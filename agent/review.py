@@ -100,9 +100,12 @@ def render(run_id: str, root: str = "artifacts") -> Dict[str, Any]:
             "script": None,  # intentional: Bronze has no transformation
         }
 
-    # Silver / Gold layers: data flow JSON + script.
+    # Silver / Gold layers: data flow JSON + script. Non-medallion flows (layer=None)
+    # don't join the layers block — they appear in the flat "dataflows" list below.
     layer_blocks: Dict[str, Any] = {}
     for df in spec.dataflows:
+        if df.layer is None:
+            continue
         layer_blocks[df.layer.value] = {
             "dataflow": df.name,
             "json": dataflows_json.get(df.name),
@@ -126,7 +129,22 @@ def render(run_id: str, root: str = "artifacts") -> Dict[str, Any]:
         "datasets": _flatten("datasets"),
         "dataflows": _flatten("dataflows"),
         "pipelines": [{"name": n, "json": p} for n, p in pipelines_json.items()],
-        "triggers": _flatten("triggers"),
+        # Schedule triggers come from the built artifacts; manual triggers are not
+        # ADF resources (never built/deployed) but must still show in the overview,
+        # so they're appended from the spec with an explanatory note.
+        "triggers": _flatten("triggers") + [
+            {
+                "name": tr.name,
+                "json": {
+                    "type": "Manual (on demand)",
+                    "pipeline": tr.pipeline,
+                    "note": "Not deployed — ADF has no manual-trigger resource; "
+                            "the pipeline is run on demand.",
+                },
+            }
+            for tr in spec.triggers
+            if tr.kind.value == "manual"
+        ],
     }
 
 
@@ -147,25 +165,29 @@ def render_text(run_id: str, root: str = "artifacts") -> str:
     rule(f"REVIEW — {data['spec_name']}  (run {run_id})")
 
     bronze = data["layers"]["bronze"]
-    rule("BRONZE — Copy Activity (raw landing, no transformation)")
     if bronze:
+        rule("BRONZE — Copy Activity (raw landing, no transformation)")
         out.append(f"pipeline: {bronze['pipeline']}   activity: {bronze['activity']}")
         out.append(f"source: {bronze['source_dataset']}  ->  sink: {bronze['sink_dataset']}")
         out.append("(no script section — Bronze performs no transformation)")
         out.append(json.dumps(bronze["copy_activity"], indent=2))
-    else:
-        out.append("MISSING — no Bronze Copy Activity found.")
 
     for layer in ("silver", "gold"):
         block = data["layers"].get(layer)
-        rule(f"{layer.upper()} — Mapping Data Flow")
         if block:
+            rule(f"{layer.upper()} — Mapping Data Flow")
             out.append(f"data flow: {block['dataflow']}")
             out.append(f"source: {block['source_dataset']}  ->  sink: {block['sink_dataset']}")
             out.append("\n-- script --")
             out.append(block["script"])
-        else:
-            out.append(f"MISSING — no {layer} data flow found.")
+
+    # Non-medallion data flows (not tagged with a layer).
+    layered = {b["dataflow"] for b in data["layers"].values() if b and b.get("dataflow")}
+    for df in data["dataflows"]:
+        if df["name"] in layered:
+            continue
+        rule(f"DATA FLOW — {df['name']}")
+        out.append(json.dumps(df["json"], indent=2))
 
     rule("PIPELINES")
     for pl in data["pipelines"]:
@@ -173,3 +195,121 @@ def render_text(run_id: str, root: str = "artifacts") -> str:
         out.append(json.dumps(pl["json"], indent=2))
 
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Human-readable Markdown plan (no raw JSON) — what the architect proposes
+# --------------------------------------------------------------------------- #
+
+
+def _transform_english(t) -> str:
+    """One plain-English line for a transform, derived from the typed spec."""
+    from models.spec import TransformKind
+
+    if t.kind in (TransformKind.cast, TransformKind.derived):
+        cols = ", ".join(f"`{c.name}` = {c.expression}" for c in t.columns)
+        verb = "cast" if t.kind == TransformKind.cast else "derive"
+        return f"{verb} {cols}"
+    if t.kind == TransformKind.filter:
+        return f"filter rows where `{t.condition}`"
+    if t.kind == TransformKind.aggregate:
+        grp = ", ".join(f"`{g}`" for g in t.group_by)
+        aggs = ", ".join(f"`{c.name}` = {c.expression}" for c in t.columns)
+        return f"aggregate by {grp} → {aggs}"
+    if t.kind == TransformKind.sort:
+        keys = ", ".join(f"`{k.column}` {k.order}" for k in t.order_by)
+        return f"sort by {keys}"
+    if t.kind == TransformKind.select:
+        cols = ", ".join(f"`{c.name}`" for c in t.columns)
+        return f"select/rename {cols}"
+    if t.kind == TransformKind.window:
+        return f"window `{t.condition or ''}`"
+    return t.kind.value
+
+
+def render_markdown(run_id: str, root: str = "artifacts") -> str:
+    """A human-readable architecture plan in Markdown — no raw JSON. This is the
+    'agent proposes, you approve' view: what each layer does in English, the
+    assumptions the agent made instead of asking, and any optional suggestions."""
+    run_dir = os.path.join(root, run_id)
+    spec = load_spec(run_dir)
+    out: List[str] = [f"# Pipeline plan — {spec.name}", ""]
+
+    # Source
+    if spec.source is not None:
+        src = spec.source
+        kind = getattr(src, "kind", "?")
+        where = getattr(src, "base_url", None) or getattr(src, "account_url", None) or ""
+        out.append(f"**Source:** {kind} — {where}")
+    if spec.storage is not None:
+        out.append(
+            f"**Storage:** `{spec.storage.account_name}` · containers "
+            + ", ".join(f"`{c}`" for c in spec.storage.containers)
+        )
+    out.append("")
+
+    # Steps (medallion layers, copy activities, and any other data flows)
+    out.append("## Steps")
+    _, bronze_act = find_bronze_copy(spec)
+    if bronze_act is not None:
+        out.append(
+            f"- **Bronze** (Copy, no transform): `{bronze_act.source_dataset}` "
+            f"→ `{bronze_act.sink_dataset}` — raw byte-for-byte landing."
+        )
+    for pl in spec.pipelines:
+        for act in pl.activities:
+            if act.type == "Copy" and act is not bronze_act:
+                out.append(
+                    f"- **Copy** `{act.name}` (pipeline `{pl.name}`): "
+                    f"`{act.source_dataset}` → `{act.sink_dataset}`."
+                )
+    for df in spec.dataflows:
+        steps = "; ".join(_transform_english(t) for t in df.transforms) or "passthrough"
+        label = df.layer.value.capitalize() if df.layer else "Transform"
+        out.append(
+            f"- **{label}** (Data Flow `{df.name}`): "
+            f"`{df.source.dataset}` → `{df.sink.dataset}` — {steps}."
+        )
+    out.append("")
+
+    # Orchestration
+    out.append("## Orchestration")
+    for pl in spec.pipelines:
+        acts = [a for a in pl.activities if a.type == "ExecutePipeline"]
+        if acts and len(acts) == len(pl.activities):
+            chain = " → ".join(a.invoked_pipeline for a in pl.activities)
+            out.append(f"- **{pl.name}** (master): {chain} (each on Succeeded).")
+    for tr in spec.triggers:
+        detail = "manual" if tr.kind.value == "manual" else f"{tr.frequency or 'Day'} schedule"
+        out.append(f"- Trigger `{tr.name}`: {detail} → `{tr.pipeline}`.")
+    if not spec.triggers:
+        out.append("- No triggers — the pipeline runs on demand.")
+    out.append("")
+
+    # Counts
+    out.append(
+        f"**Objects:** {len(spec.linked_services)} linked services · "
+        f"{len(spec.datasets)} datasets · {len(spec.dataflows)} data flows · "
+        f"{len(spec.pipelines)} pipelines · {len(spec.triggers)} triggers."
+    )
+    out.append("")
+
+    # Assumptions the agent made instead of asking
+    if spec.assumptions:
+        out.append("## Assumptions I made (change any via chat)")
+        out.extend(f"- {a}" for a in spec.assumptions)
+        out.append("")
+
+    # Optional suggestions
+    if spec.suggestions:
+        out.append("## Optional suggestions")
+        out.extend(f"- {s}" for s in spec.suggestions)
+        out.append("")
+
+    # Only genuine blockers
+    if spec.clarifications:
+        out.append("## I need one thing before building")
+        out.extend(f"- {c}" for c in spec.clarifications)
+        out.append("")
+
+    return "\n".join(out).rstrip() + "\n"

@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 from models.spec import (
+    Column,
     DataFlow,
     Dataset,
     DatasetKind,
@@ -49,48 +51,101 @@ def _to_blob_endpoint(account_url: "str | None") -> "str | None":
     return account_url.replace(".dfs.core.windows.net", ".blob.core.windows.net")
 
 
+def _acct_from_url(account_url: "str | None") -> "str | None":
+    """The storage account name from a .dfs/.blob URL (or a bare account name)."""
+    if not account_url:
+        return None
+    host = account_url
+    if "://" in account_url:
+        from urllib.parse import urlparse
+
+        host = urlparse(account_url).netloc
+    return host.split(".")[0] if host else None
+
+
 def _storage_endpoint(spec_account_url: "str | None") -> "str | None":
     """The storage endpoint the linked service should target.
 
     The deploy target is the storage account configured in the environment
-    (ADLS_ACCOUNT_NAME), so prefer that over whatever account name the BRD/LLM
-    happened to mention — otherwise the deployed pipeline would point at a
-    non-existent account. Falls back to the spec's URL when no env is set."""
-    account = os.environ.get("ADLS_ACCOUNT_NAME")
-    if account:
-        from config import blob_endpoint, dfs_endpoint
+    (ADLS_ACCOUNT_NAME). A linked service with NO account URL, or one naming the SAME
+    account, collapses onto that deploy account — so an LLM-hallucinated account name
+    can't point the pipeline at a non-existent store. A linked service that names a
+    DISTINCT account (multi-account BRD: e.g. a source lake separate from the medallion
+    lake) keeps its own account, so multiple storage accounts are supported.
+    Falls back to the spec's URL when no deploy account env is set."""
+    from config import blob_endpoint, dfs_endpoint
 
-        return blob_endpoint(account) if _blob_mode() else dfs_endpoint(account)
+    deploy = os.environ.get("ADLS_ACCOUNT_NAME")
+    spec_acct = _acct_from_url(spec_account_url)
+    if deploy and spec_acct and spec_acct.lower() != deploy.lower():
+        # Distinct, explicitly-named account -> honor it (mapped to storage_kind).
+        return blob_endpoint(spec_acct) if _blob_mode() else dfs_endpoint(spec_acct)
+    if deploy:
+        return blob_endpoint(deploy) if _blob_mode() else dfs_endpoint(deploy)
     return _to_blob_endpoint(spec_account_url) if _blob_mode() else spec_account_url
 
 
 # Every Azure storage linked-service label the LLM might emit. They all collapse to
 # ONE deploy target whose concrete type is decided by STORAGE_KIND, not the label.
+# Includes common LLM shorthands (e.g. AzureDataLakeGen2 without "Storage") so a
+# label variant never crashes the build.
 _AZURE_STORAGE_TYPES = {
     "AzureBlobFS",
     "AzureBlobStorage",
     "AzureDataLakeStorageGen2",
+    "AzureDataLakeGen2",
+    "AzureDataLakeStorage",
     "AzureDataLakeStore",
+    "AzureDataLake",
     "AzureStorage",
+    "ADLS",
+    "ADLSGen2",
 }
 
 
-def _canonical_storage_ls(spec: PipelineSpec) -> LinkedService:
-    """The single storage linked service every storage-backed dataset must share.
+# Azure SQL linked-service labels the LLM might emit — all build as AzureSqlDatabase.
+_AZURE_SQL_TYPES = {
+    "AzureSqlDatabase",
+    "AzureSql",
+    "AzureSQLDB",
+    "SqlServer",
+    "AzureSqlServer",
+}
+
+
+_DEPLOY_ACCT_KEY = "__deploy__"  # linked services with no/deploy account share this
+
+
+def _ls_account_key(ls: LinkedService) -> str:
+    """Which storage account a linked service targets. No explicit URL -> the deploy
+    account bucket; a distinct account host -> its own bucket (multi-account)."""
+    acct = _acct_from_url(ls.account_url)
+    return acct.lower() if acct else _DEPLOY_ACCT_KEY
+
+
+def _canonical_storage_by_account(spec: PipelineSpec) -> "dict[str, LinkedService]":
+    """Return {account_key: canonical LinkedService} — ONE storage linked service per
+    distinct account.
 
     The LLM often emits several storage linked services with inconsistent names
     (ls_adls, ls_blob_<acct>, ...) and points different datasets at different ones —
-    some at a name that never gets created ("invalid reference ..."), some at an
-    AzureBlobFS (.dfs) endpoint that a non-HNS Blob account rejects with the
-    SoftDelete/BlobStorageEvents 409. Collapsing to ONE storage linked service,
-    built per STORAGE_KIND, removes both failure modes. Prefer the first storage LS
-    the spec declared (keeps its name stable across reruns); synthesize one only when
-    the spec declared none but still has storage datasets."""
+    some at a name that never gets created ("invalid reference"), some at a .dfs
+    endpoint a non-HNS Blob account rejects (SoftDelete/BlobStorageEvents 409).
+    Collapsing per account removes both failure modes while still supporting a BRD
+    that legitimately spans MORE THAN ONE storage account (e.g. an external source
+    lake plus the medallion lake). Same-account duplicates still collapse to one; the
+    first LS declared for an account wins (stable name across reruns)."""
+    groups: "dict[str, LinkedService]" = {}
+    for ls in spec.linked_services:
+        if ls.type in _AZURE_STORAGE_TYPES:
+            groups.setdefault(_ls_account_key(ls), ls)
+    return groups
+
+
+def _synthetic_storage_ls() -> LinkedService:
+    """A storage LS to synthesize when the spec declared none but has storage datasets."""
     from models.spec import AuthKind
 
-    storage = [ls for ls in spec.linked_services if ls.type in _AZURE_STORAGE_TYPES]
-    if storage:
-        return storage[0]
     ls_type = "AzureBlobStorage" if _blob_mode() else "AzureBlobFS"
     return LinkedService(name="ls_storage", type=ls_type, auth=AuthKind.managed_identity)
 
@@ -114,13 +169,20 @@ def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
                 "authenticationType": "Anonymous",
             },
         }
-    if ls.type in {
-        "AzureBlobFS",
-        "AzureBlobStorage",
-        "AzureDataLakeStorageGen2",
-        "AzureDataLakeStore",
-        "AzureStorage",
-    }:
+    if ls.type in _AZURE_SQL_TYPES:
+        # Azure SQL Database with Managed Identity — no user/password anywhere.
+        server = ls.server or _acct_from_url(ls.url) or ""
+        if server and "." not in server:
+            server = f"{server}.database.windows.net"
+        return {
+            "type": "AzureSqlDatabase",
+            "typeProperties": {
+                "server": server,
+                "database": ls.database or "",
+                "authenticationType": "SystemAssignedManagedIdentity",
+            },
+        }
+    if ls.type in _AZURE_STORAGE_TYPES:
         # Any Azure storage linked service the LLM names maps to the SAME deploy
         # target; the concrete type (AzureBlobStorage vs AzureBlobFS) is decided by
         # STORAGE_KIND, not the label.
@@ -140,6 +202,14 @@ def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
             "type": "AzureBlobFS",
             "typeProperties": {"url": endpoint},
         }
+    # Unknown label from the LLM — classify by keyword instead of crashing the build.
+    low = ls.type.lower()
+    if "sql" in low:
+        return build_linked_service(ls.model_copy(update={"type": "AzureSqlDatabase"}))
+    if any(k in low for k in ("blob", "lake", "storage", "adls")):
+        return build_linked_service(ls.model_copy(update={"type": "AzureBlobFS"}))
+    if "http" in low or "rest" in low:
+        return build_linked_service(ls.model_copy(update={"type": "HttpServer"}))
     raise ValueError(f"Unsupported linked service type: {ls.type}")
 
 
@@ -174,8 +244,31 @@ def _dataset_parameters(ds: Dataset) -> Dict[str, Any]:
     return _param_defs(list(ds.parameters))
 
 
+_PATH_PARAM = re.compile(r"\{(\w+)\}")
+
+
+def _path_value(path: str, param_names) -> Any:
+    """A dataset path that references declared dataset parameters must be an ADF
+    EXPRESSION, not a literal — 'orders/{execution_date}' written as a plain string
+    makes ADF create a folder literally named '{execution_date}'. Convert declared
+    {param} tokens to @{dataset().param} and wrap as an Expression; paths without
+    parameter tokens stay plain strings."""
+    hit = False
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal hit
+        if m.group(1) in param_names:
+            hit = True
+            return f"@{{dataset().{m.group(1)}}}"
+        return m.group(0)
+
+    out = _PATH_PARAM.sub(repl, path)
+    return {"value": out, "type": "Expression"} if hit else path
+
+
 def _adls_location(ds: Dataset) -> Dict[str, Any]:
     loc = ds.location
+    params = set(ds.parameters)
     if _blob_mode():
         # Plain Blob: AzureBlobStorageLocation uses 'container' (not 'fileSystem').
         store: Dict[str, Any] = {
@@ -185,9 +278,9 @@ def _adls_location(ds: Dataset) -> Dict[str, Any]:
     else:
         store = {"type": "AzureBlobFSLocation", "fileSystem": loc.container if loc else None}
     if loc and loc.folder:
-        store["folderPath"] = loc.folder
+        store["folderPath"] = _path_value(loc.folder, params)
     if loc and loc.file_name:
-        store["fileName"] = loc.file_name
+        store["fileName"] = _path_value(loc.file_name, params)
     return store
 
 
@@ -203,6 +296,33 @@ def build_dataset(ds: Dataset) -> Dict[str, Any]:
             "parameters": _dataset_parameters(ds),
             "typeProperties": {"relativeUrl": ds.relative_url or ""},
             "schema": schema,
+        }
+
+    # Azure SQL table (source only — sinks are storage)
+    if ds.kind == DatasetKind.azure_sql_table:
+        return {
+            "type": "AzureSqlTable",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {
+                "schema": ds.schema_name or "dbo",
+                "table": ds.table_name or ds.name.removeprefix("ds_"),
+            },
+            "schema": schema,
+        }
+
+    # Binary (byte-for-byte copy of any file type; no schema)
+    if ds.kind == DatasetKind.binary:
+        location = (
+            {"type": "HttpServerLocation", "relativeUrl": ds.relative_url}
+            if ds.relative_url is not None
+            else _adls_location(ds)
+        )
+        return {
+            "type": "Binary",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {"location": location},
         }
 
     # JSON (over HTTP or in ADLS)
@@ -257,12 +377,16 @@ _COPY_SOURCE_TYPE = {
     DatasetKind.parquet: "ParquetSource",
     DatasetKind.json: "JsonSource",
     DatasetKind.rest_resource: "RestSource",
+    DatasetKind.binary: "BinarySource",
+    DatasetKind.azure_sql_table: "AzureSqlSource",
 }
 _COPY_SINK_TYPE = {
     DatasetKind.delimited_text: "DelimitedTextSink",
     DatasetKind.parquet: "ParquetSink",
     DatasetKind.json: "JsonSink",
     DatasetKind.rest_resource: "RestSink",
+    DatasetKind.binary: "BinarySink",
+    DatasetKind.azure_sql_table: "AzureSqlSink",
 }
 
 
@@ -296,58 +420,124 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
     if t.kind == TransformKind.window:
         return f"{input_stream} window({t.condition or ''}) ~> {t.name}"
 
+    if t.kind == TransformKind.join:
+        # ADF join DSL: "<left>, <right> join(<cond>, joinType:'inner', ...) ~> <name>".
+        # left = the current stream; right = the other source stream.
+        join_type = (t.join_type or "inner").replace("-", "_")
+        return (
+            f"{input_stream}, {t.right_stream} join({t.condition or 'true()'},\n"
+            f"  joinType:'{join_type}',\n"
+            "  matchType:'exact',\n"
+            "  ignoreSpaces: false,\n"
+            "  broadcast: 'auto') ~> "
+            f"{t.name}"
+        )
+
     raise ValueError(f"Unsupported transform kind: {t.kind}")
 
 
-def build_dataflow_script(df: DataFlow) -> str:
-    """Produce the full ADF Mapping Data Flow script:
+def _delta_ds(datasets: "Dict[str, Dataset] | None", dataset_name: str) -> "Dataset | None":
+    """The Dataset object when `dataset_name` is a Delta dataset, else None."""
+    ds = (datasets or {}).get(dataset_name)
+    return ds if ds is not None and ds.kind == DatasetKind.delta else None
 
-        source(...) ~> Src
-        Src derive/filter/aggregate/sort ... ~> ...
-        Last sink(...) ~> Sink
-    """
-    schema = ",\n    ".join(f"{c.name} as {c.type}" for c in df.source_columns)
+
+def _delta_script_props(ds: Dataset) -> List[str]:
+    """Inline-dataset location lines for a Delta source/sink. Delta is not an ADF
+    dataset resource — the container/folder ride inside the data-flow script.
+    Parameter tokens are stripped: a Delta table lives at ONE static folder
+    (versioning is Delta's job, not per-run folders)."""
+    loc = ds.location
+    lines = ["  format: 'delta',"]
+    if loc and loc.container:
+        lines.append(f"  fileSystem: '{loc.container}',")
+    if loc and loc.folder:
+        folder = _PATH_PARAM.sub("", loc.folder).strip("/").replace("//", "/")
+        if folder:
+            lines.append(f"  folderPath: '{folder}',")
+    return lines
+
+
+def _source_block(
+    stream_name: str,
+    columns: "List[Column]",
+    delta: "Dataset | None" = None,
+) -> List[str]:
+    """One ADF `source(...) ~> Stream` block with an optional inline schema."""
+    schema = ",\n    ".join(f"{c.name} as {c.type}" for c in columns)
     body = f"\n    {schema}\n  " if schema else ""
-    lines: List[str] = [
+    lines = [
         f"source(output({body}),",
         "  allowSchemaDrift: true,",
         "  validateSchema: false,",
-        f"  ignoreNoFilesFound: false) ~> {df.source.stream_name}",
     ]
+    if delta is not None:
+        lines.extend(_delta_script_props(delta))
+    lines.append(f"  ignoreNoFilesFound: false) ~> {stream_name}")
+    return lines
+
+
+def build_dataflow_script(df: DataFlow, datasets: "Dict[str, Dataset] | None" = None) -> str:
+    """Produce the full ADF Mapping Data Flow script:
+
+        source(...) ~> Src            (one per input source; joins have several)
+        Src derive/filter/aggregate/sort/join ... ~> ...
+        Last sink(...) ~> Sink
+
+    Delta endpoints (dataset kind Delta) become INLINE datasets: their location
+    is embedded in the script and no ADF dataset resource is referenced.
+    """
+    lines: List[str] = _source_block(
+        df.source.stream_name, df.source_columns, _delta_ds(datasets, df.source.dataset)
+    )
+    # Extra sources (multi-source / join flows) each get their own source() block.
+    for extra in df.additional_sources:
+        lines.extend(
+            _source_block(extra.stream_name, extra.columns, _delta_ds(datasets, extra.dataset))
+        )
 
     current = df.source.stream_name
     for t in df.transforms:
         lines.append(_transform_dsl(current, t))
         current = t.name
 
-    lines.append(
-        f"{current} sink(allowSchemaDrift: true,\n"
-        "  validateSchema: false,\n"
-        "  skipDuplicateMapInputs: true,\n"
-        "  skipDuplicateMapOutputs: true) ~> "
-        f"{df.sink.stream_name}"
-    )
+    sink_lines = [f"{current} sink(allowSchemaDrift: true,", "  validateSchema: false,"]
+    sink_delta = _delta_ds(datasets, df.sink.dataset)
+    if sink_delta is not None:
+        sink_lines.extend(_delta_script_props(sink_delta))
+    sink_lines.append("  skipDuplicateMapInputs: true,")
+    sink_lines.append(f"  skipDuplicateMapOutputs: true) ~> {df.sink.stream_name}")
+    lines.append("\n".join(sink_lines))
     return "\n".join(lines)
 
 
-def build_dataflow(df: DataFlow) -> Dict[str, Any]:
+def build_dataflow(
+    df: DataFlow,
+    datasets: "Dict[str, Dataset] | None" = None,
+    ls_name_for: "Any | None" = None,
+) -> Dict[str, Any]:
+    def endpoint_entry(ep) -> Dict[str, Any]:
+        delta = _delta_ds(datasets, ep.dataset)
+        if delta is not None:
+            # Inline dataset: reference the linked service, not a dataset resource.
+            ls = ls_name_for(delta) if ls_name_for else delta.linked_service
+            return {
+                "name": ep.stream_name,
+                "linkedService": {"referenceName": ls, "type": "LinkedServiceReference"},
+            }
+        return {
+            "name": ep.stream_name,
+            "dataset": {"referenceName": ep.dataset, "type": "DatasetReference"},
+        }
+
+    sources = [df.source] + list(df.additional_sources)
     return {
         "type": "MappingDataFlow",
         "typeProperties": {
-            "sources": [
-                {
-                    "name": df.source.stream_name,
-                    "dataset": {"referenceName": df.source.dataset, "type": "DatasetReference"},
-                }
-            ],
-            "sinks": [
-                {
-                    "name": df.sink.stream_name,
-                    "dataset": {"referenceName": df.sink.dataset, "type": "DatasetReference"},
-                }
-            ],
+            "sources": [endpoint_entry(s) for s in sources],
+            "sinks": [endpoint_entry(df.sink)],
             "transformations": [{"name": t.name} for t in df.transforms],
-            "scriptLines": build_dataflow_script(df).split("\n"),
+            "scriptLines": build_dataflow_script(df, datasets).split("\n"),
         },
     }
 
@@ -369,7 +559,7 @@ def _source_read_settings(ds: Dataset) -> "Dict[str, Any] | None":
     are unaffected."""
     if ds.relative_url is not None:  # HTTP file: relativeUrl already names it
         return None
-    if ds.kind == DatasetKind.rest_resource:
+    if ds.kind in (DatasetKind.rest_resource, DatasetKind.azure_sql_table):
         return None
     loc = ds.location
     if loc and loc.file_name:  # concrete file name present
@@ -380,7 +570,12 @@ def _source_read_settings(ds: Dataset) -> "Dict[str, Any] | None":
         "wildcardFileName": "*",
     }
     if loc and loc.folder:
-        settings["wildcardFolderPath"] = loc.folder
+        # Activity-scope setting: @{dataset().x} is not valid here, so a
+        # parameterized folder ('orders/{execution_date}') becomes a wildcard
+        # ('orders/*') — the read matches any per-run folder.
+        settings["wildcardFolderPath"] = _PATH_PARAM.sub(
+            lambda m: "*" if m.group(1) in set(ds.parameters) else m.group(0), loc.folder
+        )
     return settings
 
 
@@ -390,6 +585,14 @@ def _build_context(spec: PipelineSpec) -> Dict[str, Any]:
         "dataset_params": {ds.name: list(ds.parameters) for ds in spec.datasets},
         "pipeline_params": {pl.name: list(pl.parameters) for pl in spec.pipelines},
         "source_read_settings": {ds.name: _source_read_settings(ds) for ds in spec.datasets},
+        # stream name -> dataset name per data flow, for datasetParameters binding.
+        "dataflow_streams": {
+            df.name: {
+                ep.stream_name: ep.dataset
+                for ep in (df.source, df.sink, *df.additional_sources)
+            }
+            for df in spec.dataflows
+        },
     }
 
 
@@ -433,6 +636,12 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
         if act.type == "Copy":
             src_kind = ctx["dataset_kinds"].get(act.source_dataset, DatasetKind.delimited_text)
             sink_kind = ctx["dataset_kinds"].get(act.sink_dataset, DatasetKind.delimited_text)
+            if DatasetKind.delta in (src_kind, sink_kind):
+                raise ValueError(
+                    f"Copy activity '{act.name}' uses a Delta dataset — Delta is "
+                    "supported only in Mapping Data Flows (inline), not Copy. Keep "
+                    "bronze as CSV/Parquet/Binary and use Delta for silver/gold flows."
+                )
             source_tp: Dict[str, Any] = {"type": _COPY_SOURCE_TYPE[src_kind]}
             read_settings = ctx.get("source_read_settings", {}).get(act.source_dataset)
             if read_settings:  # source dataset has no concrete file -> wildcard read
@@ -454,11 +663,27 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
                 }
             )
         elif act.type == "ExecuteDataFlow":
+            df_ref: Dict[str, Any] = {
+                "referenceName": act.data_flow,
+                "type": "DataFlowReference",
+            }
+            # Thread pipeline parameters down to parameterized flow datasets
+            # (stream -> {param: @pipeline().parameters.param}); without this the
+            # datasets silently fall back to their build-date defaultValue.
+            streams = ctx.get("dataflow_streams", {}).get(act.data_flow, {})
+            ds_params: Dict[str, Any] = {}
+            for stream, ds_name in streams.items():
+                params = ctx["dataset_params"].get(ds_name, [])
+                bound = {p: f"@pipeline().parameters.{p}" for p in params if p in pipeline_params}
+                if bound:
+                    ds_params[stream] = bound
+            if ds_params:
+                df_ref["datasetParameters"] = ds_params
             common.update(
                 {
                     "type": "ExecuteDataFlow",
                     "typeProperties": {
-                        "dataflow": {"referenceName": act.data_flow, "type": "DataFlowReference"},
+                        "dataflow": df_ref,
                         # smallest General Purpose tier (cost)
                         "compute": {"computeType": "General", "coreCount": 8},
                         "traceLevel": "Fine",
@@ -497,30 +722,52 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
 # --------------------------------------------------------------------------- #
 
 
+def _normalize_start_time(value: "str | None") -> str:
+    """Coerce whatever the LLM emits into a valid ADF ISO-8601 UTC startTime.
+
+    ADF's ScheduleTrigger REQUIRES a full datetime startTime; the LLM often emits a
+    bare time ('02:00'), a date, or nothing, which ADF rejects
+    (MissingStartTimeInScheduleTriggerDefinition / bad format). Normalize:
+      * 'HH:MM'        -> today at that time, UTC
+      * 'YYYY-MM-DD'   -> that date at midnight, UTC
+      * ISO datetime   -> as-is (ensure a trailing Z)
+      * missing/other  -> a fixed valid default
+    """
+    import re
+
+    default = "2024-01-01T00:00:00Z"
+    if not value:
+        return default
+    v = value.strip()
+    if "T" in v:  # already a datetime
+        return v if (v.endswith("Z") or "+" in v) else v + "Z"
+    m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+    if m:
+        return f"{_BUILD_DATE}T{int(m.group(1)):02d}:{m.group(2)}:00Z"
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+        return f"{v}T00:00:00Z"
+    return default
+
+
 def build_trigger(tr: Trigger) -> Dict[str, Any]:
-    if tr.kind == TriggerKind.schedule:
-        return {
-            "type": "ScheduleTrigger",
-            "typeProperties": {
-                "recurrence": {
-                    "frequency": tr.frequency or "Day",
-                    "interval": tr.interval or 1,
-                    "startTime": tr.start_time or "2024-01-01T00:00:00Z",
-                    "timeZone": "UTC",
-                }
-            },
-            "pipelines": [
-                {
-                    "pipelineReference": {"referenceName": tr.pipeline, "type": "PipelineReference"},
-                    "parameters": {},
-                }
-            ],
-        }
-    # Manual triggers are not ARM resources — they run via create_run on demand.
+    # Only ScheduleTrigger is a deployable ARM resource here. Manual triggers are
+    # filtered out before deploy (see build_all) because ADF has no "manual trigger"
+    # resource — a pipeline is simply run on demand. This branch stays defensive.
     return {
-        "type": "ManualTrigger",
+        "type": "ScheduleTrigger",
+        "typeProperties": {
+            "recurrence": {
+                "frequency": tr.frequency or "Day",
+                "interval": tr.interval or 1,
+                "startTime": _normalize_start_time(tr.start_time),
+                "timeZone": "UTC",
+            }
+        },
         "pipelines": [
-            {"pipelineReference": {"referenceName": tr.pipeline, "type": "PipelineReference"}}
+            {
+                "pipelineReference": {"referenceName": tr.pipeline, "type": "PipelineReference"},
+                "parameters": {},
+            }
         ],
     }
 
@@ -533,39 +780,77 @@ def build_trigger(tr: Trigger) -> Dict[str, Any]:
 def build_all(spec: PipelineSpec) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Return {category: {name: properties_json}} for the whole spec.
 
-    All Azure storage linked services are collapsed into one canonical LS and every
-    storage-backed dataset is repointed at it — see :func:`_canonical_storage_ls`."""
+    Azure storage linked services are collapsed to ONE canonical LS PER ACCOUNT and
+    every storage-backed dataset is repointed at the canonical LS for its account —
+    see :func:`_canonical_storage_by_account`. Single-account specs collapse to one LS
+    exactly as before; multi-account specs keep one LS per distinct account."""
     ctx = _build_context(spec)
 
-    storage_ls_names = {ls.name for ls in spec.linked_services if ls.type in _AZURE_STORAGE_TYPES}
-    canonical = _canonical_storage_ls(spec)
+    storage_ls = {ls.name: ls for ls in spec.linked_services if ls.type in _AZURE_STORAGE_TYPES}
+    storage_ls_names = set(storage_ls)
+    # One canonical storage LS per distinct account (empty when the spec named none).
+    canon_by_key = _canonical_storage_by_account(spec)
     # A dataset lives in storage when it has a `location` (vs an HTTP relative_url).
     needs_storage = storage_ls_names or any(ds.location is not None for ds in spec.datasets)
+    # Fallback account bucket for storage datasets whose LS is missing/unknown: prefer
+    # the deploy-account canonical, else the first canonical, else a synthetic LS.
+    if _DEPLOY_ACCT_KEY in canon_by_key:
+        default_canonical = canon_by_key[_DEPLOY_ACCT_KEY]
+    elif canon_by_key:
+        default_canonical = next(iter(canon_by_key.values()))
+    else:
+        default_canonical = _synthetic_storage_ls()
+        if needs_storage:
+            canon_by_key[_DEPLOY_ACCT_KEY] = default_canonical
+
+    def _canonical_for_dataset(ds: Dataset) -> LinkedService:
+        """The canonical storage LS for the account this dataset's LS targets."""
+        ls = storage_ls.get(ds.linked_service)
+        if ls is not None:
+            return canon_by_key.get(_ls_account_key(ls), default_canonical)
+        return default_canonical
 
     # Linked services: keep every non-storage LS (HttpServer/RestService) as-is, and
-    # emit exactly ONE storage LS (the canonical one) when any storage dataset exists.
+    # emit exactly ONE storage LS per distinct account when any storage dataset exists.
     linked: Dict[str, Any] = {
         ls.name: build_linked_service(ls)
         for ls in spec.linked_services
         if ls.type not in _AZURE_STORAGE_TYPES
     }
     if needs_storage:
-        linked[canonical.name] = build_linked_service(canonical)
+        for canonical in canon_by_key.values():
+            linked[canonical.name] = build_linked_service(canonical)
 
     def _dataset(ds: Dataset) -> Dict[str, Any]:
         built = build_dataset(ds)
-        # Repoint storage-backed datasets at the one canonical storage LS so no
-        # dataset can reference a missing or .dfs/.blob-mismatched linked service.
+        # Repoint storage-backed datasets at the canonical storage LS for their account
+        # so no dataset can reference a missing or .dfs/.blob-mismatched linked service.
         if ds.location is not None or ds.linked_service in storage_ls_names:
-            built["linkedServiceName"]["referenceName"] = canonical.name
+            built["linkedServiceName"]["referenceName"] = _canonical_for_dataset(ds).name
         return built
+
+    ds_map = {ds.name: ds for ds in spec.datasets}
+
+    def _ls_name_for(ds: Dataset) -> str:
+        return _canonical_for_dataset(ds).name
 
     return {
         "linkedServices": linked,
-        "datasets": {ds.name: _dataset(ds) for ds in spec.datasets},
-        "dataflows": {df.name: build_dataflow(df) for df in spec.dataflows},
+        # Delta datasets are inline-only (no ADF dataset resource) — not built.
+        "datasets": {
+            ds.name: _dataset(ds) for ds in spec.datasets if ds.kind != DatasetKind.delta
+        },
+        "dataflows": {
+            df.name: build_dataflow(df, ds_map, _ls_name_for) for df in spec.dataflows
+        },
         "pipelines": {pl.name: build_pipeline(pl, ctx) for pl in spec.pipelines},
-        "triggers": {tr.name: build_trigger(tr) for tr in spec.triggers},
+        # Only schedule triggers are ARM resources. Manual triggers are not deployed —
+        # ADF has no manual-trigger resource; the pipeline is run on demand instead.
+        "triggers": {
+            tr.name: build_trigger(tr)
+            for tr in spec.triggers
+            if tr.kind == TriggerKind.schedule
+        },
     }
 
 
@@ -592,11 +877,12 @@ def write_artifacts(spec: PipelineSpec, run_id: str, root: str = "artifacts") ->
             with open(os.path.join(cat_dir, f"{name}.json"), "w", encoding="utf-8") as fh:
                 json.dump({"name": name, "properties": props}, fh, indent=2)
 
+    ds_map = {ds.name: ds for ds in spec.datasets}
     for df in spec.dataflows:
         with open(
             os.path.join(run_dir, "dataflows", f"{df.name}.script"), "w", encoding="utf-8"
         ) as fh:
-            fh.write(build_dataflow_script(df))
+            fh.write(build_dataflow_script(df, ds_map))
 
     with open(os.path.join(run_dir, "spec.json"), "w", encoding="utf-8") as fh:
         fh.write(spec.model_dump_json(indent=2))

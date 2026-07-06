@@ -50,23 +50,69 @@ def _empty_layers() -> Dict[str, Dict[str, Any]]:
     return {layer: {"status": "Pending", "run_id": None, "error": None} for layer in _LAYER_ORDER}
 
 
+def _pending_steps(run_dir: str) -> List[Dict[str, Any]]:
+    """One Pending entry per activity of the pipeline that will run, in declared
+    order — the generic (non-medallion) progress view the UI renders."""
+    docs = _load_pipelines(run_dir)
+    props = docs.get(_master_name(run_dir), {})
+    return [
+        {"name": a.get("name"), "status": "Pending", "run_id": None, "error": None}
+        for a in props.get("activities", [])
+    ]
+
+
+def _steps_to_layers(steps: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Back-compat medallion view: map steps whose names mention a layer."""
+    layers = _empty_layers()
+    for step in steps:
+        name = (step.get("name") or "").lower()
+        layer = next((l for l in _LAYER_ORDER if l in name), None)
+        if layer:
+            layers[layer] = {
+                "status": step["status"],
+                "run_id": step.get("run_id"),
+                "error": step.get("error"),
+            }
+    return layers
+
+
 # --------------------------------------------------------------------------- #
 # Master pipeline name discovery
 # --------------------------------------------------------------------------- #
 
 
-def _master_name(run_dir: str) -> str:
+def _load_pipelines(run_dir: str) -> Dict[str, Dict[str, Any]]:
     pl_dir = os.path.join(run_dir, "pipelines")
+    docs: Dict[str, Dict[str, Any]] = {}
     if os.path.isdir(pl_dir):
         for fname in sorted(os.listdir(pl_dir)):
-            if not fname.endswith(".json"):
-                continue
-            with open(os.path.join(pl_dir, fname), "r", encoding="utf-8") as fh:
-                doc = json.load(fh)
-            acts = doc["properties"].get("activities", [])
-            if acts and all(a.get("type") == "ExecutePipeline" for a in acts):
-                return doc["name"]
-    return _MASTER
+            if fname.endswith(".json"):
+                with open(os.path.join(pl_dir, fname), "r", encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                docs[doc["name"]] = doc["properties"]
+    return docs
+
+
+def _master_name(run_dir: str) -> str:
+    """The pipeline to run: the all-ExecutePipeline master when one exists,
+    otherwise a ROOT pipeline (one no other pipeline invokes) — covers copy-only
+    and single-pipeline specs that have no master at all."""
+    docs = _load_pipelines(run_dir)
+    for name, props in docs.items():
+        acts = props.get("activities", [])
+        if acts and all(a.get("type") == "ExecutePipeline" for a in acts):
+            return name
+    invoked = set()
+    for props in docs.values():
+        for act in props.get("activities", []):
+            if act.get("type") == "ExecutePipeline":
+                ref = act.get("typeProperties", {}).get("pipeline", {}).get("referenceName")
+                if ref:
+                    invoked.add(ref)
+    roots = [n for n in docs if n not in invoked]
+    if roots:
+        return roots[0]
+    return next(iter(docs), _MASTER)
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +120,11 @@ def _master_name(run_dir: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _layer_status_real(adf, cfg: AzureConfig, run_id: str) -> Dict[str, Dict[str, Any]]:
+def _step_status_real(
+    adf, cfg: AzureConfig, run_id: str, pending: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Live status for every top-level activity of the running pipeline. Activities
+    ADF hasn't scheduled yet stay Pending (from the declared activity list)."""
     now = _dt.datetime.utcnow()
     flt = {
         "lastUpdatedAfter": (now - _dt.timedelta(days=1)).isoformat() + "Z",
@@ -83,20 +133,24 @@ def _layer_status_real(adf, cfg: AzureConfig, run_id: str) -> Dict[str, Dict[str
     resp = adf.activity_runs.query_by_pipeline_run(
         cfg.resource_group, cfg.factory_name, run_id, filter_parameters=flt
     )
-    layers = _empty_layers()
+    steps = {s["name"]: dict(s) for s in pending}
     for act in resp.value or []:
-        name = (act.activity_name or "").lower()
-        layer = next((l for l in _LAYER_ORDER if l in name), None)
-        if layer is None:
-            continue
         child_run_id = None
         if isinstance(act.output, dict):
             child_run_id = act.output.get("pipelineRunId")
         err = None
         if isinstance(act.error, dict) and act.error.get("message"):
             err = act.error.get("message")
-        layers[layer] = {"status": act.status, "run_id": child_run_id, "error": err}
-    return layers
+        steps[act.activity_name] = {
+            "name": act.activity_name,
+            "status": act.status,
+            "run_id": child_run_id,
+            "error": err,
+        }
+    # Preserve declared order; append any activity ADF reports that we didn't declare.
+    ordered = [steps[s["name"]] for s in pending if s["name"] in steps]
+    ordered += [v for k, v in steps.items() if k not in {s["name"] for s in pending}]
+    return ordered
 
 
 def _failed_activities(adf, cfg: AzureConfig, run_id: str) -> List[Tuple[str, str]]:
@@ -133,38 +187,54 @@ def _run_real(
 
     adf = get_datafactory_client(cfg)
     master = _master_name(run_dir)
+    pending = _pending_steps(run_dir)
     run = adf.pipelines.create_run(cfg.resource_group, cfg.factory_name, master, parameters=parameters)
     run_id = run.run_id
-    on_update({"run_id": run_id, "status": "InProgress", "layers": _empty_layers()})
+    on_update({"run_id": run_id, "status": "InProgress", "steps": pending,
+               "layers": _steps_to_layers(pending)})
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         info = adf.pipeline_runs.get(cfg.resource_group, cfg.factory_name, run_id)
-        layers = _layer_status_real(adf, cfg, run_id)
-        on_update({"run_id": run_id, "status": info.status, "layers": layers})
+        steps = _step_status_real(adf, cfg, run_id, pending)
+        layers = _steps_to_layers(steps)
+        on_update({"run_id": run_id, "status": info.status, "steps": steps, "layers": layers})
         if info.status in _TERMINAL:
-            result: Dict[str, Any] = {"run_id": run_id, "status": info.status, "layers": layers}
+            result: Dict[str, Any] = {
+                "run_id": run_id, "status": info.status, "steps": steps, "layers": layers,
+            }
             if info.status != "Succeeded":
                 result["failures"] = _failed_activities(adf, cfg, run_id)
                 result["error"] = info.message or "; ".join(m for _, m in result["failures"])
             return result
         time.sleep(poll_seconds)
 
-    return {"run_id": run_id, "status": "TimedOut", "layers": _layer_status_real(adf, cfg, run_id)}
+    steps = _step_status_real(adf, cfg, run_id, pending)
+    return {"run_id": run_id, "status": "TimedOut", "steps": steps,
+            "layers": _steps_to_layers(steps)}
 
 
-def _run_mock(on_update: UpdateFn) -> Dict[str, Any]:
-    """Simulate a Bronze->Silver->Gold run (no Azure)."""
+def _run_mock(run_dir: str, on_update: UpdateFn) -> Dict[str, Any]:
+    """Simulate the run step-by-step (no Azure)."""
     run_id = "mock-" + _dt.datetime.utcnow().strftime("%H%M%S")
-    layers = _empty_layers()
-    on_update({"run_id": run_id, "status": "InProgress", "layers": dict(layers)})
-    for layer in _LAYER_ORDER:
-        layers[layer] = {"status": "InProgress", "run_id": f"{run_id}-{layer}", "error": None}
-        on_update({"run_id": run_id, "status": "InProgress", "layers": dict(layers)})
+    steps = _pending_steps(run_dir) or [
+        {"name": l.capitalize(), "status": "Pending", "run_id": None, "error": None}
+        for l in _LAYER_ORDER
+    ]
+
+    def emit(status: str) -> None:
+        on_update({"run_id": run_id, "status": status,
+                   "steps": [dict(s) for s in steps], "layers": _steps_to_layers(steps)})
+
+    emit("InProgress")
+    for step in steps:
+        step.update(status="InProgress", run_id=f"{run_id}-{step['name']}")
+        emit("InProgress")
         time.sleep(0.4)
-        layers[layer] = {"status": "Succeeded", "run_id": f"{run_id}-{layer}", "error": None}
-        on_update({"run_id": run_id, "status": "InProgress", "layers": dict(layers)})
-    return {"run_id": run_id, "status": "Succeeded", "layers": layers, "mock": True}
+        step.update(status="Succeeded")
+        emit("InProgress")
+    return {"run_id": run_id, "status": "Succeeded", "steps": steps,
+            "layers": _steps_to_layers(steps), "mock": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -207,25 +277,71 @@ def _pick_target(error_message: str, inventory: Dict[str, str]) -> Optional[Tupl
     return next(iter(inventory.items()), None)
 
 
-def heal_artifact(run_dir: str, category: str, name: str, error_message: str) -> str:
+def _log_heal(run_dir: str, record: Dict[str, Any]) -> None:
+    """Append a full audit record to <run_dir>/heals.json so every self-heal is
+    inspectable after the fact: what failed, what the model changed, and why."""
+    path = os.path.join(run_dir, "heals.json")
+    records: List[Dict[str, Any]] = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                records = json.load(fh)
+        except Exception:  # noqa: BLE001 — corrupt log never blocks a heal
+            records = []
+    records.append(record)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(records, fh, indent=2)
+
+
+def read_heal_log(run_dir: str) -> List[Dict[str, Any]]:
+    path = os.path.join(run_dir, "heals.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def heal_artifact(
+    run_dir: str, category: str, name: str, error_message: str, phase: str = "runtime"
+) -> str:
     from pydantic_ai import Agent
 
-    from config import get_claude_model
+    from config import get_model, structured_output
 
     path = os.path.join(run_dir, category, f"{name}.json")
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
+    before = doc["properties"]
 
-    agent = Agent(get_claude_model(), output_type=HealedArtifact, system_prompt=_HEAL_PROMPT)
+    agent = Agent(
+        get_model(), output_type=structured_output(HealedArtifact), system_prompt=_HEAL_PROMPT
+    )
     user_msg = (
         f"Artifact category: {category}\nArtifact name: {name}\n"
         f"Runtime error:\n{error_message}\n\n"
-        f"Current properties JSON:\n{json.dumps(doc['properties'], indent=2)}"
+        f"Current properties JSON:\n{json.dumps(before, indent=2)}"
     )
     healed = agent.run_sync(user_msg).output
     doc["properties"] = healed.properties
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
+
+    _log_heal(
+        run_dir,
+        {
+            "time": _dt.datetime.utcnow().isoformat() + "Z",
+            "phase": phase,  # 'deploy' (create_or_update rejected) or 'runtime' (run failed)
+            "category": category,
+            "name": name,
+            "error": error_message,
+            "fix": healed.explanation,
+            "before": before,
+            "after": healed.properties,
+        },
+    )
     return healed.explanation
 
 
@@ -249,7 +365,7 @@ def execute(
     parameters = parameters or _default_params()
 
     if mock_mode():
-        report = _run_mock(on_update)
+        report = _run_mock(run_dir, on_update)
         return {"status": report["status"], "attempts": [report]}
 
     cfg = cfg or AzureConfig.from_env()

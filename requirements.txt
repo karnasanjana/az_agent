@@ -8,6 +8,11 @@ pydantic-ai>=0.0.30
 # Claude via Azure AI Foundry (Anthropic-compatible endpoint)
 anthropic>=0.40
 
+# Optional — only needed if you switch LLM_PROVIDER away from anthropic.
+# LLM_PROVIDER=openai  -> pip install "openai>=1.30"
+# LLM_PROVIDER=gemini  -> pip install "google-generativeai>=0.7"
+# (pydantic-ai drives them; the project stays provider-agnostic via config.get_model)
+
 # API + UI
 fastapi>=0.110
 uvicorn[standard]>=0.29

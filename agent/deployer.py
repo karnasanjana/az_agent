@@ -142,6 +142,18 @@ def _mock_deploy(run_dir: str) -> List[str]:
         for fname in os.listdir(src_scripts):
             if fname.endswith(".script"):
                 shutil.copy2(os.path.join(src_scripts, fname), os.path.join(dst, fname))
+    # Same verification the real backend reports: intended vs actual counts.
+    deploy_artifacts.last_intended_counts = {  # type: ignore[attr-defined]
+        cat: len(_load_category(run_dir, cat)) for cat in DEPLOY_ORDER
+    }
+    deploy_artifacts.last_factory_counts = {  # type: ignore[attr-defined]
+        cat: sum(
+            1 for f in os.listdir(os.path.join(factory_dir, cat)) if f.endswith(".json")
+        )
+        if os.path.isdir(os.path.join(factory_dir, cat))
+        else 0
+        for cat in DEPLOY_ORDER
+    }
     return deployed
 
 
@@ -151,29 +163,41 @@ def _mock_deploy(run_dir: str) -> List[str]:
 
 
 def _real_provision(containers: List[str], cfg: AzureConfig) -> List[str]:
-    from azure.core.exceptions import ResourceExistsError
+    from azure.core.exceptions import HttpResponseError, ResourceExistsError
 
     from config import get_blob_service_client, get_datalake_client, storage_kind
+
+    def _create(make) -> "str | None":
+        """Create a container/filesystem; treat 'already exists' AND a data-plane
+        403 as non-fatal. The deploy identity may lack 'Storage Blob Data
+        Contributor' (control-plane roles don't grant data access) while the
+        containers already exist and the ADF Managed Identity — which actually reads/
+        writes at run time — is separately authorized. Blocking the whole deploy on a
+        redundant create step would be wrong, so we skip and let the run proceed."""
+        try:
+            make()
+            return "created"
+        except ResourceExistsError:
+            return None  # idempotent — already there
+        except HttpResponseError as exc:
+            blob = f"{exc}".lower()
+            if exc.status_code in (401, 403) or "authorizationpermissionmismatch" in blob:
+                return None  # no data-plane role; assume pre-existing, don't block deploy
+            raise
 
     created: List[str] = []
     if storage_kind() == "blob":
         # Plain Blob storage (no HNS): containers, not filesystems.
         service = get_blob_service_client(cfg)
         for name in containers:
-            try:
-                service.create_container(name)
+            if _create(lambda n=name: service.create_container(n)):
                 created.append(name)
-            except ResourceExistsError:
-                pass  # idempotent
         return created
 
     service = get_datalake_client(cfg)
     for name in containers:
-        try:
-            service.create_file_system(file_system=name)
+        if _create(lambda n=name: service.create_file_system(file_system=n)):
             created.append(name)
-        except ResourceExistsError:
-            pass  # already provisioned — idempotent
     return created
 
 
@@ -210,22 +234,41 @@ _PRUNE_ORDER = list(reversed(DEPLOY_ORDER))
 def _real_prune(adf, cfg: AzureConfig, keep: Dict[str, set]) -> List[str]:
     """Delete every factory object whose name is not in ``keep`` (this run's objects),
     so the factory converges to exactly this run. Triggers are stopped before delete —
-    ADF refuses to delete a started trigger."""
+    ADF refuses to delete a started trigger.
+
+    Within a category, deletion is PASS-BASED: an object still referenced by another
+    (a stale master pipeline invoking a stale child via ExecutePipeline) fails its
+    delete with 'cannot be deleted since it is referenced by ...'. We retry in passes,
+    deleting whatever succeeds each pass; once the referrer is gone the referenced
+    object deletes on the next pass. This converges regardless of the stale objects'
+    dependency order without fetching each object's graph."""
     removed: List[str] = []
     for category in _PRUNE_ORDER:
         op = getattr(adf, _RESOURCE_CALL[category])
         keep_names = keep.get(category, set())
-        existing = [item.name for item in op.list_by_factory(cfg.resource_group, cfg.factory_name)]
-        for name in existing:
-            if name in keep_names:
-                continue
-            if category == "triggers":
+        pending = [
+            item.name
+            for item in op.list_by_factory(cfg.resource_group, cfg.factory_name)
+            if item.name not in keep_names
+        ]
+        while pending:
+            progressed = False
+            blocked: List[str] = []
+            for name in pending:
+                if category == "triggers":
+                    try:
+                        adf.triggers.begin_stop(cfg.resource_group, cfg.factory_name, name).result()
+                    except Exception:  # noqa: BLE001 — not started / already stopped
+                        pass
                 try:
-                    adf.triggers.begin_stop(cfg.resource_group, cfg.factory_name, name).result()
-                except Exception:  # noqa: BLE001 — not started / already stopped
-                    pass
-            op.delete(cfg.resource_group, cfg.factory_name, name)
-            removed.append(f"{category}/{name}")
+                    op.delete(cfg.resource_group, cfg.factory_name, name)
+                    removed.append(f"{category}/{name}")
+                    progressed = True
+                except Exception:  # noqa: BLE001 — likely still referenced; retry next pass
+                    blocked.append(name)
+            if not progressed:  # nothing deletable this pass — real error, stop looping
+                break
+            pending = blocked
     return removed
 
 
@@ -242,6 +285,33 @@ def provision_containers(containers: List[str], cfg: "AzureConfig | None" = None
     return _real_provision(containers, cfg)
 
 
+def _intended_keep(run_dir: str) -> Dict[str, set]:
+    """The FULL set of object names this run intends to create, per category — read
+    from the run dir BEFORE deploying. Prune keeps exactly these, so a partial deploy
+    failure can never prune this run's own objects (only stale ones from prior runs)."""
+    keep: Dict[str, set] = {}
+    for category in DEPLOY_ORDER:
+        keep[category] = set(_load_category(run_dir, category).keys())
+    return keep
+
+
+def _factory_counts_real(adf, cfg: AzureConfig) -> Dict[str, int]:
+    """What the factory ACTUALLY contains per category, listed live after deploy +
+    prune. This is the ground truth the UI compares against the run's intended
+    counts — it makes 'the factory has 60 datasets but the plan had 16' visible
+    instead of silent."""
+    counts: Dict[str, int] = {}
+    for category in DEPLOY_ORDER:
+        op = getattr(adf, _RESOURCE_CALL[category])
+        try:
+            counts[category] = sum(
+                1 for _ in op.list_by_factory(cfg.resource_group, cfg.factory_name)
+            )
+        except Exception:  # noqa: BLE001 — verification must never fail the deploy
+            counts[category] = -1  # unknown
+    return counts
+
+
 def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str]:
     """Deploy every artifact in dependency order. Idempotent. MOCK-aware.
 
@@ -249,6 +319,12 @@ def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str
     to Claude once to correct the artifact, then redeployed — the same heal loop
     used at runtime, applied at create_or_update time. Recorded fixes are exposed
     on ``deploy_artifacts.last_heals`` for the UI.
+
+    Convergence (fixes the "objects pile up / created thrice" bug): the keep-set is
+    the run's FULL intended object list, computed upfront, and prune runs in a
+    ``finally`` — so even if a deploy raises mid-loop, the factory still converges to
+    exactly this run and stale names from earlier runs are removed. Prune never
+    deletes this run's own objects because they are all in ``keep``.
     """
     if mock_mode():
         return _mock_deploy(run_dir)
@@ -258,34 +334,54 @@ def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str
     adf = get_datafactory_client(cfg)
     deployed: List[str] = []
     heals: List[Dict[str, str]] = []
-    keep: Dict[str, set] = {}
+    keep = _intended_keep(run_dir)  # full intended set, known before any write
     deploy_artifacts.last_heals = heals  # type: ignore[attr-defined]
+    deploy_artifacts.last_pruned = []  # type: ignore[attr-defined]
+    deploy_artifacts.last_intended_counts = {  # type: ignore[attr-defined]
+        cat: len(names) for cat, names in keep.items()
+    }
+    deploy_artifacts.last_factory_counts = None  # type: ignore[attr-defined]
 
     from agent.validator import heal_artifact, self_heal_enabled
 
-    for category in DEPLOY_ORDER:
-        for name, properties in _ordered_items(category, _load_category(run_dir, category)):
+    try:
+        for category in DEPLOY_ORDER:
+            for name, properties in _ordered_items(category, _load_category(run_dir, category)):
+                try:
+                    _real_deploy_object(adf, cfg, category, name, properties)
+                except Exception as exc:  # noqa: BLE001 — bad ARM body
+                    if not self_heal_enabled():
+                        raise
+                    fix = heal_artifact(
+                        run_dir, category, name, f"{type(exc).__name__}: {exc}", phase="deploy"
+                    )
+                    heals.append({"category": category, "name": name, "fix": fix})
+                    fixed = _load_category(run_dir, category)[name]
+                    _real_deploy_object(adf, cfg, category, name, fixed)
+                deployed.append(f"{category}/{name}")
+    finally:
+        # Converge to exactly this run — always, even on a partial deploy failure —
+        # so stale objects from prior runs never accumulate (16 -> 32 -> 48). Prune
+        # must never mask the deploy error nor crash the deploy: record its own
+        # failure on last_prune_error so a non-converging factory is VISIBLE instead
+        # of silently piling up.
+        deploy_artifacts.last_prune_error = None  # type: ignore[attr-defined]
+        if _prune_enabled():
             try:
-                _real_deploy_object(adf, cfg, category, name, properties)
-            except Exception as exc:  # noqa: BLE001 — bad ARM body
-                if not self_heal_enabled():
-                    raise
-                fix = heal_artifact(run_dir, category, name, f"{type(exc).__name__}: {exc}")
-                heals.append({"category": category, "name": name, "fix": fix})
-                fixed = _load_category(run_dir, category)[name]
-                _real_deploy_object(adf, cfg, category, name, fixed)
-            deployed.append(f"{category}/{name}")
-            keep.setdefault(category, set()).add(name)
-
-    # Converge: remove objects left over from prior runs (stale LLM-drifted names).
-    pruned = _real_prune(adf, cfg, keep) if _prune_enabled() else []
-    deploy_artifacts.last_pruned = pruned  # type: ignore[attr-defined]
+                deploy_artifacts.last_pruned = _real_prune(adf, cfg, keep)  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001 — surface, don't mask/raise
+                deploy_artifacts.last_prune_error = f"{type(exc).__name__}: {exc}"  # type: ignore[attr-defined]
+        # Verify: list what the factory really contains now, per category.
+        deploy_artifacts.last_factory_counts = _factory_counts_real(adf, cfg)  # type: ignore[attr-defined]
     return deployed
 
 
-# Most recent deploy-time heals + prunes (populated by deploy_artifacts).
+# Most recent deploy-time heals + prunes + verification (populated by deploy_artifacts).
 deploy_artifacts.last_heals = []  # type: ignore[attr-defined]
 deploy_artifacts.last_pruned = []  # type: ignore[attr-defined]
+deploy_artifacts.last_prune_error = None  # type: ignore[attr-defined]
+deploy_artifacts.last_intended_counts = {}  # type: ignore[attr-defined]
+deploy_artifacts.last_factory_counts = None  # type: ignore[attr-defined]
 
 
 def deploy_object(run_dir: str, category: str, name: str, cfg: "AzureConfig | None" = None):

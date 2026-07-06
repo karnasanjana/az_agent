@@ -167,17 +167,151 @@ def _build_anthropic_client(cfg: "FoundryConfig"):
     return AsyncAnthropic(**kwargs)
 
 
-def get_claude_model():
-    """Build a Pydantic AI model backed by Claude on Azure AI Foundry.
-
-    The key/endpoint are read from the environment, never hardcoded.
-    """
+def _anthropic_model():
+    """Pydantic AI model backed by Claude on Azure AI Foundry (Anthropic endpoint)."""
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.providers.anthropic import AnthropicProvider
 
     cfg = FoundryConfig.from_env()
     client = _build_anthropic_client(cfg)
     return AnthropicModel(cfg.model, provider=AnthropicProvider(anthropic_client=client))
+
+
+def _openai_model():
+    """Pydantic AI model backed by an OpenAI-compatible endpoint. Reads OPENAI_API_KEY.
+
+    Covers plain OpenAI, Azure OpenAI, and Azure AI Foundry models exposed on the
+    OpenAI-compatible ``/models`` route (e.g. Phi-4-mini-reasoning, DeepSeek, Mistral,
+    gpt-*-mini). For those set:
+
+        LLM_PROVIDER=openai
+        LLM_MODEL=<deployment name, e.g. Phi-4-mini-reasoning>
+        OPENAI_BASE_URL=https://<resource>.services.ai.azure.com/models
+        OPENAI_API_KEY=<foundry key>
+        OPENAI_API_VERSION=2024-05-01-preview   # Foundry requires this query param
+
+    Key/endpoint/version come from the environment, never hardcoded."""
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    model_id = os.environ.get("LLM_MODEL", "Phi-4-mini-reasoning")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    api_version = os.environ.get("OPENAI_API_VERSION")
+    if base_url:
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        # Azure AI Foundry's /models route rejects calls without an api-version query
+        # param. When set, build an explicit client that appends it to every request;
+        # otherwise fall back to the plain base_url/api_key provider.
+        if api_version:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(
+                base_url=base_url,
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                default_query={"api-version": api_version},
+            )
+            provider = OpenAIProvider(openai_client=client)
+        else:
+            provider = OpenAIProvider(base_url=base_url, api_key=os.environ.get("OPENAI_API_KEY"))
+        return OpenAIChatModel(model_id, provider=provider)
+    return OpenAIChatModel(model_id)  # OPENAI_API_KEY picked up from env by the provider
+
+
+def _gemini_model():
+    """Pydantic AI model backed by Google Gemini. Reads GEMINI_API_KEY / GOOGLE_API_KEY."""
+    from pydantic_ai.models.gemini import GeminiModel
+
+    model_id = os.environ.get("LLM_MODEL", "gemini-1.5-pro")
+    return GeminiModel(model_id)
+
+
+# provider aliases -> builder
+_MODEL_BUILDERS = {
+    "anthropic": _anthropic_model,
+    "claude": _anthropic_model,
+    "foundry": _anthropic_model,
+    "openai": _openai_model,
+    "azure-openai": _openai_model,
+    "azure_openai": _openai_model,
+    "google": _gemini_model,
+    "gemini": _gemini_model,
+}
+
+
+def get_model():
+    """Build a Pydantic AI model for the configured provider — the SINGLE place the
+    project is coupled to an LLM. Swap providers with env vars, no code change:
+
+        LLM_PROVIDER=anthropic|openai|gemini   (default: anthropic)
+        LLM_MODEL=<provider model id>          (provider default if unset)
+
+    Because every agent uses ``output_type=<Pydantic model>`` (structured output),
+    any provider with tool/JSON mode drops in. Keys/endpoints come from the
+    environment, never hardcoded.
+    """
+    provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
+    builder = _MODEL_BUILDERS.get(provider)
+    if builder is None:
+        raise RuntimeError(
+            f"Unknown LLM_PROVIDER '{provider}'. Supported: "
+            f"{', '.join(sorted(set(_MODEL_BUILDERS)))}."
+        )
+    return builder()
+
+
+# Backward-compatible alias — existing callers keep working; new code uses get_model().
+def get_claude_model():
+    return get_model()
+
+
+_REASONING_HINTS = ("gpt-5", "o1", "o3", "o4", "reasoning")
+
+
+def is_reasoning_model() -> bool:
+    """True when LLM_MODEL is an OpenAI-style reasoning model (gpt-5*, o1/o3/o4,
+    or any '*reasoning*'). These reject a custom temperature and spend part of the
+    token budget on hidden reasoning."""
+    m = os.environ.get("LLM_MODEL", "").lower()
+    return any(h in m for h in _REASONING_HINTS)
+
+
+def default_model_settings() -> dict:
+    """Model settings for the parser/heal agents, adapted to the active model.
+
+    Reasoning models (gpt-5-nano, o-series) reject ``temperature`` other than the
+    default and burn tokens on hidden reasoning — so drop temperature and give a
+    bigger completion budget. Everything else keeps deterministic temperature=0.
+    """
+    if is_reasoning_model():
+        return {"max_tokens": 32000}
+    return {"max_tokens": 16384, "temperature": 0.0}
+
+
+def structured_output(model_cls):
+    """Wrap a Pydantic output type in the output MODE the active provider supports.
+
+    Pydantic AI's default structured output uses forced tool-calling
+    (tool_choice="required"). That fails on chat models whose serving stack has no
+    tool-call parser — e.g. Phi-4-mini on Azure Foundry returns
+    ``tool_choice="required" requires --tool-call-parser to be set``. For those we
+    fall back to PROMPTED JSON (schema in the prompt, model returns JSON text, SDK
+    validates) which works on any chat model. Claude keeps tool-calling (best).
+
+    Override per deployment with LLM_OUTPUT_MODE=tool|prompted|native.
+    """
+    mode = os.environ.get("LLM_OUTPUT_MODE", "").strip().lower()
+    if not mode:
+        provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
+        mode = "tool" if provider in {"anthropic", "claude", "foundry"} else "prompted"
+    if mode == "prompted":
+        from pydantic_ai import PromptedOutput
+
+        return PromptedOutput(model_cls)
+    if mode == "native":
+        from pydantic_ai import NativeOutput
+
+        return NativeOutput(model_cls)
+    return model_cls  # tool mode = Pydantic AI default
 
 
 # --------------------------------------------------------------------------- #

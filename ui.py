@@ -68,19 +68,49 @@ INDEX_HTML = r"""<!doctype html>
   .err { color:var(--bad); white-space:pre-wrap; }
   .pill { font-size:11px; color:var(--mut); }
   label.file { font-size:12px; color:var(--mut); cursor:pointer; }
+  .azin { width:100%; margin:3px 0; background:var(--panel2); color:var(--ink);
+          border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .warn { color:var(--warn); white-space:pre-wrap; }
 </style>
 </head>
 <body>
 <header>
-  <h1>BRD &rarr; ADF Medallion Agent</h1>
+  <h1>BRD &rarr; ADF Agent</h1>
   <span id="modeTag" class="tag">checking&hellip;</span>
-  <span class="tag">Bronze=Copy &nbsp;Silver/Gold=Data&nbsp;Flow</span>
+  <span id="healTag" class="tag" style="display:none">self-heal ON</span>
   <span id="runTag" class="pill"></span>
 </header>
 <main>
   <section class="left">
-    <h2>1. Business Requirements</h2>
-    <textarea id="brd" placeholder="Paste the BRD here, or upload a .txt/.md/.pdf file&hellip;"></textarea>
+    <h2>0. Azure connection</h2>
+    <details id="azBox" class="card" style="padding:0">
+      <summary>Deploy target <span id="azSummary" class="pill"></span></summary>
+      <div style="padding:10px">
+        <div class="muted" style="margin-bottom:8px">Where pipelines get deployed. Saved for this
+          server session only — never written into the code.</div>
+        <input id="az_subscription_id" class="azin" placeholder="Subscription ID"/>
+        <input id="az_resource_group" class="azin" placeholder="Resource group"/>
+        <input id="az_factory_name" class="azin" placeholder="Data Factory name"/>
+        <input id="az_storage_account" class="azin" placeholder="Storage account name"/>
+        <div class="row">
+          <select id="az_storage_kind" class="azin" style="flex:1">
+            <option value="">storage kind (auto)</option>
+            <option value="adls">ADLS Gen2 (hierarchical namespace)</option>
+            <option value="blob">Plain Blob storage</option>
+          </select>
+          <input id="az_location" class="azin" placeholder="Region (e.g. eastus)" style="flex:1"/>
+        </div>
+        <div class="row">
+          <button id="azSaveBtn" class="sec">Save</button>
+          <button id="azTestBtn" class="sec">Test connection</button>
+        </div>
+        <div id="azState" class="pill"></div>
+        <div id="azChecks"></div>
+      </div>
+    </details>
+
+    <h2>1. What do you want to build?</h2>
+    <textarea id="brd" placeholder="Describe it in plain English or paste a full BRD &mdash; e.g. &quot;copy the daily sales CSVs from https://... into the lake and aggregate revenue by region&quot;. Or upload a .txt/.md/.pdf."></textarea>
     <div class="row">
       <label class="file">Upload BRD (.txt/.md/.pdf)<input id="file" type="file" accept=".txt,.md,.text,.pdf" style="display:none"/></label>
       <span id="fileName" class="pill"></span>
@@ -123,14 +153,18 @@ INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section class="right">
-    <h2>2. Pipeline graph (click a layer)</h2>
-    <div id="graph" class="muted">Generate a plan to see the Bronze&rarr;Silver&rarr;Gold graph.</div>
+    <h2>2. Pipeline graph (click a step)</h2>
+    <div id="graph" class="muted">Generate a plan to see the pipeline steps.</div>
 
     <h2>Node detail</h2>
     <div id="detail" class="card muted">Select a node above.</div>
 
-    <h2>3. Governance plan (human-readable)</h2>
-    <details><summary>Show plain-text plan</summary><pre id="planText" class="muted">&mdash;</pre></details>
+    <h2>Plan &mdash; what I'll build</h2>
+    <div id="planReadable" class="card muted">Generate a plan to see it in plain English.</div>
+    <div id="planNotes"></div>
+
+    <h2>3. Governance plan (raw)</h2>
+    <details><summary>Show plain-text plan (with JSON)</summary><pre id="planText" class="muted">&mdash;</pre></details>
 
     <h2>All objects</h2>
     <div id="objects" class="muted">&mdash;</div>
@@ -147,7 +181,41 @@ async function jpost(u, body){ const r = await fetch(u,{method:'POST',headers:{'
 
 (async()=>{ try{ const h=await jget('/health');
   const t=$('#modeTag'); if(h.mock){t.textContent='MOCK tenant (no Azure writes)';t.className='tag mock';}
-  else{t.textContent='LIVE Azure';t.className='tag live';} }catch(e){} })();
+  else{t.textContent='LIVE Azure';t.className='tag live';}
+  if(h.self_heal){ $('#healTag').style.display=''; }
+}catch(e){} })();
+
+// --- Azure connection panel: read/set the deploy target from the UI ---------
+const AZ_FIELDS = ['subscription_id','resource_group','factory_name','storage_account','storage_kind','location'];
+function azSummary(cfg){
+  const ok = cfg.subscription_id && cfg.resource_group && cfg.factory_name && cfg.storage_account;
+  $('#azSummary').textContent = ok ? (cfg.factory_name+' / '+cfg.storage_account) : 'not set — click to configure';
+  if(!ok) $('#azBox').open = true;
+}
+(async()=>{ try{
+  const cfg = await jget('/azure-config');
+  AZ_FIELDS.forEach(f=>{ const el=$('#az_'+f); if(el && cfg[f]) el.value=cfg[f]; });
+  azSummary(cfg);
+}catch(e){} })();
+
+$('#azSaveBtn').onclick = async ()=>{
+  const body={}; AZ_FIELDS.forEach(f=>{ body[f]=$('#az_'+f).value.trim(); });
+  try{
+    const cfg = await jpost('/azure-config', body);
+    $('#azState').textContent='Saved for this session.'; azSummary(cfg); $('#azChecks').innerHTML='';
+  }catch(e){ $('#azState').textContent='Save failed: '+e.message; }
+};
+
+$('#azTestBtn').onclick = async ()=>{
+  $('#azState').textContent='Testing…'; $('#azChecks').innerHTML='';
+  try{
+    const r = await jpost('/azure-config/test', {});
+    $('#azState').textContent = r.ok ? 'Connection OK.' : 'Connection has problems:';
+    $('#azChecks').innerHTML = '<div class="card">'+r.checks.map(c=>
+      '<div class="check"><span class="dot '+(c.passed?'ok':'bad')+'"></span><div><b>'+
+      esc(c.name)+'</b><div class="muted">'+esc(c.detail||'')+'</div></div></div>').join('')+'</div>';
+  }catch(e){ $('#azState').textContent='Test failed: '+e.message; }
+};
 
 $('#file').addEventListener('change', async (e)=>{
   const f=e.target.files[0]; if(!f) return; $('#fileName').textContent=f.name;
@@ -197,12 +265,18 @@ $('#genBtn').onclick = async ()=>{
 function applyPlan(data){
   if(data.status==='NEEDS_CLARIFICATION'){
     renderClar(data.clarifications);
+    renderPlan(data);  // show any assumptions the agent already made
     $('#approveBox').style.display='none';
     REVIEW=GRAPH=null; $('#graph').textContent=''; $('#objects').innerHTML='';
     $('#preflight').innerHTML=''; $('#planText').textContent='—';
     return;
   }
-  $('#clar').innerHTML='';
+  // Non-blocking questions: the plan built fine, these are optional to answer.
+  if(data.clarifications && data.clarifications.length){
+    $('#clar').innerHTML = '<h2>Questions (optional)</h2><div class="card">'+
+      'The plan below is complete and approvable. Answer these in the chat if you want it adjusted first:'+
+      '<ul>'+data.clarifications.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
+  } else { $('#clar').innerHTML=''; }
   // A refine reopens the approval gate — stop any stale live run/poll.
   if(POLL){ clearInterval(POLL); POLL=null; }
   $('#liveBox').style.display='none';
@@ -210,7 +284,32 @@ function applyPlan(data){
   renderPreflight(data.preflight);
   renderGraph(GRAPH); renderObjects(REVIEW);
   $('#planText').textContent=data.plan_text; $('#planText').className='';
+  renderPlan(data);
   renderGate(data);
+}
+
+// --- readable plan + assumptions/suggestions (agent proposes, you approve) ---
+function mdToHtml(md){
+  return (md||'').split('\n').map(line=>{
+    if(/^## /.test(line)) return '<h3>'+esc(line.slice(3))+'</h3>';
+    if(/^# /.test(line))  return '<h2 style="border:0;margin:.3em 0">'+esc(line.slice(2))+'</h2>';
+    let t = esc(line).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`(.+?)`/g,'<code>$1</code>');
+    if(/^- /.test(line)) return '<div style="margin-left:1em">&bull; '+t.slice(2)+'</div>';
+    return line.trim()===''? '<div style="height:.4em"></div>' : '<div>'+t+'</div>';
+  }).join('');
+}
+function renderPlan(data){
+  if(data.plan_markdown){
+    $('#planReadable').innerHTML = mdToHtml(data.plan_markdown);
+    $('#planReadable').className = 'card';
+  }
+  const A = data.assumptions||[], S = data.suggestions||[];
+  let html='';
+  if(A.length) html += '<h2>Assumptions I made (change any via chat)</h2><div class="card">'+
+    A.map(a=>'<div class="check"><span class="dot ok"></span><div>'+esc(a)+'</div></div>').join('')+'</div>';
+  if(S.length) html += '<h2>Optional suggestions</h2><div class="card">'+
+    S.map(s=>'<div class="check"><span class="dot"></span><div>'+esc(s)+'</div></div>').join('')+'</div>';
+  $('#planNotes').innerHTML = html;
 }
 
 // --- chat: refine the spec or answer the agent's questions ---
@@ -243,15 +342,16 @@ $('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat();
 
 function reset(){
   REVIEW=GRAPH=null; if(POLL){clearInterval(POLL);POLL=null;}
-  ['preflight','clar','graph','objects','chatLog'].forEach(id=>$('#'+id).innerHTML='');
+  ['preflight','clar','graph','objects','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
   $('#detail').innerHTML='Select a node above.'; $('#detail').className='card muted';
+  $('#planReadable').innerHTML='Generate a plan to see it in plain English.'; $('#planReadable').className='card muted';
   $('#planText').textContent='—'; $('#approveBox').style.display='none'; $('#liveBox').style.display='none';
   $('#chatBox').style.display='none'; $('#graph').textContent=''; $('#runErr').textContent='';
 }
 
 function renderClar(items){
-  $('#clar').innerHTML = '<h2>Needs clarification</h2><div class="card">'+
-    'The agent will not invent components. Answer these in the chat below (or edit the BRD and regenerate):'+
+  $('#clar').innerHTML = '<h2>One thing before I can build</h2><div class="card">'+
+    'Answer in the chat below (or edit the description and regenerate):'+
     '<ul>'+items.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
 }
 
@@ -261,12 +361,28 @@ function renderPreflight(pf){
   $('#preflight').innerHTML='<h2>Pre-flight ('+(pf.passed?'PASS':'FAIL')+')</h2><div class="card">'+rows+'</div>';
 }
 
+function orderedNodes(g){
+  // Topological order from the edges (works for any pipeline shape);
+  // falls back to the server's node order for anything unreachable.
+  const indeg = {}, next = {};
+  g.nodes.forEach(n=>{ indeg[n.id]=0; });
+  g.edges.forEach(e=>{ if(e.to in indeg){ indeg[e.to]++; (next[e.from]=next[e.from]||[]).push(e.to); } });
+  const queue = g.nodes.filter(n=>indeg[n.id]===0).map(n=>n.id), out=[], seen=new Set();
+  while(queue.length){
+    const id=queue.shift(); if(seen.has(id)) continue; seen.add(id); out.push(id);
+    (next[id]||[]).forEach(t=>{ if(--indeg[t]===0) queue.push(t); });
+  }
+  g.nodes.forEach(n=>{ if(!seen.has(n.id)) out.push(n.id); });
+  return out.map(id=>g.nodes.find(n=>n.id===id));
+}
+
 function renderGraph(g){
-  const order = ['bronze','silver','gold'];
-  const nodes = order.map(l=>g.nodes.find(n=>n.id===l)).filter(Boolean);
+  if(!g.nodes.length){ $('#graph').textContent='No executable steps found.'; return; }
+  const nodes = orderedNodes(g);
   let html='<div class="graph">';
   nodes.forEach((n,i)=>{
-    html += '<div class="node '+n.id+'" data-id="'+n.id+'" onclick="selNode(\''+n.id+'\')">'+
+    const idx = g.nodes.indexOf(n);
+    html += '<div class="node '+(n.layer||'')+'" data-idx="'+idx+'" onclick="selNode('+idx+')">'+
             '<div class="l">'+esc(n.label)+'</div><div class="k">'+esc(n.kind)+'</div>'+
             '<div class="k">'+esc(n.note||'')+'</div></div>';
     if(i<nodes.length-1) html+='<div class="arrow">&rarr;<small>Succeeded</small></div>';
@@ -275,13 +391,14 @@ function renderGraph(g){
   $('#graph').innerHTML=html;
 }
 
-function selNode(id){
-  document.querySelectorAll('.node').forEach(n=>n.classList.toggle('sel', n.dataset.id===id));
-  const n = GRAPH.nodes.find(x=>x.id===id);
+function selNode(idx){
+  document.querySelectorAll('.node').forEach(n=>n.classList.toggle('sel', n.dataset.idx==idx));
+  const n = GRAPH.nodes[idx];
+  if(!n) return;
   let h = '<div><b>'+esc(n.label)+'</b> &mdash; '+esc(n.kind)+'</div>'+
           '<div class="muted">object: '+esc(n.object||'')+' &nbsp; source: '+esc(n.source_dataset||'-')+
           ' &rarr; sink: '+esc(n.sink_dataset||'-')+'</div>';
-  if(n.id==='bronze'){ h+='<div class="pill">raw landing, no transformation &mdash; no script (correct)</div>'; }
+  if(n.layer==='bronze'){ h+='<div class="pill">raw landing, no transformation &mdash; no script (correct)</div>'; }
   h += '<h2>JSON</h2><pre>'+esc(JSON.stringify(n.json,null,2))+'</pre>';
   if(n.script){ h+='<h2>Data Flow script</h2><pre>'+esc(n.script)+'</pre>'; }
   $('#detail').className='card'; $('#detail').innerHTML=h;
@@ -325,26 +442,57 @@ $('#approveBtn').onclick = async ()=>{
   }catch(e){ alert('Approve blocked: '+e.message); $('#approveBtn').disabled=false; }
 };
 
+const CAT_LABEL = {linkedServices:'linked services', datasets:'datasets',
+                   dataflows:'data flows', pipelines:'pipelines', triggers:'triggers'};
+
+function renderDeployReport(s){
+  let html = 'state: '+s.status+
+    (s.containers_created? '  •  containers '+JSON.stringify(s.containers_created):'');
+  const dr = s.deploy_report;
+  if(dr){
+    // Intended (this plan) vs actual (what the factory really contains now).
+    const rows = Object.keys(CAT_LABEL).map(cat=>{
+      const want = (dr.intended_counts||{})[cat];
+      const have = dr.factory_counts ? dr.factory_counts[cat] : null;
+      if(!want && !have) return '';
+      const match = (have==null || have===-1) ? '' : (have===want ? ' ✓' : ' ⚠ factory has '+have);
+      return '<div class="pill">'+CAT_LABEL[cat]+': '+(want||0)+' in plan'+match+'</div>';
+    }).join('');
+    html += '<div style="margin-top:6px">'+rows+'</div>';
+    if(dr.pruned && dr.pruned.length){
+      html += '<div class="pill">removed '+dr.pruned.length+' stale object(s) from earlier runs</div>';
+    }
+    if(dr.prune_error){
+      html += '<div class="warn">Cleanup of old objects failed — stale objects may remain in the factory: '+
+              esc(dr.prune_error)+'</div>';
+    }
+  } else if(s.deployed){
+    html += '  •  deployed '+s.deployed.length+' objects';
+  }
+  $('#deployState').innerHTML = html;
+}
+
 async function poll(){
   if(!RUN) return;
   let s; try{ s = await jget('/status/'+RUN); }catch(e){ return; }
-  $('#deployState').textContent = 'state: '+s.status+
-    (s.deployed? '  •  deployed '+s.deployed.length+' objects':'')+
-    (s.containers_created? '  •  containers '+JSON.stringify(s.containers_created):'');
+  renderDeployReport(s);
   if(s.heals && s.heals.length){
-    $('#heals').innerHTML = '<h2>Auto-fixes</h2><div class="card">'+
+    $('#heals').innerHTML = '<h2>Auto-fixes (self-heal)</h2><div class="card">'+
       s.heals.map(h=>'<div class="check"><span class="dot ok"></span><div><b>'+
         esc(h.category)+'/'+esc(h.name)+'</b><div class="muted">'+esc(h.fix||'')+'</div></div></div>').join('')+
-      '</div>';
+      '<div class="pill">Full before/after audit: artifacts/&lt;run&gt;/heals.json</div></div>';
   }
-  const layers = (s.run && s.run.layers) || {};
-  $('#layers').innerHTML = ['bronze','silver','gold'].map(l=>{
-    const d = layers[l] || {status:'Pending'};
-    return '<div class="layerbox"><div class="s">'+l.toUpperCase()+'</div>'+
-      '<div class="badge s-'+(d.status||'Pending')+'">'+(d.status||'Pending')+'</div>'+
-      (d.run_id?'<div class="pill">run '+esc(d.run_id)+'</div>':'')+
-      (d.error?'<div class="err">'+esc(d.error)+'</div>':'')+'</div>';
-  }).join('');
+  // Per-step live status: generic steps when present, medallion layers as fallback.
+  let steps = (s.run && s.run.steps) || null;
+  if(!steps){
+    const layers = (s.run && s.run.layers) || {};
+    steps = ['bronze','silver','gold'].map(l=>({name:l.toUpperCase(), ...(layers[l]||{status:'Pending'})}));
+  }
+  $('#layers').innerHTML = steps.map(d=>
+    '<div class="layerbox"><div class="s">'+esc(d.name)+'</div>'+
+    '<div class="badge s-'+(d.status||'Pending')+'">'+(d.status||'Pending')+'</div>'+
+    (d.run_id?'<div class="pill">run '+esc(d.run_id)+'</div>':'')+
+    (d.error?'<div class="err">'+esc(d.error)+'</div>':'')+'</div>').join('');
   if(['SUCCEEDED','FAILED','ERROR'].includes(s.status)){
     clearInterval(POLL); POLL=null;
     if(s.error) $('#runErr').textContent = s.error;
