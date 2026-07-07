@@ -124,6 +124,38 @@ def check(plan: LogicalPlan) -> List[str]:
                         f"{known} (has: {sorted(available)})"
                     )
 
+    # 11. Pipeline structure (only when the BRD specified one). Every membership
+    #     reference must resolve, invokes must point at declared pipelines, and
+    #     every entity + output must be covered so nothing goes unbuilt.
+    if plan.pipelines:
+        pl_names = {p.name for p in plan.pipelines}
+        out_names = {o.name for o in plan.outputs}
+        covered_ingest: Set[str] = set()
+        covered_silver: Set[str] = set()
+        covered_gold: Set[str] = set()
+        for p in plan.pipelines:
+            for e in p.ingest:
+                (covered_ingest.add(e) if e in src_by_entity
+                 else problems.append(f"pipeline '{p.name}': ingest entity '{e}' unknown"))
+            for e in p.silver:
+                (covered_silver.add(e) if e in src_by_entity
+                 else problems.append(f"pipeline '{p.name}': silver entity '{e}' unknown"))
+            for o in p.gold:
+                (covered_gold.add(o) if o in out_names
+                 else problems.append(f"pipeline '{p.name}': gold output '{o}' unknown"))
+            for child in p.invokes:
+                if child not in pl_names:
+                    problems.append(f"pipeline '{p.name}': invokes unknown pipeline '{child}'")
+        for e in src_by_entity:
+            if e not in covered_ingest:
+                problems.append(f"entity '{e}' is not ingested by any pipeline")
+        for t in plan.transforms:
+            if t.entity in src_by_entity and t.entity not in covered_silver:
+                problems.append(f"entity '{t.entity}' has a transform but no silver pipeline")
+        for o in out_names:
+            if o not in covered_gold:
+                problems.append(f"output '{o}' is not built by any pipeline")
+
     # 9b. column existence for transforms (only when the source has a schema).
     for t in plan.transforms:
         src = src_by_entity.get(t.entity)

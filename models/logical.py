@@ -204,6 +204,26 @@ class SchedulePlan(BaseModel):
     start_time: Optional[str] = None
 
 
+class LogicalPipeline(BaseModel):
+    """Pipeline ORGANISATION the BRD asks for — how the work is grouped into
+    pipelines. This is a real requirement (a BRD may name PL_Landing_To_Bronze,
+    PL_Bronze_To_Silver, a master, etc.), so the model captures it and the
+    compiler builds exactly that many — no fixed count baked into code. Membership
+    is by BUSINESS name (entities / output names), never ADF resource names; the
+    compiler assigns every ADF name and dependency.
+
+    A pipeline is EITHER a work stage (fill ingest/silver/gold) OR an orchestrator
+    (fill `invokes` with the names of other logical pipelines, in run order) — a
+    master. Leave `LogicalPlan.pipelines` empty when the BRD does not specify a
+    structure; the compiler then builds a single pipeline."""
+
+    name: str  # logical/BRD name, e.g. "PL_Bronze_To_Silver" (compiler normalizes)
+    ingest: List[str] = Field(default_factory=list)  # entities to land (bronze copy)
+    silver: List[str] = Field(default_factory=list)  # entities to clean (silver flow)
+    gold: List[str] = Field(default_factory=list)  # OUTPUT names to build (gold flow)
+    invokes: List[str] = Field(default_factory=list)  # child pipeline names, in run order
+
+
 class LogicalPlan(BaseModel):
     """Complete business description of the pipeline. NO ADF concepts."""
 
@@ -211,6 +231,10 @@ class LogicalPlan(BaseModel):
     sources: List[LogicalSource]
     transforms: List[EntityTransform] = Field(default_factory=list)
     outputs: List[OutputPlan] = Field(default_factory=list)
+    # Pipeline organisation the BRD specifies. Empty -> compiler builds ONE
+    # pipeline. Populated -> compiler builds exactly these (any count the BRD
+    # asks for, master + stages included).
+    pipelines: List[LogicalPipeline] = Field(default_factory=list)
     schedule: Optional[SchedulePlan] = None
     # Requirements the model recognized but this system cannot build.
     # LOUD capability contract: each is one plain-English line, e.g.

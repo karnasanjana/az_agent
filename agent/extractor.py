@@ -51,6 +51,16 @@ Rules:
   {name: order_month, op: month, column: order_purchase_timestamp}], then
   group_by = [order_year, order_month] with the sum aggregation. This is fully
   supported — do NOT mark year/month grouping as unsupported.
+- pipelines: capture the pipeline ORGANISATION the requirements ask for. If the
+  BRD names pipelines (e.g. "PL_Landing_To_Bronze", "PL_Bronze_To_Silver", a
+  master) or says how the work is grouped, list one entry per pipeline: put its
+  member entities in `ingest` (bronze copies) / `silver` (cleaning) and its
+  output names in `gold`; for a master/orchestrator, fill `invokes` with the
+  other pipeline names IN RUN ORDER and leave ingest/silver/gold empty. Use the
+  BRD's own names. Cover EVERY entity and output across the stage pipelines — do
+  not leave one out. If the BRD does NOT specify any pipeline structure, leave
+  `pipelines` empty and one pipeline will be built. Never invent a structure the
+  BRD didn't ask for.
 - schedule: only when the requirements state or clearly imply one.
 - unsupported: every requirement you recognized but cannot express (validation
   gates, alerting, archive/delete steps, SCD2, incremental merge, ForEach

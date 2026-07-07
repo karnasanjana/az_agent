@@ -396,21 +396,93 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
         )
 
     # ------------------------------------------------------------------ #
-    # One pipeline: all activities, bronze -> silver -> gold via dependsOn.
-    # (No master + child pipelines — a medallion BRD describes one flow, not a
-    # dozen. dependsOn already gives the exact ordering and per-activity rerun.)
+    # Pipelines — driven by the BRD. If the plan lists pipelines, build exactly
+    # those (any count, master + stages). If it lists none, build ONE pipeline.
+    # The compiler assigns every ADF name and dependency; the plan only says how
+    # the work is grouped. No fixed pipeline count is baked into this code.
     # ------------------------------------------------------------------ #
-    pipeline_name = f"pl_{project}"
-    pipelines.append(
-        PipelineDef(name=pipeline_name, activities=bronze_acts + silver_acts + gold_acts)
-    )
+    bronze_by_ent = {a.name[len("copy_"):]: a for a in bronze_acts}
+    silver_by_ent = {a.name[len("flow_silver_"):]: a for a in silver_acts}
+    gold_by_out = {a.name[len("flow_gold_"):]: a for a in gold_acts}
+
+    def _pl_name(logical: str) -> str:
+        s = re.sub(r"[^a-z0-9_]", "_", (logical or "").strip().lower())
+        s = re.sub(r"_+", "_", s).strip("_")
+        if s.startswith("pl_"):
+            s = s[3:]
+        return f"pl_{s or 'pipeline'}"
+
+    def _strip(act: Activity) -> Activity:
+        # Cross-stage ordering comes from the master's ExecutePipeline chain, so
+        # activities inside a stage pipeline carry no intra-pipeline dependency.
+        return act.model_copy(update={"depends_on": []})
+
+    if plan.pipelines:
+        adf_name_of = {lp.name: _pl_name(lp.name) for lp in plan.pipelines}
+        placed: set = set()
+        trigger_target: Optional[str] = None
+        for lp in plan.pipelines:
+            adf = adf_name_of[lp.name]
+            if lp.invokes:  # orchestrator / master
+                acts: List[Activity] = []
+                prev: Optional[str] = None
+                for child in lp.invokes:
+                    child_adf = adf_name_of.get(child, _pl_name(child))
+                    run_name = f"run_{child_adf[len('pl_'):]}"
+                    acts.append(
+                        Activity(
+                            name=run_name,
+                            type="ExecutePipeline",
+                            invoked_pipeline=child_adf,
+                            depends_on=[prev] if prev else [],
+                        )
+                    )
+                    prev = run_name
+                pipelines.append(PipelineDef(name=adf, activities=acts))
+                trigger_target = adf  # the master is what the trigger fires
+            else:  # work stage
+                acts = []
+                for e in lp.ingest:
+                    if e in bronze_by_ent:
+                        acts.append(_strip(bronze_by_ent[e]))
+                        placed.add(bronze_by_ent[e].name)
+                for e in lp.silver:
+                    if e in silver_by_ent:
+                        acts.append(_strip(silver_by_ent[e]))
+                        placed.add(silver_by_ent[e].name)
+                for o in lp.gold:
+                    if o in gold_by_out:
+                        acts.append(_strip(gold_by_out[o]))
+                        placed.add(gold_by_out[o].name)
+                pipelines.append(PipelineDef(name=adf, activities=acts))
+
+        # Nothing silently dropped: any activity the BRD's pipelines didn't place
+        # goes into a catch-all pipeline (completeness normally prevents this).
+        leftover = [
+            a for a in (bronze_acts + silver_acts + gold_acts) if a.name not in placed
+        ]
+        if leftover:
+            extra = f"pl_{project}_unassigned"
+            pipelines.append(PipelineDef(name=extra, activities=[_strip(a) for a in leftover]))
+            assumptions.append(
+                f"{len(leftover)} activities were not assigned to any BRD pipeline "
+                f"-> placed in {extra}"
+            )
+        trigger_target = trigger_target or (pipelines[-1].name if pipelines else f"pl_{project}")
+    else:
+        # No structure specified -> one pipeline, ordered by dependsOn.
+        pipeline_name = f"pl_{project}"
+        pipelines.append(
+            PipelineDef(name=pipeline_name, activities=bronze_acts + silver_acts + gold_acts)
+        )
+        trigger_target = pipeline_name
 
     if plan.schedule:
         triggers.append(
             Trigger(
                 name=f"tr_schedule_{project}",
                 kind=TriggerKind.schedule,
-                pipeline=pipeline_name,
+                pipeline=trigger_target,
                 frequency=plan.schedule.frequency,
                 interval=plan.schedule.interval,
                 start_time=plan.schedule.start_time,

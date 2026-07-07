@@ -114,6 +114,67 @@ def test_aggregation_dup_group_by_raises():
         compile_plan(plan)
 
 
+def test_brd_specified_pipeline_structure(monkeypatch):
+    """When the plan carries pipelines (any BRD may), the compiler builds exactly
+    those — master + stages — not 1 and not per-entity."""
+    monkeypatch.setenv("MOCK", "true")
+    from agent.completeness import check
+    from models.logical import LogicalPipeline, SchedulePlan
+
+    plan = LogicalPlan(
+        project="retail",
+        sources=[
+            LogicalSource(entity="orders", format="csv", file_name="o.csv",
+                          columns=[LogicalColumn(name="order_id"),
+                                   LogicalColumn(name="amount", type="decimal(18,2)")]),
+            LogicalSource(entity="payments", format="csv", file_name="p.csv",
+                          columns=[LogicalColumn(name="order_id"),
+                                   LogicalColumn(name="amount", type="decimal(18,2)")]),
+        ],
+        transforms=[EntityTransform(entity="orders", dedup_keys=["order_id"])],
+        outputs=[OutputPlan(name="monthly_sales", from_entities=["orders", "payments"],
+                            joins=[JoinPlan(left_entity="orders", right_entity="payments",
+                                            left_keys=["order_id"], right_keys=["order_id"])],
+                            aggregations=[AggregationPlan(name="rev", op="sum", column="amount")])],
+        pipelines=[
+            LogicalPipeline(name="PL_Master", invokes=["PL_Bronze", "PL_Silver", "PL_Gold"]),
+            LogicalPipeline(name="PL_Bronze", ingest=["orders", "payments"]),
+            LogicalPipeline(name="PL_Silver", silver=["orders", "payments"]),
+            LogicalPipeline(name="PL_Gold", gold=["monthly_sales"]),
+        ],
+        schedule=SchedulePlan(),
+    )
+    assert check(plan) == []
+    spec = compile_plan(plan)
+    names = [p.name for p in spec.pipelines]
+    assert names == ["pl_master", "pl_bronze", "pl_silver", "pl_gold"]
+    master = next(p for p in spec.pipelines if p.name == "pl_master")
+    assert [a.type for a in master.activities] == ["ExecutePipeline"] * 3
+    # master chains the stages in order
+    assert master.activities[1].depends_on == ["run_bronze"]
+    assert spec.triggers[0].pipeline == "pl_master"
+    run_id = "test_brd_pipes"
+    run_dir = builder.artifacts_dir(run_id)
+    try:
+        builder.write_artifacts(spec, run_id)
+        assert preflight.validate(run_id)["passed"]
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def test_no_pipelines_specified_falls_back_to_one(monkeypatch):
+    monkeypatch.setenv("MOCK", "true")
+    plan = LogicalPlan(
+        project="simple",
+        sources=[LogicalSource(entity="orders", format="csv", file_name="o.csv",
+                               columns=[LogicalColumn(name="order_id")])],
+        transforms=[EntityTransform(entity="orders", dedup_keys=["order_id"])],
+    )
+    spec = compile_plan(plan)
+    assert len(spec.pipelines) == 1
+    assert spec.pipelines[0].name == "pl_simple"
+
+
 def test_gold_date_part_grouping(monkeypatch):
     """Year/Month grouping from a timestamp must build a real gold flow — not be
     dropped as unsupported (the monthly_sales gap the user hit)."""

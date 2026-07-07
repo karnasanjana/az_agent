@@ -421,6 +421,10 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
             aggs = f"each(match(!in([{quoted}], name)), $$ = first($$))"
         else:
             aggs = ",\n        ".join(f"{c.name} = {c.expression}" for c in agg_cols)
+        if not t.group_by:
+            # Global aggregate (one row, no grouping) — no groupBy() clause, which
+            # ADF's DSL rejects when empty (lint 'empty groupBy()').
+            return f"{input_stream} aggregate({aggs}) ~> {t.name}"
         return f"{input_stream} aggregate(groupBy({group}),\n        {aggs}) ~> {t.name}"
 
     if t.kind == TransformKind.sort:
