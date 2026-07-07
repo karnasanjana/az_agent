@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
@@ -224,6 +225,18 @@ def _store_and_respond(
             "suggestions": spec.suggestions,
             "mock": mock_mode(),
         }
+
+    # Ground schemas in REAL data before building: read file headers from storage
+    # and stamp them into the spec, overriding whatever columns the LLM guessed
+    # (or omitted). Never blocks — unreadable files just keep the spec as-is.
+    try:
+        from agent.grounding import ground_spec
+
+        for note in ground_spec(spec):
+            if note not in spec.assumptions:  # /chat re-runs this — don't duplicate
+                spec.assumptions.append(note)
+    except Exception:  # noqa: BLE001 — grounding is best-effort by design
+        pass
 
     # Rebuild from a clean directory so renamed/removed objects don't linger.
     run_dir = builder.artifacts_dir(run_id)
@@ -418,14 +431,24 @@ def _deploy_and_run(run_id: str) -> None:
             "prune_error": getattr(deploy_artifacts, "last_prune_error", None),
         }
 
+        stop_event = run.get("_stop_event")
+        if stop_event is not None and stop_event.is_set():
+            run["status"] = "STOPPED"
+            return
+
         run["status"] = "RUNNING"
-        report = execute(run["run_dir"], on_update=on_update)
+        report = execute(run["run_dir"], on_update=on_update, stop_event=stop_event)
         run["report"] = report
         # Collect any runtime artifact fixes from the self-heal loop.
         for att in report.get("attempts", []):
             if att.get("healed"):
                 heals.append(att["healed"])
-        run["status"] = "SUCCEEDED" if report["status"] == "Succeeded" else "FAILED"
+        if report["status"] == "Succeeded":
+            run["status"] = "SUCCEEDED"
+        elif report["status"] == "Cancelled":
+            run["status"] = "STOPPED"
+        else:
+            run["status"] = "FAILED"
     except Exception as exc:  # surface deploy/runtime errors in /status
         run["status"] = "ERROR"
         hint = _azure_error_hint(exc)
@@ -471,8 +494,23 @@ def approve(req: ApproveRequest, background: BackgroundTasks) -> Dict[str, Any]:
             )
 
     run["status"] = "APPROVED"
+    run["_stop_event"] = threading.Event()
     background.add_task(_deploy_and_run, req.run_id)
     return {"run_id": req.run_id, "status": "APPROVED", "mock": mock_mode()}
+
+
+@app.post("/stop/{run_id}")
+def stop(run_id: str) -> Dict[str, Any]:
+    """Abort a live run: stop the self-heal loop and cancel the in-flight ADF
+    pipeline run (recursively, so child ExecutePipeline runs die too)."""
+    run = _RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    event = run.get("_stop_event")
+    if event is None or run["status"] not in {"APPROVED", "PROVISIONING", "DEPLOYING", "RUNNING"}:
+        raise HTTPException(status_code=409, detail=f"Run is '{run['status']}' — nothing to stop")
+    event.set()
+    return {"run_id": run_id, "status": run["status"], "stopping": True}
 
 
 # --------------------------------------------------------------------------- #

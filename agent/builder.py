@@ -406,7 +406,21 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
 
     if t.kind == TransformKind.aggregate:
         group = ", ".join(t.group_by)
-        aggs = ",\n        ".join(f"{c.name} = {c.expression}" for c in t.columns)
+        # A computed group-by key is 'Name = expr'; its output column is Name.
+        key_names = [g.split("=", 1)[0].strip() if "=" in g else g for g in t.group_by]
+        # ADF outputs groupBy columns automatically; an aggregate column with the
+        # same name is a DF-AGG-005 duplicate-column error. LLMs write exactly
+        # that for dedup ("customer_id = first(customer_id)" with
+        # groupBy(customer_id)) — drop the collisions instead of failing in Azure.
+        agg_cols = [c for c in t.columns if c.name not in key_names]
+        if not agg_cols and t.group_by:
+            # Pure dedup: every declared aggregate collided. Keep every OTHER
+            # column via a column pattern — preserves the full (drifted) schema
+            # instead of collapsing the row to just the group keys.
+            quoted = ", ".join(f"'{k}'" for k in key_names)
+            aggs = f"each(match(!in([{quoted}], name)), $$ = first($$))"
+        else:
+            aggs = ",\n        ".join(f"{c.name} = {c.expression}" for c in agg_cols)
         return f"{input_stream} aggregate(groupBy({group}),\n        {aggs}) ~> {t.name}"
 
     if t.kind == TransformKind.sort:
@@ -418,7 +432,20 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
         return f"{input_stream} select(mapColumn({cols})) ~> {t.name}"
 
     if t.kind == TransformKind.window:
+        # Structured render: window(over(keys), asc/desc(col, true), out = fn()).
+        # A raw `condition` is the legacy escape hatch — the one place models
+        # emit Spark partitionBy/orderBy (DF-DSL-001, run 24756f0f5aa8).
+        if t.partition_by and t.columns:
+            parts = [f"over({', '.join(t.partition_by)})"]
+            parts += [f"{k.order}({k.column}, true)" for k in t.order_by]
+            parts += [f"{c.name} = {c.expression}" for c in t.columns]
+            body = ",\n  ".join(parts)
+            return f"{input_stream} window({body}) ~> {t.name}"
         return f"{input_stream} window({t.condition or ''}) ~> {t.name}"
+
+    if t.kind == TransformKind.limit:
+        # ADF Limit transform: limit(skip, take), both integer literals.
+        return f"{input_stream} limit({t.skip},\n    {t.take}) ~> {t.name}"
 
     if t.kind == TransformKind.join:
         # ADF join DSL: "<left>, <right> join(<cond>, joinType:'inner', ...) ~> <name>".
@@ -436,17 +463,46 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
     raise ValueError(f"Unsupported transform kind: {t.kind}")
 
 
+def _effective_transforms(df: DataFlow) -> "List[Transform]":
+    """Transforms that can actually be rendered. LLMs emit DEGENERATE transforms
+    (aggregate with no groupBy and no columns, derive/select with no columns,
+    filter with no condition) — rendering those is a guaranteed DF-DSL-001 in
+    Azure ('aggregate( )' parse error, run fe4102f4960d). A degenerate transform
+    carries no semantics, so dropping it keeps the flow correct AND running."""
+    kept: List[Transform] = []
+    for t in df.transforms:
+        if t.kind == TransformKind.aggregate and not t.group_by and not t.columns:
+            continue
+        if t.kind in (TransformKind.cast, TransformKind.derived, TransformKind.select) \
+                and not t.columns:
+            continue
+        if t.kind == TransformKind.filter and not (t.condition or "").strip():
+            continue
+        if t.kind == TransformKind.sort and not t.order_by:
+            continue
+        if t.kind == TransformKind.window and not (t.condition or "").strip() \
+                and not (t.partition_by and t.columns):
+            continue
+        kept.append(t)
+    return kept
+
+
 def _delta_ds(datasets: "Dict[str, Dataset] | None", dataset_name: str) -> "Dataset | None":
     """The Dataset object when `dataset_name` is a Delta dataset, else None."""
     ds = (datasets or {}).get(dataset_name)
     return ds if ds is not None and ds.kind == DatasetKind.delta else None
 
 
-def _delta_script_props(ds: Dataset) -> List[str]:
+def _delta_script_props(ds: Dataset, sink: bool = False) -> List[str]:
     """Inline-dataset location lines for a Delta source/sink. Delta is not an ADF
     dataset resource — the container/folder ride inside the data-flow script.
     Parameter tokens are stripped: a Delta table lives at ONE static folder
-    (versioning is Delta's job, not per-run folders)."""
+    (versioning is Delta's job, not per-run folders).
+
+    Sinks are FULL-RELOAD: recreate + mergeSchema. Without this, appends
+    duplicate rows on every re-run, and any projection change (e.g. schema
+    grounding widening 3 guessed columns to the file's real 8) fails with
+    Delta's 'A schema mismatch detected when writing to the Delta table'."""
     loc = ds.location
     lines = ["  format: 'delta',"]
     if loc and loc.container:
@@ -455,6 +511,9 @@ def _delta_script_props(ds: Dataset) -> List[str]:
         folder = _PATH_PARAM.sub("", loc.folder).strip("/").replace("//", "/")
         if folder:
             lines.append(f"  folderPath: '{folder}',")
+    if sink:
+        lines.append("  mergeSchema: true,")
+        lines.append("  recreate: true,")
     return lines
 
 
@@ -497,14 +556,14 @@ def build_dataflow_script(df: DataFlow, datasets: "Dict[str, Dataset] | None" = 
         )
 
     current = df.source.stream_name
-    for t in df.transforms:
+    for t in _effective_transforms(df):
         lines.append(_transform_dsl(current, t))
         current = t.name
 
     sink_lines = [f"{current} sink(allowSchemaDrift: true,", "  validateSchema: false,"]
     sink_delta = _delta_ds(datasets, df.sink.dataset)
     if sink_delta is not None:
-        sink_lines.extend(_delta_script_props(sink_delta))
+        sink_lines.extend(_delta_script_props(sink_delta, sink=True))
     sink_lines.append("  skipDuplicateMapInputs: true,")
     sink_lines.append(f"  skipDuplicateMapOutputs: true) ~> {df.sink.stream_name}")
     lines.append("\n".join(sink_lines))
@@ -536,7 +595,7 @@ def build_dataflow(
         "typeProperties": {
             "sources": [endpoint_entry(s) for s in sources],
             "sinks": [endpoint_entry(df.sink)],
-            "transformations": [{"name": t.name} for t in df.transforms],
+            "transformations": [{"name": t.name} for t in _effective_transforms(df)],
             "scriptLines": build_dataflow_script(df, datasets).split("\n"),
         },
     }
@@ -609,7 +668,20 @@ def _copy_input(dataset_name: str, ctx: Dict[str, Any], pipeline_params: List[st
     return ref
 
 
-_SUPPORTED_ACTIVITIES = {"Copy", "ExecuteDataFlow", "ExecutePipeline"}
+_SUPPORTED_ACTIVITIES = {"Copy", "ExecuteDataFlow", "ExecutePipeline", "Validation", "GetMetadata"}
+
+
+def unsupported_activities(spec: "PipelineSpec") -> List[str]:
+    """Activities the builder will NOT render (they'd be silently skipped).
+    Surfaced in preflight so a BRD requirement never vanishes without a trace."""
+    out: List[str] = []
+    for pl in spec.pipelines:
+        for a in pl.activities:
+            if a.type not in _SUPPORTED_ACTIVITIES:
+                out.append(f"{pl.name}.{a.name} ({a.type})")
+            elif a.type in ("Validation", "GetMetadata") and not (a.source_dataset or a.sink_dataset):
+                out.append(f"{pl.name}.{a.name} ({a.type}: no dataset)")
+    return out
 
 
 def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict[str, Any]:
@@ -617,14 +689,21 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
     pipeline_params = list(pl.parameters)
     activities: List[Dict[str, Any]] = []
 
-    # This ADF model supports Copy / ExecuteDataFlow / ExecutePipeline. The LLM may
-    # add GetMetadata / IfCondition / Validation / Delete activities for the BRD's
-    # error-handling asks — skip them rather than crash, and drop dangling dependsOn
-    # references to the skipped activities so the pipeline stays valid.
-    kept = {a.name for a in pl.activities if a.type in _SUPPORTED_ACTIVITIES}
+    # Activities outside _SUPPORTED_ACTIVITIES (e.g. IfCondition, Delete) are
+    # skipped, and dangling dependsOn references to them dropped so the pipeline
+    # stays valid. unsupported_activities() reports the skips so they surface in
+    # preflight instead of vanishing silently.
+    def _renderable(a) -> bool:
+        if a.type not in _SUPPORTED_ACTIVITIES:
+            return False
+        if a.type in ("Validation", "GetMetadata") and not (a.source_dataset or a.sink_dataset):
+            return False  # nothing to validate against
+        return True
+
+    kept = {a.name for a in pl.activities if _renderable(a)}
 
     for act in pl.activities:
-        if act.type not in _SUPPORTED_ACTIVITIES:
+        if not _renderable(act):
             continue
         common: Dict[str, Any] = {
             "name": act.name,
@@ -690,6 +769,36 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
                     },
                 }
             )
+        elif act.type in ("Validation", "GetMetadata"):
+            # BRD "verify the file exists / is not empty before processing" asks.
+            # Both take one dataset reference; the LLM puts it in source_dataset.
+            ds_name = act.source_dataset or act.sink_dataset
+            ds_ref = _copy_input(ds_name, ctx, pipeline_params)
+            if act.type == "Validation":
+                # Waits for the file to exist AND have >=1 byte, then proceeds;
+                # times out (fails, blocking downstream) when it never appears.
+                common.pop("policy", None)  # control activity: no retry policy
+                common.update(
+                    {
+                        "type": "Validation",
+                        "typeProperties": {
+                            "dataset": ds_ref,
+                            "timeout": "0.00:10:00",
+                            "sleep": 30,
+                            "minimumSize": 1,
+                        },
+                    }
+                )
+            else:
+                common.update(
+                    {
+                        "type": "GetMetadata",
+                        "typeProperties": {
+                            "dataset": ds_ref,
+                            "fieldList": ["exists", "size"],
+                        },
+                    }
+                )
         elif act.type == "ExecutePipeline":
             common.update(
                 {

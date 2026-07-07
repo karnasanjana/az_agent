@@ -76,17 +76,100 @@ def validate(run_id: str, root: str = "artifacts") -> Dict[str, Any]:
         )
     )
 
-    # 6. Every declared data flow has a non-trivial script with a sink.
+    # 6. Every declared data flow has a non-trivial script with a sink, and the
+    #    script LINTS clean — the same classes of problem ADF's Spark broker
+    #    rejects at runtime (DF-DSL-001/DF-AGG-005) caught here in milliseconds.
+    from agent.lint import lint_dataflow_script
+
     for df in spec.dataflows:
         script = load_script(run_dir, df.name)
-        has_sink = "~>" in script and "sink(" in script
+        problems = lint_dataflow_script(df.name, script)
         checks.append(
             _check(
                 f"script_{df.name}",
-                bool(script) and has_sink,
-                f"{len(script.splitlines())} script lines" if script else "empty script",
+                not problems,
+                "; ".join(problems) or f"{len(script.splitlines())} script lines, lint clean",
             )
         )
+
+    # 6b. Container names are concrete and Azure-legal. A parameterized or
+    #     underscore container fails at run time with AdlsGen2InvalidResourceName
+    #     (run df2db30c73a5). The spec validator repairs inferable cases; this
+    #     blocks whatever slips through.
+    from models.spec import _AZ_CONTAINER_RE
+
+    bad_containers = [
+        f"{ds.name}: '{ds.location.container}'"
+        for ds in spec.datasets
+        if ds.location is not None
+        and not _AZ_CONTAINER_RE.fullmatch((ds.location.container or "").strip())
+    ]
+    checks.append(
+        _check(
+            "container_names",
+            not bad_containers,
+            "; ".join(bad_containers) or "all dataset containers are concrete, valid names",
+        )
+    )
+
+    # 7. Medallion wiring: a data flow must never write back onto its own input
+    #    (in-place overwrite — silver stays empty, bronze gets clobbered), a
+    #    silver/gold flow must land in its layer's container, and gold must not
+    #    read bronze when a silver layer exists. The spec validator repairs the
+    #    common cases; this is the backstop that blocks whatever slips through.
+    wiring: List[str] = []
+    ds_by_name = {d.name: d for d in spec.datasets}
+
+    def _container(ds_name: str) -> str:
+        ds = ds_by_name.get(ds_name)
+        if ds is None or ds.location is None or not ds.location.container:
+            return ""
+        return ds.location.container.strip().lower()
+
+    def _layer(df) -> "str | None":
+        if df.layer is not None:
+            return df.layer.value
+        name = df.name.lower()
+        return next((l for l in ("gold", "silver") if l in name), None)
+
+    containers = {_container(d.name) for d in spec.datasets}
+    silver_flows = [df for df in spec.dataflows if _layer(df) == "silver"]
+    for df in spec.dataflows:
+        if df.sink.dataset == df.source.dataset:
+            wiring.append(
+                f"{df.name}: sink dataset == source dataset ('{df.sink.dataset}') "
+                f"— flow overwrites its own input"
+            )
+        layer = _layer(df)
+        sink_container = _container(df.sink.dataset)
+        if layer and layer in containers and sink_container and sink_container != layer:
+            wiring.append(
+                f"{df.name}: {layer} flow sinks to container '{sink_container}', "
+                f"expected '{layer}'"
+            )
+        if layer == "gold" and silver_flows:
+            for ep in (df.source, *df.additional_sources):
+                if _container(ep.dataset) == "bronze":
+                    wiring.append(
+                        f"{df.name}: gold flow reads bronze dataset '{ep.dataset}' "
+                        f"— must read the silver layer"
+                    )
+    checks.append(_check("medallion_wiring", not wiring, "; ".join(wiring) or "layer wiring ok"))
+
+    # 8. No BRD requirement silently dropped: activities the builder can't render
+    #    are reported by name. Informational (doesn't block) — the plan review
+    #    shows the user exactly what was left out.
+    from agent.builder import unsupported_activities
+
+    dropped = unsupported_activities(spec)
+    checks.append(
+        _check(
+            "all_activities_supported",
+            True,  # informational: visible, never blocking
+            ("NOT built (unsupported): " + "; ".join(dropped)) if dropped
+            else "every activity type is supported",
+        )
+    )
 
     passed = all(c["passed"] for c in checks)
     return {"run_id": run_id, "passed": passed, "checks": checks}

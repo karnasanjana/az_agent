@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -182,19 +183,43 @@ def _run_real(
     on_update: UpdateFn,
     poll_seconds: int = 15,
     timeout_seconds: int = 1800,
+    recover_from: "str | None" = None,
+    stop_event: "Any | None" = None,
 ) -> Dict[str, Any]:
     from config import get_datafactory_client
 
     adf = get_datafactory_client(cfg)
     master = _master_name(run_dir)
     pending = _pending_steps(run_dir)
-    run = adf.pipelines.create_run(cfg.resource_group, cfg.factory_name, master, parameters=parameters)
+    if recover_from:
+        # ADF-native recovery rerun: skip activities that succeeded in the referenced
+        # run and restart at the failed ones (portal's "Rerun from failed activity").
+        # A healed artifact was already redeployed, so the rerun picks it up.
+        run = adf.pipelines.create_run(
+            cfg.resource_group, cfg.factory_name, master, parameters=parameters,
+            reference_pipeline_run_id=recover_from, is_recovery=True,
+            start_from_failure=True,
+        )
+    else:
+        run = adf.pipelines.create_run(
+            cfg.resource_group, cfg.factory_name, master, parameters=parameters
+        )
     run_id = run.run_id
     on_update({"run_id": run_id, "status": "InProgress", "steps": pending,
-               "layers": _steps_to_layers(pending)})
+               "layers": _steps_to_layers(pending), "recovered_from": recover_from})
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            try:
+                adf.pipeline_runs.cancel(
+                    cfg.resource_group, cfg.factory_name, run_id, is_recursive=True
+                )
+            except Exception:  # noqa: BLE001 — already-terminal runs reject cancel
+                pass
+            steps = _step_status_real(adf, cfg, run_id, pending)
+            return {"run_id": run_id, "status": "Cancelled", "steps": steps,
+                    "layers": _steps_to_layers(steps), "stopped_by_user": True}
         info = adf.pipeline_runs.get(cfg.resource_group, cfg.factory_name, run_id)
         steps = _step_status_real(adf, cfg, run_id, pending)
         layers = _steps_to_layers(steps)
@@ -253,6 +278,14 @@ Given its current ARM 'properties' JSON and the runtime error, return the
 corrected 'properties' body. Preserve names, references, and Managed Identity
 auth. Change only what is necessary. Never add keys, SAS tokens, or connection
 strings.
+
+Data-flow 'scriptLines' are ADF data flow script DSL, NOT Spark SQL.
+Window transform syntax:
+  <in> window(over(<partition cols>), asc(<col>, true) | desc(<col>, true),
+              <out> = <fn>()) ~> <name>
+'partitionBy', 'orderBy' and 'row_number' do not exist in this DSL. For a
+plain dedup, prefer aggregate(groupBy(<keys>), <col> = first(<col>), ...)
+over a window + filter.
 """
 
 
@@ -267,10 +300,29 @@ def _artifact_inventory(run_dir: str) -> Dict[str, str]:
     return inventory
 
 
-def _pick_target(error_message: str, inventory: Dict[str, str]) -> Optional[Tuple[str, str]]:
+def _pick_target(
+    error_message: str, inventory: Dict[str, str], run_dir: Optional[str] = None
+) -> Optional[Tuple[str, str]]:
+    # 1. The error names an artifact directly.
     for name, category in inventory.items():
         if name and name in error_message:
             return name, category
+    # 2. The error names an ACTIVITY ("Operation on target copy_x failed") —
+    #    find the artifact whose JSON contains that activity. Without this the
+    #    fallback healed an unrelated dataflow twice for a Copy-activity error
+    #    (run df2db30c73a5) while the real problem was elsewhere.
+    if run_dir:
+        targets = re.findall(r"Operation on target (\S+) failed", error_message)
+        for tok in targets:
+            for name, category in inventory.items():
+                path = os.path.join(run_dir, category, f"{name}.json")
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        if f'"{tok}"' in fh.read():
+                            return name, category
+                except OSError:
+                    continue
+    # 3. Last resort: any dataflow, else anything.
     for name, category in inventory.items():
         if category == "dataflows":
             return name, category
@@ -304,6 +356,18 @@ def read_heal_log(run_dir: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _lint_healed(name: str, properties: Dict[str, Any]) -> List[str]:
+    """Lint a healed data flow's scriptLines before redeploy — a heal that
+    trips the same parser checks would burn a full Azure run to learn what
+    lint knows in milliseconds (runs 24756f0f5aa8 attempts 1-2)."""
+    from agent.lint import lint_dataflow_script
+
+    lines = ((properties.get("typeProperties") or {}).get("scriptLines")) or []
+    if not lines:
+        return []
+    return lint_dataflow_script(name, "\n".join(lines))
+
+
 def heal_artifact(
     run_dir: str, category: str, name: str, error_message: str, phase: str = "runtime"
 ) -> str:
@@ -325,6 +389,19 @@ def heal_artifact(
         f"Current properties JSON:\n{json.dumps(before, indent=2)}"
     )
     healed = agent.run_sync(user_msg).output
+    lint_problems = _lint_healed(name, healed.properties) if category == "dataflows" else []
+    if lint_problems:
+        # One corrective round-trip: cheaper than discovering the same parse
+        # error 5 minutes into the redeployed run.
+        healed = agent.run_sync(
+            user_msg
+            + "\n\nYour previous correction:\n"
+            + json.dumps(healed.properties, indent=2)
+            + "\n\nIt still fails the data-flow script linter:\n"
+            + "\n".join(f"- {p}" for p in lint_problems)
+            + "\n\nFix these problems and return the full corrected properties."
+        ).output
+        lint_problems = _lint_healed(name, healed.properties)
     doc["properties"] = healed.properties
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
@@ -338,6 +415,7 @@ def heal_artifact(
             "name": name,
             "error": error_message,
             "fix": healed.explanation,
+            "lint_after_heal": lint_problems,  # non-empty = heal shipped known-bad
             "before": before,
             "after": healed.properties,
         },
@@ -355,11 +433,15 @@ def execute(
     cfg: "AzureConfig | None" = None,
     parameters: "Dict[str, Any] | None" = None,
     on_update: "UpdateFn | None" = None,
+    stop_event: "Any | None" = None,
 ) -> Dict[str, Any]:
     """Run the master pipeline and report the outcome.
 
     Default (v1): fail-loud — one run, surface the error. With SELF_HEAL=true and
-    a real backend, patch the failing artifact and retry up to RETRY_CAP.
+    a real backend, patch the failing artifact and retry up to RETRY_CAP. Retries
+    are ADF recovery reruns: layers that already succeeded (e.g. bronze) are
+    skipped and the run restarts at the failed activity. `stop_event` (a
+    threading.Event) aborts the loop and cancels the in-flight ADF run.
     """
     on_update = on_update or _noop
     parameters = parameters or _default_params()
@@ -372,29 +454,60 @@ def execute(
 
     # Fail-loud single attempt (v1 default).
     if not self_heal_enabled():
-        report = _run_real(run_dir, cfg, parameters, on_update)
+        report = _run_real(run_dir, cfg, parameters, on_update, stop_event=stop_event)
         return {"status": report["status"], "attempts": [report]}
 
     # Opt-in self-heal loop.
     inventory = _artifact_inventory(run_dir)
     attempts: List[Dict[str, Any]] = []
+    prev_run_id: Optional[str] = None
+
+    def _emit(rec: Dict[str, Any]) -> None:
+        # Past attempts ride along on every live update, so the UI can keep
+        # showing what failed (and how it was healed) while the retry runs —
+        # otherwise each retry resets the steps and the error vanishes unread.
+        if attempts:
+            rec["attempt_history"] = [
+                {"attempt": a.get("attempt"), "status": a.get("status"),
+                 "run_id": a.get("run_id"), "error": a.get("error"),
+                 "healed": a.get("healed")}
+                for a in attempts
+            ]
+        on_update(rec)
+
     for attempt in range(1, RETRY_CAP + 1):
-        report = _run_real(run_dir, cfg, parameters, on_update)
+        report = _run_real(
+            run_dir, cfg, parameters, _emit,
+            recover_from=prev_run_id, stop_event=stop_event,
+        )
         report["attempt"] = attempt
         if report["status"] == "Succeeded":
             attempts.append(report)
             return {"status": "Succeeded", "attempts": attempts}
+        if report.get("stopped_by_user") or (stop_event is not None and stop_event.is_set()):
+            report["healed"] = None
+            attempts.append(report)
+            return {"status": "Cancelled", "attempts": attempts}
 
         error_blob = report.get("error") or "; ".join(m for _, m in report.get("failures", []))
-        target = _pick_target(error_blob or "", inventory)
+        target = _pick_target(error_blob or "", inventory, run_dir)
         if target is None or attempt == RETRY_CAP:
             report["healed"] = None
             attempts.append(report)
             break
+        # Append BEFORE the (slow) heal call and emit, so the failure is readable
+        # in the UI while the model works instead of vanishing into the retry.
+        report["healed"] = None
+        attempts.append(report)
+        _emit({"run_id": report.get("run_id"), "status": "Healing",
+               "steps": report.get("steps"), "layers": report.get("layers")})
         name, category = target
         explanation = heal_artifact(run_dir, category, name, error_blob or report["status"])
         deploy_object(run_dir, category, name, cfg)
+        # Mutates the dict already inside `attempts`, so history picks it up.
         report["healed"] = {"category": category, "name": name, "fix": explanation}
-        attempts.append(report)
+        # Next attempt resumes from this run's failure point instead of re-running
+        # already-succeeded layers.
+        prev_run_id = report.get("run_id")
 
     return {"status": "Failed", "attempts": attempts}

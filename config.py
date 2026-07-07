@@ -218,11 +218,26 @@ def _openai_model():
 
 
 def _gemini_model():
-    """Pydantic AI model backed by Google Gemini. Reads GEMINI_API_KEY / GOOGLE_API_KEY."""
-    from pydantic_ai.models.gemini import GeminiModel
+    """Pydantic AI model backed by Google Gemini via the google-genai SDK.
 
-    model_id = os.environ.get("LLM_MODEL", "gemini-1.5-pro")
-    return GeminiModel(model_id)
+    Set:
+        LLM_PROVIDER=gemini
+        LLM_MODEL=gemini-2.5-flash        # or any Gemini model id
+        GEMINI_API_KEY=<key from https://aistudio.google.com/apikey>
+
+    GOOGLE_API_KEY is accepted as a fallback name. Structured output defaults to
+    prompted JSON (see structured_output); override with LLM_OUTPUT_MODE=native
+    to use Gemini's response-schema mode."""
+    from pydantic_ai.models.google import GoogleModel
+    from pydantic_ai.providers.google import GoogleProvider
+
+    model_id = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env to use LLM_PROVIDER=gemini."
+        )
+    return GoogleModel(model_id, provider=GoogleProvider(api_key=api_key))
 
 
 # provider aliases -> builder
@@ -264,13 +279,14 @@ def get_claude_model():
     return get_model()
 
 
-_REASONING_HINTS = ("gpt-5", "o1", "o3", "o4", "reasoning")
+_REASONING_HINTS = ("gpt-5", "o1", "o3", "o4", "reasoning", "gemini-2.5", "gemini-3")
 
 
 def is_reasoning_model() -> bool:
-    """True when LLM_MODEL is an OpenAI-style reasoning model (gpt-5*, o1/o3/o4,
-    or any '*reasoning*'). These reject a custom temperature and spend part of the
-    token budget on hidden reasoning."""
+    """True when LLM_MODEL is a reasoning/thinking model (gpt-5*, o1/o3/o4,
+    any '*reasoning*', or Gemini 2.5+ which thinks by default). These spend part
+    of the output-token budget on hidden reasoning, so they get a bigger
+    completion budget and no custom temperature."""
     m = os.environ.get("LLM_MODEL", "").lower()
     return any(h in m for h in _REASONING_HINTS)
 

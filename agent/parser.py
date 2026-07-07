@@ -50,11 +50,31 @@ Hard rules:
   Succeeded condition, so a failed early stage halts downstream work.
 - Add a schedule trigger only when the BRD asks for (or implies) a schedule;
   otherwise the pipeline is run on demand.
-- DATA FLOW EXPRESSIONS use ADF Mapping-Data-Flow syntax with BARE column names:
-  `!isNull(order_id)`, `trim(order_status)`, `toTimestamp(order_purchase_timestamp)`.
-  NEVER write @{column}, @stream@column, SQL `col != null` (use isNull()/!isNull()),
-  or `cond ? a : b` ternaries (use iif(cond, a, b)). The stream@column qualifier is
-  allowed ONLY inside a join condition (e.g. "orders@order_id == items@order_id").
+- DATA FLOW EXPRESSIONS — USE STRUCTURED OPS, NOT DSL TEXT. For every
+  derived/cast/aggregate/select column fill {name, op, column, args} and leave
+  `expression` empty: op is one of trim, upper, lower, to_timestamp, to_date,
+  to_integer, to_long, to_double, to_decimal, to_boolean, to_string, round, abs,
+  floor, ceil, length, substring, replace, concat, coalesce, count,
+  count_distinct, sum, avg, min, max, first, identity; `column` is the INPUT
+  column (defaults to `name`); `args` are extra literal arguments (e.g. a
+  timestamp format like yyyy-MM-dd). Example: {"name": "order_status", "op":
+  "trim"} or {"name": "order_count", "op": "count", "column": "order_id"}.
+  For filters fill `predicates` (AND-ed) instead of `condition`: [{"op":
+  "not_null"|"null"|"eq"|"ne"|"gt"|"ge"|"lt"|"le", "column": ..., "value": ...}].
+  For DEDUP use ONE aggregate transform: `group_by` = the key columns and every
+  non-key column in `columns` with op "first" — never sort+window+filter. For a
+  true window (ranking, running totals) fill `partition_by` + `order_by` +
+  `columns` (e.g. {"name": "row_num", "op": "row_number"}) and leave `condition`
+  empty — never hand-write window DSL. For "TOP N" / "first N rows" use a sort
+  transform (desc on the ranking column) followed by ONE limit transform with
+  `take`=N — never a dummy partition key + window(rowNumber) + filter hack.
+  The system renders these to correct ADF syntax — this path can never produce a
+  syntax error, so PREFER IT. Only when the logic truly exceeds the op list, put
+  raw ADF Mapping-Data-Flow syntax in `expression`/`condition`, with BARE column
+  names: `!isNull(order_id)`, `iif(cond, a, b)`. NEVER write @{column},
+  @stream@column, SQL `col != null`, or `cond ? a : b` ternaries. The
+  stream@column qualifier is allowed ONLY inside a join condition (e.g.
+  "orders@order_id == items@order_id").
 
 SOURCES you can express: HTTP(S) file (anonymous), Azure Blob / ADLS Gen2
 (Managed Identity), generic REST endpoint, and Azure SQL Database (Managed

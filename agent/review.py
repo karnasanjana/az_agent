@@ -223,7 +223,13 @@ def _transform_english(t) -> str:
         cols = ", ".join(f"`{c.name}`" for c in t.columns)
         return f"select/rename {cols}"
     if t.kind == TransformKind.window:
+        if t.partition_by:
+            keys = ", ".join(f"`{p}`" for p in t.partition_by)
+            outs = ", ".join(f"`{c.name}`" for c in t.columns)
+            return f"window per {keys} → {outs}"
         return f"window `{t.condition or ''}`"
+    if t.kind == TransformKind.limit:
+        return f"keep top {t.take} rows" + (f" (skip {t.skip})" if t.skip else "")
     return t.kind.value
 
 
@@ -286,25 +292,11 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
         out.append("- No triggers — the pipeline runs on demand.")
     out.append("")
 
-    # Counts
-    out.append(
-        f"**Objects:** {len(spec.linked_services)} linked services · "
-        f"{len(spec.datasets)} datasets · {len(spec.dataflows)} data flows · "
-        f"{len(spec.pipelines)} pipelines · {len(spec.triggers)} triggers."
-    )
-    out.append("")
+    # Counts live in the UI summary pills, not here.
 
-    # Assumptions the agent made instead of asking
-    if spec.assumptions:
-        out.append("## Assumptions I made (change any via chat)")
-        out.extend(f"- {a}" for a in spec.assumptions)
-        out.append("")
-
-    # Optional suggestions
-    if spec.suggestions:
-        out.append("## Optional suggestions")
-        out.extend(f"- {s}" for s in spec.suggestions)
-        out.append("")
+    # Assumptions and suggestions are NOT repeated here — the UI renders them
+    # as their own cards from the response's assumptions/suggestions fields
+    # (they were duplicated when this markdown also carried them).
 
     # Only genuine blockers
     if spec.clarifications:

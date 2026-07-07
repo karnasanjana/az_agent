@@ -126,11 +126,13 @@ INDEX_HTML = r"""<!doctype html>
 
     <div id="chatBox" style="display:none">
       <h2>Chat &mdash; refine or answer questions</h2>
-      <div id="chatLog" class="card" style="max-height:240px;overflow:auto"></div>
-      <div class="row">
-        <input id="chatInput" placeholder="e.g. rename the gold sink, or answer a question&hellip;"
-               style="flex:1;min-width:160px;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px"/>
-        <button id="chatBtn" class="sec">Send</button>
+      <div class="card" style="padding:0">
+        <div id="chatLog" style="max-height:260px;overflow:auto;padding:10px"></div>
+        <div style="display:flex;gap:8px;padding:8px;border-top:1px solid var(--line)">
+          <input id="chatInput" placeholder="e.g. rename the gold sink, or answer a question&hellip;"
+                 style="flex:1;min-width:120px;background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px"/>
+          <button id="chatBtn" class="sec">Send</button>
+        </div>
       </div>
     </div>
 
@@ -145,8 +147,12 @@ INDEX_HTML = r"""<!doctype html>
 
     <div id="liveBox" style="display:none">
       <h2>5. Live run</h2>
+      <div class="row">
+        <button id="stopBtn" class="bad sec">Stop run</button>
+      </div>
       <div id="deployState" class="muted"></div>
       <div class="status-grid" id="layers"></div>
+      <div id="attemptLog"></div>
       <div id="heals"></div>
       <div id="runErr" class="err"></div>
     </div>
@@ -156,18 +162,13 @@ INDEX_HTML = r"""<!doctype html>
     <h2>2. Pipeline graph (click a step)</h2>
     <div id="graph" class="muted">Generate a plan to see the pipeline steps.</div>
 
-    <h2>Node detail</h2>
-    <div id="detail" class="card muted">Select a node above.</div>
+    <h2>Step detail</h2>
+    <div id="detail" class="card muted">Select a step above.</div>
 
     <h2>Plan &mdash; what I'll build</h2>
+    <div id="summary"></div>
     <div id="planReadable" class="card muted">Generate a plan to see it in plain English.</div>
     <div id="planNotes"></div>
-
-    <h2>3. Governance plan (raw)</h2>
-    <details><summary>Show plain-text plan (with JSON)</summary><pre id="planText" class="muted">&mdash;</pre></details>
-
-    <h2>All objects</h2>
-    <div id="objects" class="muted">&mdash;</div>
   </section>
 </main>
 
@@ -267,8 +268,8 @@ function applyPlan(data){
     renderClar(data.clarifications);
     renderPlan(data);  // show any assumptions the agent already made
     $('#approveBox').style.display='none';
-    REVIEW=GRAPH=null; $('#graph').textContent=''; $('#objects').innerHTML='';
-    $('#preflight').innerHTML=''; $('#planText').textContent='—';
+    REVIEW=GRAPH=null; $('#graph').textContent=''; $('#summary').innerHTML='';
+    $('#preflight').innerHTML='';
     return;
   }
   // Non-blocking questions: the plan built fine, these are optional to answer.
@@ -282,8 +283,7 @@ function applyPlan(data){
   $('#liveBox').style.display='none';
   REVIEW = data.review; GRAPH = data.graph;
   renderPreflight(data.preflight);
-  renderGraph(GRAPH); renderObjects(REVIEW);
-  $('#planText').textContent=data.plan_text; $('#planText').className='';
+  renderGraph(GRAPH); renderSummary(REVIEW);
   renderPlan(data);
   renderGate(data);
 }
@@ -342,10 +342,10 @@ $('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat();
 
 function reset(){
   REVIEW=GRAPH=null; if(POLL){clearInterval(POLL);POLL=null;}
-  ['preflight','clar','graph','objects','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
-  $('#detail').innerHTML='Select a node above.'; $('#detail').className='card muted';
+  ['preflight','clar','graph','summary','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
+  $('#detail').innerHTML='Select a step above.'; $('#detail').className='card muted';
   $('#planReadable').innerHTML='Generate a plan to see it in plain English.'; $('#planReadable').className='card muted';
-  $('#planText').textContent='—'; $('#approveBox').style.display='none'; $('#liveBox').style.display='none';
+  $('#approveBox').style.display='none'; $('#liveBox').style.display='none';
   $('#chatBox').style.display='none'; $('#graph').textContent=''; $('#runErr').textContent='';
 }
 
@@ -391,31 +391,33 @@ function renderGraph(g){
   $('#graph').innerHTML=html;
 }
 
+// Plain-English step card — no JSON, no scripts.
 function selNode(idx){
   document.querySelectorAll('.node').forEach(n=>n.classList.toggle('sel', n.dataset.idx==idx));
   const n = GRAPH.nodes[idx];
   if(!n) return;
-  let h = '<div><b>'+esc(n.label)+'</b> &mdash; '+esc(n.kind)+'</div>'+
-          '<div class="muted">object: '+esc(n.object||'')+' &nbsp; source: '+esc(n.source_dataset||'-')+
-          ' &rarr; sink: '+esc(n.sink_dataset||'-')+'</div>';
-  if(n.layer==='bronze'){ h+='<div class="pill">raw landing, no transformation &mdash; no script (correct)</div>'; }
-  h += '<h2>JSON</h2><pre>'+esc(JSON.stringify(n.json,null,2))+'</pre>';
-  if(n.script){ h+='<h2>Data Flow script</h2><pre>'+esc(n.script)+'</pre>'; }
+  const verbs = {bronze:'Lands the raw file as-is', silver:'Cleans and standardises the data',
+                 gold:'Aggregates into the business-ready output'};
+  let h = '<div><b>'+esc(n.label)+'</b></div>';
+  h += '<div style="margin-top:4px">'+esc(verbs[n.layer] || n.note || n.kind)+'.</div>';
+  if(n.source_dataset || n.sink_dataset){
+    h += '<div class="muted" style="margin-top:4px">'+esc(n.source_dataset||'?')+
+         ' &rarr; '+esc(n.sink_dataset||'?')+'</div>';
+  }
+  if(n.note && verbs[n.layer]) h += '<div class="pill" style="margin-top:4px">'+esc(n.note)+'</div>';
   $('#detail').className='card'; $('#detail').innerHTML=h;
 }
 window.selNode = selNode;
 
-function renderObjects(rev){
-  const cats = [['linked_services','Linked services'],['datasets','Datasets'],
-                ['dataflows','Data flows'],['pipelines','Pipelines'],['triggers','Triggers']];
-  let html='';
-  cats.forEach(([k,label])=>{
-    (rev[k]||[]).forEach(o=>{
-      html += '<details><summary>'+esc(label.slice(0,-1))+': '+esc(o.name)+'</summary>'+
-              '<pre>'+esc(JSON.stringify(o.json,null,2))+'</pre></details>';
-    });
-  });
-  $('#objects').innerHTML = html || '<span class="muted">—</span>';
+// Object counts only — to the point, no JSON dumps.
+function renderSummary(rev){
+  const cats = [['pipelines','pipelines'],['dataflows','data flows'],
+                ['datasets','datasets'],['linked_services','linked services'],['triggers','triggers']];
+  const pills = cats.map(([k,label])=>{
+    const n = (rev[k]||[]).length;
+    return n ? '<span class="tag" style="margin-right:6px">'+n+' '+label+'</span>' : '';
+  }).join('');
+  $('#summary').innerHTML = pills ? '<div style="margin-bottom:8px">'+pills+'</div>' : '';
 }
 
 function renderGate(data){
@@ -438,8 +440,16 @@ $('#approveBtn').onclick = async ()=>{
   try{
     await jpost('/approve',{run_id:RUN});
     $('#liveBox').style.display='block';
+    $('#stopBtn').style.display=''; $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run';
     POLL = setInterval(poll, 1500); poll();
   }catch(e){ alert('Approve blocked: '+e.message); $('#approveBtn').disabled=false; }
+};
+
+$('#stopBtn').onclick = async ()=>{
+  if(!RUN) return;
+  $('#stopBtn').disabled=true; $('#stopBtn').textContent='Stopping…';
+  try{ await jpost('/stop/'+RUN,{}); }
+  catch(e){ alert('Stop failed: '+e.message); $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run'; }
 };
 
 const CAT_LABEL = {linkedServices:'linked services', datasets:'datasets',
@@ -493,8 +503,26 @@ async function poll(){
     '<div class="badge s-'+(d.status||'Pending')+'">'+(d.status||'Pending')+'</div>'+
     (d.run_id?'<div class="pill">run '+esc(d.run_id)+'</div>':'')+
     (d.error?'<div class="err">'+esc(d.error)+'</div>':'')+'</div>').join('');
-  if(['SUCCEEDED','FAILED','ERROR'].includes(s.status)){
+  // Past self-heal attempts stay visible while the retry runs (and at the end,
+  // sourced from the final report), so errors never vanish into the loop.
+  let hist = (s.run && s.run.attempt_history) || null;
+  if(!hist && s.report && s.report.attempts && s.report.attempts.length > 1)
+    hist = s.report.attempts.slice(0, -1);
+  if(hist && hist.length){
+    $('#attemptLog').innerHTML = '<h2>Previous attempts</h2><div class="card">'+
+      hist.map(a=>'<div class="check"><span class="dot bad"></span><div>'+
+        '<b>attempt '+esc(a.attempt)+' — '+esc(a.status||'Failed')+'</b>'+
+        (a.error?'<div class="err">'+esc(a.error)+'</div>':'')+
+        (a.healed?'<div class="muted">healed '+esc(a.healed.category)+'/'+esc(a.healed.name)+
+          ': '+esc(a.healed.fix||'')+'</div>':'')+
+        '</div></div>').join('')+'</div>';
+  }
+  if(s.run && s.run.status==='Healing')
+    $('#deployState').innerHTML += '  •  <b>self-heal in progress&hellip;</b>';
+  if(['SUCCEEDED','FAILED','ERROR','STOPPED'].includes(s.status)){
     clearInterval(POLL); POLL=null;
+    $('#stopBtn').style.display='none';
+    if(s.status==='STOPPED') $('#runErr').textContent = 'Run stopped by user.';
     if(s.error) $('#runErr').textContent = s.error;
     if(s.report && s.report.attempts){
       const last = s.report.attempts[s.report.attempts.length-1];

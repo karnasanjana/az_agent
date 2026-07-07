@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Annotated, Literal
@@ -49,6 +49,7 @@ class TransformKind(str, Enum):
     sort = "sort"
     window = "window"
     join = "join"  # combine the current stream with another source stream
+    limit = "limit"  # keep only the first N rows (e.g. "top 10 customers")
 
 
 class TriggerKind(str, Enum):
@@ -139,9 +140,40 @@ class LinkedService(BaseModel):
     database: Optional[str] = None     # AzureSqlDatabase
 
 
+# LLM-emitted type -> valid ADF data-flow type. Bare 'decimal' is the killer:
+# the DSL requires decimal(precision,scale) and fails DF-DSL-001 with
+# "mismatched input ')' expecting '('" (gemini-2.5-flash, run 7d90232abeec).
+_COLUMN_TYPE_ALIASES = {
+    "decimal": "decimal(38,18)",
+    "numeric": "decimal(38,18)",
+    "int": "integer",
+    "bigint": "long",
+    "smallint": "short",
+    "datetime": "timestamp",
+    "bool": "boolean",
+    "float": "double",
+    "number": "double",
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+}
+
+
 class Column(BaseModel):
     name: str
     type: str = "string"  # string | integer | timestamp | double | boolean | ...
+
+    @field_validator("type")
+    @classmethod
+    def _normalize_type(cls, v: str) -> str:
+        key = (v or "").strip().lower()
+        return _COLUMN_TYPE_ALIASES.get(key, (v or "").strip() or "string")
+
+
+# Azure storage container naming rules: 3-63 chars, lowercase alphanumerics and
+# hyphens, starts/ends alphanumeric. Underscores, @dataset() tokens, and empty
+# strings all fail at run time with AdlsGen2InvalidResourceName.
+_AZ_CONTAINER_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]")
 
 
 class DatasetLocation(BaseModel):
@@ -170,9 +202,114 @@ class Dataset(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
+# ---------------------------------------------------------------------------- #
+# Structured expressions (model-independence): the LLM picks an OPERATION from a
+# closed vocabulary; CODE renders the DSL string. Invalid syntax becomes
+# unrepresentable — any model that can fill an enum produces valid expressions.
+# Raw `expression`/`condition` strings remain as the escape hatch for logic the
+# ops can't express (and still pass through _normalize_df_expression).
+# ---------------------------------------------------------------------------- #
+
+# op (normalized: lowercase, non-letters stripped) -> DSL function name.
+_OP_FN = {
+    "trim": "trim",
+    "upper": "upper",
+    "lower": "lower",
+    "totimestamp": "toTimestamp",
+    "todate": "toDate",
+    "tointeger": "toInteger",
+    "tolong": "toLong",
+    "todouble": "toDouble",
+    "todecimal": "toDecimal",
+    "toboolean": "toBoolean",
+    "tostring": "toString",
+    "round": "round",
+    "abs": "abs",
+    "floor": "floor",
+    "ceil": "ceil",
+    "length": "length",
+    "substring": "substring",
+    "replace": "replace",
+    "concat": "concat",
+    "coalesce": "coalesce",
+    "count": "count",
+    "countdistinct": "countDistinct",
+    "sum": "sum",
+    "avg": "avg",
+    "mean": "avg",
+    "min": "min",
+    "max": "max",
+    "first": "first",
+    "rownumber": "rowNumber",
+    "rank": "rank",
+    "denserank": "denseRank",
+}
+_OP_IDENTITY = {"identity", "copy", "passthrough", "asis", "none"}
+# Window functions that take NO arguments — rendered as fn(), never fn(column).
+_OP_NOARG = {"rownumber", "rank", "denserank"}
+
+
+def _norm_op(op: str) -> str:
+    return re.sub(r"[^a-z]", "", (op or "").lower())
+
+
+def _render_literal(value: str) -> str:
+    """A structured arg/value as a DSL literal: numbers bare, everything else a
+    single-quoted string (pre-quoted values pass through)."""
+    s = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return s
+    if len(s) >= 2 and s.startswith("'") and s.endswith("'"):
+        return s
+    return "'" + s.replace("'", r"\'") + "'"
+
+
+def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
+    """Render {op, column, args} to a DSL expression; None when op is unknown."""
+    key = _norm_op(op)
+    if key in _OP_IDENTITY:
+        return column or None
+    if key in _OP_NOARG:
+        return f"{_OP_FN[key]}()"
+    fn = _OP_FN.get(key)
+    if fn is None:
+        return None
+    parts = ([column] if column else []) + [_render_literal(a) for a in args]
+    return f"{fn}({', '.join(parts)})"
+
+
+_PRED_CMP = {"eq": "==", "ne": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
+_PRED_NOT_NULL = {"notnull", "isnotnull", "notempty", "exists"}
+_PRED_NULL = {"null", "isnull", "missing"}
+
+
+class Predicate(BaseModel):
+    """One structured filter clause; a transform's predicates are AND-ed."""
+
+    op: str  # not_null | null | eq | ne | gt | ge | lt | le
+    column: str
+    value: Optional[str] = None  # comparison operand (unused for null tests)
+
+    def render(self) -> "str | None":
+        key = _norm_op(self.op)
+        if key in _PRED_NOT_NULL:
+            return f"!isNull({self.column})"
+        if key in _PRED_NULL:
+            return f"isNull({self.column})"
+        cmp = _PRED_CMP.get(key)
+        if cmp is None or self.value is None:
+            return None
+        return f"{self.column} {cmp} {_render_literal(self.value)}"
+
+
 class DerivedColumn(BaseModel):
     name: str
-    expression: str  # Mapping-Data-Flow expression, e.g. toInteger(Confirmed)
+    # EITHER a raw Mapping-Data-Flow expression (escape hatch)...
+    expression: Optional[str] = None  # e.g. toInteger(Confirmed)
+    # ...OR a structured op, rendered to DSL deterministically in Transform.
+    op: Optional[str] = None
+    column: Optional[str] = None  # input column; defaults to `name`
+    args: List[str] = Field(default_factory=list)  # extra literals (formats etc.)
 
 
 class SortKey(BaseModel):
@@ -205,6 +342,8 @@ _AT_STREAM_AT = re.compile(r"@(\w+)@")
 _EXPR_IDENT = re.compile(r"\b[A-Za-z_]\w*\b(?!\s*\()")
 _EXPR_LITERALS = {"true", "false", "null"}
 _QUOTED_LITERAL = re.compile(r"'[^']*'")
+# `<expression> as <Alias>` — SQL idiom LLMs put in aggregate group_by entries.
+_GROUPBY_ALIAS = re.compile(r"^(.+?)\s+[Aa][Ss]\s+([A-Za-z_]\w*)$")
 
 
 def _normalize_df_expression(s: "str | None", keep_stream_qualifier: bool = False) -> "str | None":
@@ -237,12 +376,48 @@ class Transform(BaseModel):
     name: str  # output stream name (e.g. 'CastTypes')
     columns: List[DerivedColumn] = Field(default_factory=list)  # cast/derived/aggregate
     condition: Optional[str] = None  # filter / window; also the JOIN condition
+    # Structured filter clauses (preferred over a raw condition; AND-ed).
+    predicates: List[Predicate] = Field(default_factory=list)
     group_by: List[str] = Field(default_factory=list)  # aggregate
-    order_by: List[SortKey] = Field(default_factory=list)  # sort
+    order_by: List[SortKey] = Field(default_factory=list)  # sort; also window sort
+    # window-only: partition columns. With partition_by set, the builder renders
+    # window(over(...), asc/desc(col, true), name = expression) deterministically —
+    # a raw `condition` for window is the legacy escape hatch and is DSL the model
+    # reliably gets wrong (Spark partitionBy/orderBy, run 24756f0f5aa8).
+    partition_by: List[str] = Field(default_factory=list)
     # join-only: the OTHER stream to join the current stream with, and the join type.
     # `condition` carries the join expression, e.g. "orders@order_id == items@order_id".
     right_stream: Optional[str] = None
     join_type: str = "inner"  # inner | left_outer | right_outer | full_outer | cross
+    # limit-only: keep only the first `take` rows (after `skip`), e.g. "top 10
+    # customers" = sort desc + limit(take=10). A single native ADF transform —
+    # prefer this over hand-rolling window(rowNumber)+filter for row-limiting.
+    take: Optional[int] = None
+    skip: int = 0
+
+    @model_validator(mode="after")
+    def _render_structured(self) -> "Transform":
+        """Structured ops/predicates -> DSL strings, BEFORE idiom normalization.
+        A column with neither a renderable op nor an expression is a hard parse
+        error (Pydantic AI feeds it back and the model retries in seconds —
+        instead of failing in Azure minutes later). Exception: a select column
+        with only a name is an identity mapping (name = name)."""
+        if self.predicates and not self.condition:
+            clauses = [p.render() for p in self.predicates]
+            if all(clauses):
+                self.condition = " && ".join(clauses)  # type: ignore[arg-type]
+        for c in self.columns:
+            if not c.expression and c.op:
+                c.expression = _render_op(c.op, c.column or c.name, c.args)
+            if not c.expression and self.kind == TransformKind.select:
+                c.expression = c.name
+            if not c.expression:
+                raise ValueError(
+                    f"transform '{self.name}' column '{c.name}': set 'op' (one of "
+                    f"{', '.join(sorted(set(_OP_FN.values())))} or identity) with "
+                    "optional column/args, or a raw 'expression'"
+                )
+        return self
 
     @model_validator(mode="after")
     def _normalize_expressions(self) -> "Transform":
@@ -253,6 +428,46 @@ class Transform(BaseModel):
         for c in self.columns:
             c.expression = _normalize_df_expression(c.expression) or c.expression
         self.group_by = [_normalize_df_expression(g) or g for g in self.group_by]
+        # SQL-style computed group-by keys: `year(ts) as Year` is invalid DSL
+        # (DF-DSL-001 "no viable alternative at input 'groupBy(year(...) as'",
+        # gemini-2.5-flash run 7d90232abeec). The DSL form is `Year = year(ts)`.
+        self.group_by = [
+            f"{m.group(2)} = {m.group(1)}" if (m := _GROUPBY_ALIAS.match(g)) else g
+            for g in self.group_by
+        ]
+        self.partition_by = [_normalize_df_expression(p) or p for p in self.partition_by]
+        return self
+
+    @model_validator(mode="after")
+    def _window_needs_partition(self) -> "Transform":
+        """A window that outputs columns must say what it partitions over —
+        without partition_by the builder can't render over(...) and the raw
+        condition path is the exact DSL models get wrong. Hard parse error so
+        Pydantic AI retries in seconds instead of ADF failing in minutes."""
+        if (
+            self.kind == TransformKind.window
+            and self.columns
+            and not self.partition_by
+            and not self.condition
+        ):
+            raise ValueError(
+                f"window '{self.name}': set partition_by (the over(...) key columns), "
+                "optional order_by, and columns like "
+                '{"name": "row_num", "op": "row_number"}'
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _limit_needs_take(self) -> "Transform":
+        """A limit transform with no `take` is meaningless. Hard parse error so
+        the model retries in seconds instead of building the fragile
+        dummy-partition + window(rowNumber) + filter workaround for 'top N'."""
+        if self.kind == TransformKind.limit and self.take is None:
+            raise ValueError(
+                f"limit '{self.name}': set 'take' (row count to keep) — e.g. "
+                'for "top 10 X" put a sort transform (desc) then a limit '
+                'transform with take=10'
+            )
         return self
 
 
@@ -288,6 +503,8 @@ def _referenced_columns(transforms: List["Transform"]) -> List[str]:
             scan(c.expression)
         for g in t.group_by:
             scan(g)
+        for p in t.partition_by:
+            scan(p)
         for k in t.order_by:
             scan(k.column)
         produced.update(c.name for c in t.columns)
@@ -369,10 +586,14 @@ class DataFlow(BaseModel):
                 return not t.columns
             if t.kind == TransformKind.aggregate:
                 return not t.columns and not t.group_by
-            if t.kind in (TransformKind.filter, TransformKind.window):
+            if t.kind == TransformKind.filter:
                 return not t.condition
+            if t.kind == TransformKind.window:
+                return not t.condition and not (t.partition_by and t.columns)
             if t.kind == TransformKind.sort:
                 return not t.order_by
+            if t.kind == TransformKind.limit:
+                return t.take is None
             return False  # joins are validated by cross_reference_errors
 
         self.transforms = [t for t in self.transforms if not noop(t)]
@@ -521,6 +742,169 @@ class PipelineSpec(BaseModel):
                     src.kind = snk.kind
                 elif snk.kind == DatasetKind.binary:
                     snk.kind = src.kind
+        return self
+
+    @model_validator(mode="after")
+    def _repair_container_names(self) -> "PipelineSpec":
+        """Containers must be CONCRETE, valid Azure names. The LLM parameterizes
+        them anyway (container='@dataset().p_bronze_container_name' with an empty
+        default) — at runtime the empty container makes ADF treat the FOLDER as
+        the container name, failing with AdlsGen2InvalidResourceName on the
+        folder's underscores (run df2db30c73a5). Deterministic repair: infer the
+        layer from the dataset/parameter name and use it as the container; drop
+        the now-dead container parameter. Unfixable names are left for pre-flight."""
+        layer_tokens = ("landing", "bronze", "silver", "gold", "raw", "archive")
+        for ds in self.datasets:
+            loc = ds.location
+            if loc is None:
+                continue
+            c = (loc.container or "").strip()
+            if _AZ_CONTAINER_RE.fullmatch(c):
+                continue
+            hay = f"{c} {ds.name}".lower()
+            layer = next((t for t in layer_tokens if t in hay), None)
+            if layer is None:
+                continue  # pre-flight fails with the exact name
+            old = c or "(empty)"
+            loc.container = layer
+            ds.parameters = [
+                p for p in ds.parameters
+                if p not in old and "container" not in p.lower()
+            ]
+            self.assumptions.append(
+                f"dataset '{ds.name}' had a non-concrete container '{old}' -> "
+                f"replaced with the '{layer}' container (containers cannot be "
+                "parameterized or contain invalid characters)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _repair_layer_sinks(self) -> "PipelineSpec":
+        """A data flow must never write back onto its own input. The LLM
+        over-applies the "reuse datasets across layer boundaries" skill and
+        points a silver flow's SINK at the very bronze dataset it reads —
+        generating no ds_silver_* dataset at all. The flow then overwrites
+        bronze in place, the silver container stays empty forever, and gold
+        silently aggregates bronze (observed in factory RetailADFFF, 2026-07-06).
+
+        Deterministic repair, same spirit as _harmonize_copy_kinds:
+
+          * a silver/gold flow whose sink dataset == its source dataset gets a
+            synthesized Delta sink dataset in its layer's container, and
+          * gold flows still reading the bronze dataset a repaired silver flow
+            consumes are rewired to that flow's new silver Delta sink,
+
+        keeping the medallion chain (bronze -> silver -> gold) physically real.
+        Flows with no inferable layer are left alone — pre-flight flags them.
+        """
+        ds_by_name = {ds.name: ds for ds in self.datasets}
+
+        def flow_layer(df: DataFlow) -> Optional[str]:
+            if df.layer is not None:
+                return df.layer.value
+            name = df.name.lower()
+            for layer in ("gold", "silver"):
+                if layer in name:
+                    return layer
+            return None
+
+        def entity(ds_name: str) -> str:
+            """ds_bronze_olist_orders_dataset_csv -> olist_orders_dataset."""
+            parts = ds_name.split("_")
+            if parts and parts[0] == "ds":
+                parts = parts[1:]
+            if parts and parts[0] in ("landing", "bronze", "silver", "gold", "raw"):
+                parts = parts[1:]
+            if parts and parts[-1] in ("csv", "parquet", "json", "delta", "binary"):
+                parts = parts[:-1]
+            return "_".join(parts) or ds_name
+
+        # bronze dataset a repaired silver flow reads -> its new silver sink name
+        rewired: Dict[str, str] = {}
+
+        for df in self.dataflows:
+            if df.sink.dataset != df.source.dataset:
+                continue
+            layer = flow_layer(df)
+            if layer is None:
+                continue
+            src_ds = ds_by_name.get(df.source.dataset)
+            if src_ds is None:
+                continue
+            ent = entity(df.source.dataset)
+            new_name = f"ds_{layer}_{ent}_delta"
+            if new_name not in ds_by_name:
+                new_ds = Dataset(
+                    name=new_name,
+                    kind=DatasetKind.delta,
+                    linked_service=src_ds.linked_service,
+                    location=DatasetLocation(container=layer, folder=ent),
+                )
+                self.datasets.append(new_ds)
+                ds_by_name[new_name] = new_ds
+            df.sink.dataset = new_name
+            if layer == "silver":
+                rewired[df.source.dataset] = new_name
+            self.assumptions.append(
+                f"{df.name} sank to its own source dataset '{df.source.dataset}' "
+                f"(in-place overwrite) -> rewired sink to new Delta dataset "
+                f"'{new_name}' in the {layer} container"
+            )
+
+        if rewired:
+            for df in self.dataflows:
+                if flow_layer(df) != "gold":
+                    continue
+                for ep in (df.source, *df.additional_sources):
+                    if ep.dataset in rewired:
+                        old = ep.dataset
+                        ep.dataset = rewired[old]
+                        self.assumptions.append(
+                            f"{df.name} read bronze dataset '{old}' -> rewired to "
+                            f"silver Delta dataset '{ep.dataset}'"
+                        )
+        return self
+
+    @model_validator(mode="after")
+    def _repair_linked_service_refs(self) -> "PipelineSpec":
+        """LLMs (nano and gemini-2.5-flash both, observed 2026-07-06) declare one
+        linked service but reference a second, invented NAME from a dataset (e.g.
+        declare ls_olist_storage_bronze, reference ls_olist_orders_storage_source).
+        When the reference is unambiguous — exactly one declared linked service of
+        a kind that could serve the dataset — rewire it instead of failing
+        pre-flight. Ambiguous references are left for pre-flight to block."""
+        if not self.linked_services:
+            return self
+        ls_names = {ls.name for ls in self.linked_services}
+        storage_ls = [
+            ls for ls in self.linked_services
+            if ls.type in ("AzureBlobFS", "AzureBlobStorage")
+        ]
+        http_ls = [ls for ls in self.linked_services if ls.type in ("HttpServer", "RestService")]
+        sql_ls = [ls for ls in self.linked_services if ls.type == "AzureSqlDatabase"]
+
+        for ds in self.datasets:
+            if ds.linked_service in ls_names:
+                continue
+            if ds.kind == DatasetKind.azure_sql_table:
+                candidates = sql_ls
+            elif ds.relative_url is not None:
+                candidates = http_ls
+            elif ds.location is not None:
+                candidates = storage_ls
+            else:
+                candidates = []
+            if len(candidates) != 1 and len(self.linked_services) == 1:
+                # A single declared linked service is unambiguous whatever its type.
+                candidates = list(self.linked_services)
+            if len(candidates) != 1:
+                continue
+            old = ds.linked_service
+            ds.linked_service = candidates[0].name
+            self.assumptions.append(
+                f"dataset '{ds.name}' referenced undeclared linked service '{old}' "
+                f"-> rewired to '{ds.linked_service}'"
+            )
         return self
 
     # ------------------------------------------------------------------ #
