@@ -132,6 +132,12 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
     pipelines: List[PipelineDef] = []
     triggers: List[Trigger] = []
     assumptions: List[str] = list(plan.assumptions)
+    # ONE pipeline, activities chained by dependsOn — the minimal medallion shape
+    # any BRD implies, not a per-entity explosion. bronze copies first, then
+    # silver flows (each after its own copy), then gold (after its silver inputs).
+    bronze_acts: List[Activity] = []
+    silver_acts: List[Activity] = []
+    gold_acts: List[Activity] = []
 
     # ------------------------------------------------------------------ #
     # Linked services
@@ -232,18 +238,13 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
         )
         datasets.extend([landing, bronze])
 
-        pipelines.append(
-            PipelineDef(
-                name=f"pl_ingest_{ent}",
-                activities=[
-                    Activity(
-                        name=f"copy_{ent}",
-                        type="Copy",
-                        layer=MedallionLayer.bronze,
-                        source_dataset=landing_name,
-                        sink_dataset=bronze_name,
-                    )
-                ],
+        bronze_acts.append(
+            Activity(
+                name=f"copy_{ent}",
+                type="Copy",
+                layer=MedallionLayer.bronze,
+                source_dataset=landing_name,
+                sink_dataset=bronze_name,
             )
         )
 
@@ -281,17 +282,13 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                 transforms=transforms,
             )
         )
-        pipelines.append(
-            PipelineDef(
-                name=f"pl_silver_{ent}",
-                activities=[
-                    Activity(
-                        name=f"flow_silver_{ent}",
-                        type="ExecuteDataFlow",
-                        layer=MedallionLayer.silver,
-                        data_flow=f"df_silver_{ent}",
-                    )
-                ],
+        silver_acts.append(
+            Activity(
+                name=f"flow_silver_{ent}",
+                type="ExecuteDataFlow",
+                layer=MedallionLayer.silver,
+                data_flow=f"df_silver_{ent}",
+                depends_on=[f"copy_{ent}"],
             )
         )
 
@@ -327,17 +324,13 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                     transforms=[],
                 )
             )
-            pipelines.append(
-                PipelineDef(
-                    name=f"pl_silver_{ent}",
-                    activities=[
-                        Activity(
-                            name=f"flow_silver_{ent}",
-                            type="ExecuteDataFlow",
-                            layer=MedallionLayer.silver,
-                            data_flow=f"df_silver_{ent}",
-                        )
-                    ],
+            silver_acts.append(
+                Activity(
+                    name=f"flow_silver_{ent}",
+                    type="ExecuteDataFlow",
+                    layer=MedallionLayer.silver,
+                    data_flow=f"df_silver_{ent}",
+                    depends_on=[f"copy_{ent}"],
                 )
             )
             assumptions.append(
@@ -389,60 +382,35 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                 transforms=transforms,
             )
         )
-        pipelines.append(
-            PipelineDef(
-                name=f"pl_gold_{out.name}",
-                activities=[
-                    Activity(
-                        name=f"flow_gold_{out.name}",
-                        type="ExecuteDataFlow",
-                        layer=MedallionLayer.gold,
-                        data_flow=f"df_gold_{out.name}",
-                    )
-                ],
-            )
-        )
-
-    # ------------------------------------------------------------------ #
-    # Master pipeline + trigger
-    # ------------------------------------------------------------------ #
-    master_acts: List[Activity] = []
-
-    def _run_act(child: str, depends: List[str]) -> Activity:
-        return Activity(
-            name=f"run_{child[len('pl_'):]}",
-            type="ExecutePipeline",
-            invoked_pipeline=child,
-            depends_on=depends,
-        )
-
-    for s in plan.sources:
-        master_acts.append(_run_act(f"pl_ingest_{s.entity}", []))
-    # Every silver entity (explicit transform OR pass-through), in source order,
-    # so the master invokes the pass-through silver flows too.
-    for s in plan.sources:
-        if s.entity in silver_ds:
-            master_acts.append(
-                _run_act(f"pl_silver_{s.entity}", [f"run_ingest_{s.entity}"])
-            )
-    for out in plan.outputs:
-        entities = [e for e in out.from_entities if e in src_by_entity]
-        if not entities:
-            continue
-        deps = [
-            f"run_silver_{e}" if e in silver_ds else f"run_ingest_{e}" for e in entities
+        gold_deps = [
+            f"flow_silver_{e}" if e in silver_ds else f"copy_{e}" for e in entities
         ]
-        master_acts.append(_run_act(f"pl_gold_{out.name}", deps))
+        gold_acts.append(
+            Activity(
+                name=f"flow_gold_{out.name}",
+                type="ExecuteDataFlow",
+                layer=MedallionLayer.gold,
+                data_flow=f"df_gold_{out.name}",
+                depends_on=gold_deps,
+            )
+        )
 
-    master_name = f"pl_master_{project}"
-    pipelines.append(PipelineDef(name=master_name, activities=master_acts))
+    # ------------------------------------------------------------------ #
+    # One pipeline: all activities, bronze -> silver -> gold via dependsOn.
+    # (No master + child pipelines — a medallion BRD describes one flow, not a
+    # dozen. dependsOn already gives the exact ordering and per-activity rerun.)
+    # ------------------------------------------------------------------ #
+    pipeline_name = f"pl_{project}"
+    pipelines.append(
+        PipelineDef(name=pipeline_name, activities=bronze_acts + silver_acts + gold_acts)
+    )
 
     if plan.schedule:
         triggers.append(
             Trigger(
                 name=f"tr_schedule_{project}",
                 kind=TriggerKind.schedule,
-                pipeline=master_name,
+                pipeline=pipeline_name,
                 frequency=plan.schedule.frequency,
                 interval=plan.schedule.interval,
                 start_time=plan.schedule.start_time,

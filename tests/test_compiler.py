@@ -85,11 +85,20 @@ def test_compile_clean_spec():
     assert len(storage_ls) == 1
     # 2 landing + 2 bronze + 2 silver (orders + customers pass-through) + 1 gold
     assert len(spec.datasets) == 7
-    master = next(p for p in spec.pipelines if p.name == "pl_master_retail")
-    # ingest x2 + silver orders + silver customers (pass-through) + gold = 5
-    assert len([a for a in master.activities if a.type == "ExecutePipeline"]) == 5
-    gold = next(a for a in master.activities if a.name == "run_gold_monthly_sales")
-    assert gold.depends_on == ["run_silver_orders", "run_silver_customers"]
+    # ONE pipeline, not a master + children.
+    assert len(spec.pipelines) == 1
+    pl = spec.pipelines[0]
+    assert pl.name == "pl_retail"
+    kinds = [a.type for a in pl.activities]
+    assert kinds.count("Copy") == 2  # bronze copies
+    assert kinds.count("ExecuteDataFlow") == 3  # 2 silver + 1 gold
+    assert "ExecutePipeline" not in kinds  # no child-pipeline wrappers
+    copy_orders = next(a for a in pl.activities if a.name == "copy_orders")
+    assert copy_orders.depends_on == []
+    silver_orders = next(a for a in pl.activities if a.name == "flow_silver_orders")
+    assert silver_orders.depends_on == ["copy_orders"]
+    gold = next(a for a in pl.activities if a.name == "flow_gold_monthly_sales")
+    assert gold.depends_on == ["flow_silver_orders", "flow_silver_customers"]
 
 
 def test_compile_deterministic():
