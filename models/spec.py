@@ -867,7 +867,7 @@ class PipelineSpec(BaseModel):
 
     @model_validator(mode="after")
     def _repair_linked_service_refs(self) -> "PipelineSpec":
-        """LLMs (nano and gemini-2.5-flash both, observed 2026-07-06) declare one
+        """LLMs (gemini-2.5-flash, observed 2026-07-06) declare one
         linked service but reference a second, invented NAME from a dataset (e.g.
         declare ls_olist_storage_bronze, reference ls_olist_orders_storage_source).
         When the reference is unambiguous — exactly one declared linked service of

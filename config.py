@@ -294,7 +294,7 @@ def is_reasoning_model() -> bool:
 def default_model_settings() -> dict:
     """Model settings for the parser/heal agents, adapted to the active model.
 
-    Reasoning models (gpt-5-nano, o-series) reject ``temperature`` other than the
+    Reasoning models (Gemini 2.5+, o-series) reject ``temperature`` other than the
     default and burn tokens on hidden reasoning — so drop temperature and give a
     bigger completion budget. Everything else keeps deterministic temperature=0.
     """

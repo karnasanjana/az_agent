@@ -26,7 +26,7 @@ run before anyone sees them, and then a mis-aimed heal loop hides the error.
 
 Not luck, structural: a simple BRD (one dataset, one filter/cast) exercises spec
 shapes the normalizer and builder have already been hardened against. A big BRD
-(5 datasets, dedup + joins + aggregate) walks nano into spec shapes never seen
+(5 datasets, dedup + joins + aggregate) walks the model into spec shapes never seen
 before — empty aggregates, alias datasets, groupBy collisions. Each new BRD shape
 finds the next unguarded corner. That is exactly the "normalizer whack-a-mole"
 leak already identified in the improvement notes. The fix is not more whack-a-mole;
@@ -36,7 +36,7 @@ it is making invalid shapes unrepresentable (AST) and catching the rest in prefl
 
 | Subsystem | State | Verdict |
 |---|---|---|
-| Parse (BRD → spec, nano) | Works; weakest link. Invents aliases, empty transforms, redundant agg columns | Needs AST + decomposition + model eval |
+| Parse (BRD → spec, gemini-2.5-flash) | Works; weakest link. Invents aliases, empty transforms, redundant agg columns | Needs AST + decomposition + model eval |
 | Grounding | Good since location-aliasing fix; CSV-only; silent when file missing | Extend + make loud |
 | Builder | Deterministic, well-commented; has collision guard now; still renders some invalid shapes (empty aggregate) | Close remaining render gaps |
 | Preflight | Checks cross-refs/names only. **Does not validate dataflow scripts or Azure resources** | Biggest gap — promote to real gate |
@@ -127,7 +127,7 @@ same location → validation error telling the model to reuse the existing one
 **3.3 Decompose generation (priority item 4).** One call: skeleton (layers,
 datasets, pipeline chain). Then one small call per dataflow: "here is the REAL
 grounded schema of your source; emit transforms as ops." Narrow prompts are the
-proven way to make nano behave; also makes each call independently retryable.
+proven way to make a small model behave; also makes each call independently retryable.
 
 ### Phase 3.5 — Coverage: the "any BRD should pass" strategy (parallel track)
 
@@ -192,10 +192,10 @@ Extend `eval_spec_gen.py` scoring with the Phase-1 linter (parse → build →
 preflight → **lint**). Target: ≥95% pass over 5 runs/BRD before any model or
 prompt change merges. This is what makes "model-independent" a number.
 
-**5.2 Model upgrade experiment.** With the eval in place, run nano vs a mid-tier
-model side by side. Decide with data whether nano + guards is enough or the
-semantic layer needs a better model. (Known: nano invents; unknown: how much it
-still costs after Phases 1–3.)
+**5.2 Model upgrade experiment.** With the eval in place, run the current model
+(gemini-2.5-flash) vs a larger one side by side. Decide with data whether the
+small model + guards is enough or the semantic layer needs a better model.
+(Known: small models invent; unknown: how much it still costs after Phases 1–3.)
 
 **5.3 Regression suite.** `tests/regressions/` — every healed artifact's
 before/after pair becomes a test: bad spec in → builder+linter must reject or
