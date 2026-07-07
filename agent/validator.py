@@ -303,25 +303,47 @@ def _artifact_inventory(run_dir: str) -> Dict[str, str]:
 def _pick_target(
     error_message: str, inventory: Dict[str, str], run_dir: Optional[str] = None
 ) -> Optional[Tuple[str, str]]:
-    # 1. The error names an artifact directly.
-    for name, category in inventory.items():
-        if name and name in error_message:
-            return name, category
-    # 2. The error names an ACTIVITY ("Operation on target copy_x failed") —
-    #    find the artifact whose JSON contains that activity. Without this the
-    #    fallback healed an unrelated dataflow twice for a Copy-activity error
-    #    (run df2db30c73a5) while the real problem was elsewhere.
+    # 1. Resolve the ACTIVITY chain first — it is the most reliable signal and the
+    #    one that used to mis-fire. A runtime data-flow failure nests the targets
+    #    outermost -> innermost:
+    #      "Operation on target run_silver_x failed: Operation on target
+    #       flow_silver_x failed: {DFExecutorUserError ... at Sink 'sinkX' ...}"
+    #    The OUTER tokens are just the master's ExecutePipeline and the child's
+    #    ExecuteDataFlow wrappers; the INNER one is the real failure. So walk the
+    #    tokens innermost-first, and when a token is an ExecuteDataFlow activity,
+    #    heal the DATAFLOW it runs (a DFExecutorUserError is a data-flow problem),
+    #    NOT the pipeline that invokes it. Without this, a silver data-flow type
+    #    error healed pl_master_pipeline twice and burned every retry.
     if run_dir:
         targets = re.findall(r"Operation on target (\S+) failed", error_message)
-        for tok in targets:
-            for name, category in inventory.items():
-                path = os.path.join(run_dir, category, f"{name}.json")
-                try:
-                    with open(path, "r", encoding="utf-8") as fh:
-                        if f'"{tok}"' in fh.read():
-                            return name, category
-                except OSError:
-                    continue
+        pipelines = _load_pipelines(run_dir)
+        for tok in reversed(targets):  # innermost first
+            for pl_name, props in pipelines.items():
+                for act in props.get("activities", []):
+                    if act.get("name") != tok:
+                        continue
+                    if act.get("type") == "ExecuteDataFlow":
+                        df = (
+                            act.get("typeProperties", {})
+                            .get("dataflow", {})
+                            .get("referenceName")
+                        )
+                        if df and df in inventory:
+                            return df, inventory[df]
+                    elif act.get("type") != "ExecutePipeline":
+                        # A Copy/GetMetadata/etc. failure — heal the pipeline that
+                        # owns the activity (its dataset/LS refs live there).
+                        if pl_name in inventory:
+                            return pl_name, inventory[pl_name]
+                    # ExecutePipeline wrapper: skip, keep unwinding to the inner target.
+
+    # 2. The error names an artifact directly (e.g. a dataset in
+    #    AdlsGen2InvalidResourceName). Prefer a data flow / dataset over a pipeline.
+    matches = [(n, c) for n, c in inventory.items() if n and n in error_message]
+    if matches:
+        matches.sort(key=lambda nc: 0 if nc[1] in ("dataflows", "datasets") else 1)
+        return matches[0]
+
     # 3. Last resort: any dataflow, else anything.
     for name, category in inventory.items():
         if category == "dataflows":
