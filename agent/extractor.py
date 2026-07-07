@@ -42,6 +42,15 @@ Rules:
   the key columns on both sides. Aggregations use sum/avg/min/max/count/
   count_distinct/first. "top N" = sort + top_n. Do NOT invent outputs the
   requirements never asked for.
+- DATE PARTS: to group by or output Year / Month / Day / Hour / week from a
+  timestamp or date column, add a `derived` column on the output with op `year`,
+  `month`, `dayofmonth`, `dayofweek`, `dayofyear`, `hour`, `minute`, `second`,
+  or `weekofyear` (column = the timestamp), give it a new_column name, then put
+  that new_column in `group_by`. Example for "monthly sales by year and month":
+  derived = [{name: order_year, op: year, column: order_purchase_timestamp},
+  {name: order_month, op: month, column: order_purchase_timestamp}], then
+  group_by = [order_year, order_month] with the sum aggregation. This is fully
+  supported — do NOT mark year/month grouping as unsupported.
 - schedule: only when the requirements state or clearly imply one.
 - unsupported: every requirement you recognized but cannot express (validation
   gates, alerting, archive/delete steps, SCD2, incremental merge, ForEach

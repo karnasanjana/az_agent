@@ -105,6 +105,47 @@ def test_aggregation_dup_group_by_raises():
         compile_plan(plan)
 
 
+def test_gold_date_part_grouping(monkeypatch):
+    """Year/Month grouping from a timestamp must build a real gold flow — not be
+    dropped as unsupported (the monthly_sales gap the user hit)."""
+    monkeypatch.setenv("MOCK", "true")
+    plan = LogicalPlan(
+        project="retail_sales",
+        sources=[
+            LogicalSource(entity="orders", format="csv", file_name="o.csv",
+                          columns=[LogicalColumn(name="order_id"),
+                                   LogicalColumn(name="order_purchase_timestamp")]),
+            LogicalSource(entity="payments", format="csv", file_name="p.csv",
+                          columns=[LogicalColumn(name="order_id"),
+                                   LogicalColumn(name="payment_value", type="decimal(18,2)")]),
+        ],
+        transforms=[EntityTransform(entity="orders",
+                                    casts=[LogicalColumn(name="order_purchase_timestamp", type="timestamp")])],
+        outputs=[OutputPlan(
+            name="monthly_sales",
+            from_entities=["orders", "payments"],
+            joins=[JoinPlan(left_entity="orders", right_entity="payments",
+                            left_keys=["order_id"], right_keys=["order_id"])],
+            derived=[CleaningOp(op="year", column="order_purchase_timestamp", new_column="order_year"),
+                     CleaningOp(op="month", column="order_purchase_timestamp", new_column="order_month")],
+            group_by=["order_year", "order_month"],
+            aggregations=[AggregationPlan(name="total_sales", op="sum", column="payment_value")],
+        )],
+    )
+    spec = compile_plan(plan)
+    gold = next(df for df in spec.dataflows if df.name == "df_gold_monthly_sales")
+    exprs = [c.expression for t in gold.transforms for c in t.columns]
+    assert "year(order_purchase_timestamp)" in exprs
+    assert "month(order_purchase_timestamp)" in exprs
+    run_id = "test_gold_dateparts"
+    run_dir = builder.artifacts_dir(run_id)
+    try:
+        builder.write_artifacts(spec, run_id)
+        assert preflight.validate(run_id)["passed"]
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def test_build_and_preflight(monkeypatch):
     monkeypatch.setenv("MOCK", "true")
     run_id = "test_compile_run"

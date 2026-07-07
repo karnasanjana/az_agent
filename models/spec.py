@@ -243,6 +243,21 @@ _OP_FN = {
     "rownumber": "rowNumber",
     "rank": "rank",
     "denserank": "denseRank",
+    # Date/time PART extraction (single timestamp/date column -> integer). These
+    # unlock "group by Year, Month" style gold outputs without any raw DSL — the
+    # model emits a derived column {op: year, column: order_purchase_timestamp}
+    # then groups by it. Names match ADF Mapping-Data-Flow functions exactly.
+    "year": "year",
+    "month": "month",
+    "dayofmonth": "dayOfMonth",
+    "day": "dayOfMonth",
+    "dayofweek": "dayOfWeek",
+    "dayofyear": "dayOfYear",
+    "hour": "hour",
+    "minute": "minute",
+    "second": "second",
+    "weekofyear": "weekOfYear",
+    "week": "weekOfYear",
 }
 _OP_IDENTITY = {"identity", "copy", "passthrough", "asis", "none"}
 # Window functions that take NO arguments — rendered as fn(), never fn(column).
