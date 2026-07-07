@@ -102,20 +102,31 @@ def graph(run_id: str, root: str = "artifacts") -> Dict[str, Any]:
 
     master = _master_pipeline(spec)
     if master is not None:
-        # One node per master step, edges from the master's dependsOn chain.
+        # One node per LAYER (many ingest/silver/gold activities collapse to
+        # bronze/silver/gold). act_to_node maps EVERY activity to its layer node —
+        # including the deduped ones — so a dependsOn pointing at, say,
+        # run_silver_orders (deduped) still resolves and the silver->gold edge is
+        # not lost. Mapping only the first-seen activity per layer dropped exactly
+        # that edge, leaving gold with no incoming edge (rendered out of order).
         act_to_node: Dict[str, str] = {}
         for act in master.activities:
             node = _child_step(spec, run_dir, pipelines_json, dataflows_json, act.invoked_pipeline)
-            if node is None or node["id"] in seen:
+            if node is None:
+                continue
+            act_to_node[act.name] = node["id"]
+            if node["id"] in seen:
                 continue
             seen.add(node["id"])
-            act_to_node[act.name] = node["id"]
             nodes.append(node)
+        seen_edges: set = set()
         for act in master.activities:
             to_id = act_to_node.get(act.name)
             for dep in act.depends_on:
                 from_id = act_to_node.get(dep)
-                if from_id and to_id:
+                # Skip self-loops (two activities of the same layer) and duplicates
+                # that the layer collapse would otherwise produce.
+                if from_id and to_id and from_id != to_id and (from_id, to_id) not in seen_edges:
+                    seen_edges.add((from_id, to_id))
                     edges.append({"from": from_id, "to": to_id, "condition": "Succeeded"})
     else:
         # No master: one node per activity across the (usually single) pipeline(s).
