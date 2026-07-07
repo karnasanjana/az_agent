@@ -118,5 +118,93 @@ def main() -> int:
     return 0 if passed == total else 1
 
 
+def _raw_expression_count(spec) -> int:
+    """Transform columns whose expression did NOT come from a structured op.
+    For the logical path this MUST be 0 — every expression is compiler-rendered
+    from an op or is a deterministic cast, never model-authored DSL."""
+    n = 0
+    for df in spec.dataflows:
+        for t in df.transforms:
+            for c in t.columns:
+                # cast transforms carry a compiler-rendered expression with no op;
+                # everything else with an expression-but-no-op on a NON-cast/select
+                # transform would be model raw text. Compiler never emits that.
+                if c.expression and not c.op and t.kind.value not in ("cast", "select"):
+                    n += 1
+    return n
+
+
+def main_logical() -> int:
+    """Logical-path eval: BRD -> extract_plan -> completeness -> compile ->
+    build -> preflight -> lint. The gate for the LogicalPlan refactor."""
+    runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    root = tempfile.mkdtemp(prefix="adf_eval_logical_")
+    model = os.environ.get("LLM_MODEL", "<provider default>")
+    print(f"[LOGICAL] model={model} runs/brd={runs} artifacts={root}\n")
+    print(f"{'brd':<18} {'run':>3}  {'extract':<7} {'check':<6} {'build':<5} "
+          f"{'preflt':<6} {'lint':<5} {'raw':>3}  {'sec':>5}  notes")
+
+    try:
+        from agent.completeness import check
+        from agent.compiler import compile_plan
+        from agent.extractor import extract_plan_sync
+        from agent.lint import lint_dataflow_script
+        from agent.review import load_script
+    except Exception as exc:  # noqa: BLE001
+        print(f"cannot import logical pipeline: {exc}")
+        return 2
+
+    passed = total = 0
+    for brd_name, brd in BRDS.items():
+        for i in range(1, runs + 1):
+            total += 1
+            run_id = f"logical-{brd_name}-{i}"
+            t0 = time.time()
+            note = ""
+            ex_ok = chk_ok = build_ok = pf_ok = lint_ok = False
+            raw = "-"
+            try:
+                plan = extract_plan_sync(brd)
+                ex_ok = True
+                problems = check(plan)
+                chk_ok = not problems
+                if not chk_ok:
+                    note = f"check: {problems[:1]}"
+                else:
+                    spec = compile_plan(plan)
+                    raw = str(_raw_expression_count(spec))
+                    builder.write_artifacts(spec, run_id, root=root)
+                    build_ok = True
+                    pf = preflight.validate(run_id, root=root)
+                    pf_ok = bool(pf.get("passed"))
+                    if not pf_ok:
+                        fails = [c["name"] for c in pf.get("checks", []) if not c.get("passed")]
+                        note = f"preflight: {', '.join(fails[:3])}"
+                    lint_problems = []
+                    for df in spec.dataflows:
+                        lint_problems += lint_dataflow_script(
+                            df.name, load_script(os.path.join(root, run_id), df.name)
+                        )
+                    lint_ok = not lint_problems
+                    if not lint_ok:
+                        note = (note + "; " if note else "") + f"lint: {lint_problems[:1]}"
+            except Exception as exc:  # noqa: BLE001
+                note = f"{type(exc).__name__}: {exc}"[:90]
+            secs = time.time() - t0
+            ok = ex_ok and chk_ok and build_ok and pf_ok and lint_ok
+            passed += 1 if ok else 0
+            mark = lambda b: "ok" if b else "FAIL"  # noqa: E731
+            print(f"{brd_name:<18} {i:>3}  {mark(ex_ok):<7} {mark(chk_ok):<6} "
+                  f"{mark(build_ok):<5} {mark(pf_ok):<6} {mark(lint_ok):<5} {raw:>3}  "
+                  f"{secs:>5.1f}  {note}")
+
+    rate = 100 * passed // max(total, 1)
+    print(f"\n[LOGICAL] pass rate: {passed}/{total} ({rate}%)  gate: >=95%")
+    shutil.rmtree(root, ignore_errors=True)
+    return 0 if rate >= 95 else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--logical":
+        raise SystemExit(main_logical())
     raise SystemExit(main())

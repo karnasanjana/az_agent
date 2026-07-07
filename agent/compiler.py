@@ -24,7 +24,6 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 from models.logical import (
-    AggregationPlan,
     CleaningOp,
     EntityTransform,
     FilterRule,
@@ -55,7 +54,6 @@ from models.spec import (
     TransformKind,
     Trigger,
     TriggerKind,
-    _norm_op,
 )
 
 STORAGE_LS = "ls_storage"

@@ -276,13 +276,87 @@ def _store_and_respond(
     }
 
 
+def _legacy_parser() -> bool:
+    return os.environ.get("LEGACY_PARSER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_MAX_PLAN_REPAIRS = 3       # completeness-check repair rounds (before build)
+_MAX_PREFLIGHT_REPAIRS = 2  # preflight repair rounds (after build)
+
+
+async def _run_logical(run_id: str, produce) -> Dict[str, Any]:
+    """New path: BRD/instruction -> LogicalPlan -> compile -> spec, with the model
+    fixing its OWN plan against the deterministic checks. `produce` is an async
+    callable returning (plan, messages) — extract_plan(text) or
+    refine_plan(instruction, history).
+
+    Two feedback loops close over the model, not the human:
+      1. completeness.check() failures fed back before any build.
+      2. preflight failures fed back after build (rare — compiler output is
+         normally clean). Never deploys a failing spec; if neither loop
+         converges the user sees the problems, exactly as the legacy path does.
+    """
+    from agent.completeness import check
+    from agent.compiler import compile_plan
+    from agent.extractor import refine_plan
+
+    plan, messages = await produce()
+
+    # Loop 1 — logical consistency, before building anything.
+    for _ in range(_MAX_PLAN_REPAIRS):
+        problems = check(plan)
+        if not problems:
+            break
+        feedback = (
+            "Your plan has problems. Fix ALL of them and return the full "
+            "corrected plan:\n" + "\n".join(f"- {p}" for p in problems)
+        )
+        plan, messages = await refine_plan(feedback, messages)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Could not produce a consistent plan from the requirements.",
+                "problems": check(plan),
+            },
+        )
+
+    spec = compile_plan(plan)
+    resp = _store_and_respond(run_id, spec, messages)
+
+    # Loop 2 — compiled pipeline must pass preflight. Feed failures back.
+    for _ in range(_MAX_PREFLIGHT_REPAIRS):
+        if _RUNS[run_id].get("preflight", {}).get("passed"):
+            break
+        failed = [
+            f"{c['name']}: {c['detail']}"
+            for c in _RUNS[run_id].get("preflight", {}).get("checks", [])
+            if not c["passed"]
+        ]
+        plan, messages = await refine_plan(
+            "The compiled pipeline failed validation. Adjust the plan to fix:\n"
+            + "\n".join(f"- {f}" for f in failed),
+            messages,
+        )
+        if check(plan):  # a repair that reintroduced a logical problem — spend the round
+            continue
+        spec = compile_plan(plan)
+        resp = _store_and_respond(run_id, spec, messages)
+
+    # Audit: persist the logical plan next to the built artifacts.
+    run_dir = _RUNS[run_id].get("run_dir")
+    if run_dir:
+        with open(os.path.join(run_dir, "logical_plan.json"), "w", encoding="utf-8") as fh:
+            fh.write(plan.model_dump_json(indent=2))
+    return resp
+
+
 @app.post("/plan")
 async def plan(
     brd: Optional[str] = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
 ) -> Dict[str, Any]:
     from agent.ingest import extract_brd_text
-    from agent.parser import parse_brd  # lazy: only /plan needs Foundry
 
     text = (brd or "").strip()
     if file is not None:
@@ -297,20 +371,25 @@ async def plan(
 
     run_id = uuid.uuid4().hex[:12]
     try:
-        spec, messages = await parse_brd(text)
-    except RuntimeError as exc:  # missing Foundry config
+        if _legacy_parser():
+            from agent.parser import parse_brd  # lazy: only the legacy path needs it
+
+            spec, messages = await parse_brd(text)
+            return _store_and_respond(run_id, spec, messages)
+        from agent.extractor import extract_plan
+
+        return await _run_logical(run_id, lambda: extract_plan(text))
+    except HTTPException:
+        raise
+    except RuntimeError as exc:  # missing Foundry / model config
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:  # parse / model error — surface, don't 500
         raise HTTPException(status_code=502, detail=f"BRD parse failed: {exc}") from exc
-
-    return _store_and_respond(run_id, spec, messages)
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> Dict[str, Any]:
     """Refine an existing run: answer the agent's questions or request changes."""
-    from agent.parser import refine_spec
-
     run = _RUNS.get(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
@@ -321,13 +400,20 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="Type a change or an answer.")
 
     try:
-        spec, messages = await refine_spec(message, run["messages"])
+        if _legacy_parser():
+            from agent.parser import refine_spec
+
+            spec, messages = await refine_spec(message, run["messages"])
+            return _store_and_respond(req.run_id, spec, messages)
+        from agent.extractor import refine_plan
+
+        return await _run_logical(req.run_id, lambda: refine_plan(message, run["messages"]))
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Refine failed: {exc}") from exc
-
-    return _store_and_respond(req.run_id, spec, messages)
 
 
 # --------------------------------------------------------------------------- #
