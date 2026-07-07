@@ -499,10 +499,15 @@ def _delta_script_props(ds: Dataset, sink: bool = False) -> List[str]:
     Parameter tokens are stripped: a Delta table lives at ONE static folder
     (versioning is Delta's job, not per-run folders).
 
-    Sinks are FULL-RELOAD: recreate + mergeSchema. Without this, appends
-    duplicate rows on every re-run, and any projection change (e.g. schema
-    grounding widening 3 guessed columns to the file's real 8) fails with
-    Delta's 'A schema mismatch detected when writing to the Delta table'."""
+    Sinks are FULL-RELOAD via `recreate: true` — ADF drops and recreates the
+    Delta table each run, so THIS run's schema always wins. That both stops
+    append-duplication on re-runs AND lets a column's type change between runs
+    (e.g. order_item_id string -> integer once a cast is added): a fresh table
+    has no old schema to reconcile. We deliberately do NOT set `mergeSchema`:
+    merging is the opposite policy — it tries to unify the new write with the
+    existing table and FAILS on an incompatible type change (StringType vs
+    IntegerType at the sink), the exact runtime error observed on silver
+    order_items. recreate + mergeSchema together is contradictory; recreate wins."""
     loc = ds.location
     lines = ["  format: 'delta',"]
     if loc and loc.container:
@@ -512,7 +517,6 @@ def _delta_script_props(ds: Dataset, sink: bool = False) -> List[str]:
         if folder:
             lines.append(f"  folderPath: '{folder}',")
     if sink:
-        lines.append("  mergeSchema: true,")
         lines.append("  recreate: true,")
     return lines
 
