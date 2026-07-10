@@ -130,7 +130,31 @@ Flags:
 ```bash
 export MOCK=false        # true = local dry-run, writes to mock_tenant/, simulates the run
 export SELF_HEAL=false   # true = enable the Claude self-heal retry loop
+export PRUNE_STALE=false # true = delete agent-created objects not in this run.
+                         # OFF by default: the agent NEVER deletes from your tenant.
+                         # When off, stale objects are reported, never removed.
 ```
+
+Plan-phase performance:
+
+```bash
+export PLAN_MODE=auto    # auto (default) = one LLM call to generate, tool agent for
+                         #   repairs/refines — fastest path that stays correctable
+                         # tools   = every edit via validated tool calls (most robust,
+                         #   most model turns)
+                         # oneshot = whole plan re-emitted each round (legacy)
+export PLAN_CACHE=true   # identical BRD + same mode + same model -> reuse the cached
+                         # plan, zero LLM calls (artifacts/.plan_cache/). Set false
+                         # when evaluating a model/prompt change.
+export GROUND_PLAN=true  # /plan READS source file headers (first 64 KB) to ground
+                         # column schemas. Read-only — nothing is created in your
+                         # tenant before approval. Set false for a fully offline plan
+                         # phase; grounding then runs at /approve, before the deploy.
+```
+
+Every `/plan` and `/chat` response carries a `timings` block — per-phase wall-clock
+(`extract`, `repair_completeness`, `triage_unsupported`, `compile`, `grounding`,
+`repair_preflight`) plus `llm_calls` — so a slow or chatty run is measurable.
 
 ## Install & run
 
@@ -206,5 +230,3 @@ run. The UI shows a **MOCK** banner.
   default, primary path.
 - **Manual trigger** is created as an artifact but exercised via `create_run` on demand
   (manual runs aren't ARM trigger resources).
-#   a z _ a g e n t  
- 

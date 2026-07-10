@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # skills/ lives at the project root (one level up from this agent/ package).
 _SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
@@ -71,3 +71,92 @@ def load_skills(skills_dir: str = _SKILLS_DIR) -> str:
         "Follow these exactly; they reflect real ADF behavior.\n"
     )
     return header + "\n\n---\n\n".join(blocks)
+
+
+# --------------------------------------------------------------------------- #
+# Learned lessons: the feedback half of the skills loop
+# --------------------------------------------------------------------------- #
+# Skills flow knowledge INTO the model at session start; this flows it BACK.
+# When self-heal fixes a runtime failure, the incident is distilled into ONE
+# generic rule and appended to skills/99-learned-lessons.md — which the loader
+# above already picks up. The system grows its own knowledge; no developer
+# writes per-case code.
+
+_LESSONS_FILE = "99-learned-lessons.md"
+_LESSONS_HEADER = """\
+---
+name: learned-lessons
+description: Rules distilled automatically from self-heal incidents. Appended by the agent, not hand-written.
+---
+# Learned lessons (auto-appended from self-heal)
+Rules below were learned from real runtime failures. Follow them when planning
+transformations and writing data-flow expressions.
+"""
+
+_LESSON_PROMPT = """\
+You maintain a lessons file for an agent that turns BRDs into Azure Data
+Factory pipelines. A pipeline artifact failed at runtime and was fixed by a
+self-heal. Distill the incident into ONE generic, reusable rule for FUTURE
+pipeline generation so this class of error never happens again.
+
+Rules for the rule:
+- Generic, not incident-specific: no artifact names, dataset names, or run ids.
+- Imperative, max 2 sentences. Include the ADF error code when present.
+- It must be actionable while PLANNING transformations (choosing ops, args,
+  types, expressions), not advice about fixing deployed JSON.
+- If the existing lessons already cover this failure class, return covered=true
+  and no lesson.
+"""
+
+
+def lessons_path(skills_dir: str = _SKILLS_DIR) -> str:
+    return os.path.join(skills_dir, _LESSONS_FILE)
+
+
+def record_lesson(
+    error_message: str, fix_explanation: str, skills_dir: str = _SKILLS_DIR
+) -> Optional[str]:
+    """Distill a successful self-heal into a generic rule and append it to
+    skills/99-learned-lessons.md. Returns the rule, or None when the existing
+    lessons already cover the failure class. Never raises — a failed lesson
+    must not break the heal that triggered it."""
+    from pydantic import BaseModel, Field
+
+    class Lesson(BaseModel):
+        covered: bool = Field(description="True when existing lessons already cover this failure class.")
+        lesson: str = Field(default="", description="The single generic rule; empty when covered.")
+
+    try:
+        from pydantic_ai import Agent
+
+        from config import get_model, structured_output
+
+        path = lessons_path(skills_dir)
+        existing = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+
+        agent = Agent(
+            get_model(), output_type=structured_output(Lesson), system_prompt=_LESSON_PROMPT
+        )
+        out = agent.run_sync(
+            f"Runtime error:\n{error_message}\n\n"
+            f"What the self-heal changed:\n{fix_explanation}\n\n"
+            f"Existing lessons file:\n{existing or '(empty)'}"
+        ).output
+        rule = (out.lesson or "").strip()
+        if out.covered or not rule:
+            return None
+        if rule in existing:  # literal duplicate — belt and braces
+            return None
+
+        os.makedirs(skills_dir, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            if not existing:
+                fh.write(_LESSONS_HEADER + "\n")
+            fh.write(f"- {rule}\n")
+        load_skills.cache_clear()  # same-process parsers see the new rule
+        return rule
+    except Exception:
+        return None

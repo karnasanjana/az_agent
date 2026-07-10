@@ -215,7 +215,12 @@ def _transform_english(t) -> str:
     if t.kind == TransformKind.aggregate:
         grp = ", ".join(f"`{g}`" for g in t.group_by)
         aggs = ", ".join(f"`{c.name}` = {c.expression}" for c in t.columns)
+        if not aggs:  # aggregate with no measures = dedup on the group keys
+            return f"dedup on {grp}"
         return f"aggregate by {grp} → {aggs}"
+    if t.kind == TransformKind.join:
+        cond = f" on `{t.condition}`" if t.condition else ""
+        return f"{t.join_type} join `{t.right_stream}`{cond}"
     if t.kind == TransformKind.sort:
         keys = ", ".join(f"`{k.column}` {k.order}" for k in t.order_by)
         return f"sort by {keys}"
@@ -254,28 +259,30 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
         )
     out.append("")
 
-    # Steps (medallion layers, copy activities, and any other data flows)
+    # Steps. Bronze is one line (it's just a copy); Silver/Gold list the ACTUAL
+    # operations one per bullet with the real expression — that's where runtime
+    # errors live, so that's what the human verifies. No prose explanations.
     out.append("## Steps")
     _, bronze_act = find_bronze_copy(spec)
     if bronze_act is not None:
         out.append(
-            f"- **Bronze** (Copy, no transform): `{bronze_act.source_dataset}` "
-            f"→ `{bronze_act.sink_dataset}` — raw byte-for-byte landing."
+            f"- **Bronze**: copy `{bronze_act.source_dataset}` → "
+            f"`{bronze_act.sink_dataset}` (raw, no transform)"
         )
     for pl in spec.pipelines:
         for act in pl.activities:
             if act.type == "Copy" and act is not bronze_act:
                 out.append(
-                    f"- **Copy** `{act.name}` (pipeline `{pl.name}`): "
-                    f"`{act.source_dataset}` → `{act.sink_dataset}`."
+                    f"- **Copy** `{act.name}`: "
+                    f"`{act.source_dataset}` → `{act.sink_dataset}`"
                 )
     for df in spec.dataflows:
-        steps = "; ".join(_transform_english(t) for t in df.transforms) or "passthrough"
         label = df.layer.value.capitalize() if df.layer else "Transform"
-        out.append(
-            f"- **{label}** (Data Flow `{df.name}`): "
-            f"`{df.source.dataset}` → `{df.sink.dataset}` — {steps}."
-        )
+        out.append(f"- **{label}** `{df.name}` (`{df.source.dataset}` → `{df.sink.dataset}`):")
+        for i, t in enumerate(df.transforms, 1):
+            out.append(f"  {i}. {_transform_english(t)}")
+        if not df.transforms:
+            out.append("  1. passthrough")
     out.append("")
 
     # Orchestration

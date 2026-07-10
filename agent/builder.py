@@ -395,8 +395,12 @@ _COPY_SINK_TYPE = {
 # --------------------------------------------------------------------------- #
 
 
-def _transform_dsl(input_stream: str, t: Transform) -> str:
-    """Render one transformation line: '<in> <op>(...) ~> <name>'."""
+def _transform_dsl(
+    input_stream: str, t: Transform, prev_sort: "Transform | None" = None
+) -> str:
+    """Render one transformation line: '<in> <op>(...) ~> <name>'. `prev_sort`
+    is the most recent sort transform in the chain — a limit needs its keys to
+    rank deterministically (ADF has no native limit transform)."""
     if t.kind in (TransformKind.cast, TransformKind.derived):
         assigns = ",\n        ".join(f"{c.name} = {c.expression}" for c in t.columns)
         return f"{input_stream} derive({assigns}) ~> {t.name}"
@@ -448,8 +452,37 @@ def _transform_dsl(input_stream: str, t: Transform) -> str:
         return f"{input_stream} window({t.condition or ''}) ~> {t.name}"
 
     if t.kind == TransformKind.limit:
-        # ADF Limit transform: limit(skip, take), both integer literals.
-        return f"{input_stream} limit({t.skip},\n    {t.take}) ~> {t.name}"
+        # ADF has NO limit() transform — the Spark broker rejects it with
+        # DF-FLO-005 "Transformation 'limit' not registered" (which also
+        # orphans the sink: DF-FLO-001/DF-TX-001). Row-limiting is lowered to
+        # the documented top-N pattern: rank on the preceding sort's keys
+        # (falling back to a surrogate key when no sort precedes), filter to
+        # the first `take` ranks, then drop the helper column so the sink
+        # schema is unchanged. The final stream keeps t.name so downstream
+        # chaining (next transform / sink input) is unaffected.
+        rank_col = "__rowRank"
+        if prev_sort is not None and prev_sort.order_by:
+            keys = ",\n    ".join(f"{k.order}({k.column})" for k in prev_sort.order_by)
+            head = (
+                f"{input_stream} rank({keys},\n"
+                f"    output({rank_col} as long),\n"
+                f"    dense: false) ~> {t.name}Rank"
+            )
+        else:
+            head = (
+                f"{input_stream} keyGenerate(output({rank_col} as long),\n"
+                f"    startAt: 1L) ~> {t.name}Rank"
+            )
+        cond = f"{rank_col} <= {t.skip + (t.take or 0)}"
+        if t.skip:
+            cond = f"{rank_col} > {t.skip} && {cond}"
+        keep = f"{t.name}Rank filter({cond}) ~> {t.name}Keep"
+        drop = (
+            f"{t.name}Keep select(mapColumn(each(match(name != '{rank_col}'))),\n"
+            f"    skipDuplicateMapInputs: true,\n"
+            f"    skipDuplicateMapOutputs: true) ~> {t.name}"
+        )
+        return "\n".join([head, keep, drop])
 
     if t.kind == TransformKind.join:
         # ADF join DSL: "<left>, <right> join(<cond>, joinType:'inner', ...) ~> <name>".
@@ -503,15 +536,20 @@ def _delta_script_props(ds: Dataset, sink: bool = False) -> List[str]:
     Parameter tokens are stripped: a Delta table lives at ONE static folder
     (versioning is Delta's job, not per-run folders).
 
-    Sinks are FULL-RELOAD via `recreate: true` — ADF drops and recreates the
-    Delta table each run, so THIS run's schema always wins. That both stops
-    append-duplication on re-runs AND lets a column's type change between runs
-    (e.g. order_item_id string -> integer once a cast is added): a fresh table
-    has no old schema to reconcile. We deliberately do NOT set `mergeSchema`:
-    merging is the opposite policy — it tries to unify the new write with the
-    existing table and FAILS on an incompatible type change (StringType vs
-    IntegerType at the sink), the exact runtime error observed on silver
-    order_items. recreate + mergeSchema together is contradictory; recreate wins."""
+    Sinks are FULL-RELOAD via `overwrite: true` — the Delta sink's "Overwrite"
+    table action replaces the existing table's METADATA and data each run, so
+    THIS run's schema always wins. That both stops append-duplication on
+    re-runs AND lets a column's type change between runs (e.g. order_item_id
+    string -> integer once a cast is added, or a different project reusing the
+    same silver/<entity> folder): a replaced table has no old schema to
+    reconcile. Per the ADF Delta format docs the only sink table actions are
+    `deltaTruncate` (keeps the old schema — type changes still fail) and
+    `overwrite`; `recreate` is a SQL-sink property that Delta sinks silently
+    IGNORE, which left the sink appending with schema merge and produced the
+    "Failed to merge incompatible data types StringType and IntegerType"
+    runtime failures. We deliberately do NOT set `mergeSchema`: merging tries
+    to unify the new write with the existing table and fails on exactly that
+    type change; overwrite makes the old table irrelevant."""
     loc = ds.location
     lines = ["  format: 'delta',"]
     if loc and loc.container:
@@ -521,7 +559,7 @@ def _delta_script_props(ds: Dataset, sink: bool = False) -> List[str]:
         if folder:
             lines.append(f"  folderPath: '{folder}',")
     if sink:
-        lines.append("  recreate: true,")
+        lines.append("  overwrite: true,")
     return lines
 
 
@@ -564,9 +602,12 @@ def build_dataflow_script(df: DataFlow, datasets: "Dict[str, Dataset] | None" = 
         )
 
     current = df.source.stream_name
+    prev_sort: "Transform | None" = None
     for t in _effective_transforms(df):
-        lines.append(_transform_dsl(current, t))
+        lines.append(_transform_dsl(current, t, prev_sort))
         current = t.name
+        if t.kind == TransformKind.sort:
+            prev_sort = t
 
     sink_lines = [f"{current} sink(allowSchemaDrift: true,", "  validateSchema: false,"]
     sink_delta = _delta_ds(datasets, df.sink.dataset)
@@ -676,6 +717,41 @@ def _copy_input(dataset_name: str, ctx: Dict[str, Any], pipeline_params: List[st
     return ref
 
 
+# One managed IR shared by every ExecuteDataFlow. timeToLive keeps its Spark
+# cluster alive between flows (and between runs, e.g. a self-heal retry), and
+# cleanup=false lets later flows reuse it — otherwise every flow boots its own
+# cluster (~5 minutes each) on AutoResolve.
+# NOTE: IR names reject underscores (InvalidName) — unlike every other ADF
+# object type, only letters/numbers/dashes are allowed.
+DATAFLOW_IR_NAME = "ir-dataflow"
+
+
+def _dataflow_ttl_minutes() -> int:
+    """DATAFLOW_TTL_MINUTES env override; default 10. 0 disables the shared IR
+    (flows fall back to AutoResolve — the slow path, but always valid)."""
+    try:
+        return max(0, int(os.environ.get("DATAFLOW_TTL_MINUTES", "10")))
+    except ValueError:
+        return 10
+
+
+def build_dataflow_ir() -> Dict[str, Any]:
+    return {
+        "type": "Managed",
+        "typeProperties": {
+            "computeProperties": {
+                "location": "AutoResolve",
+                "dataFlowProperties": {
+                    "computeType": "General",
+                    "coreCount": 8,  # matches the ExecuteDataFlow compute tier
+                    "timeToLive": _dataflow_ttl_minutes(),
+                    "cleanup": False,  # quick re-use: keep the cluster across runs
+                },
+            },
+        },
+    }
+
+
 _SUPPORTED_ACTIVITIES = {"Copy", "ExecuteDataFlow", "ExecutePipeline", "Validation", "GetMetadata"}
 
 
@@ -766,17 +842,21 @@ def build_pipeline(pl: PipelineDef, ctx: "Dict[str, Any] | None" = None) -> Dict
                     ds_params[stream] = bound
             if ds_params:
                 df_ref["datasetParameters"] = ds_params
-            common.update(
-                {
-                    "type": "ExecuteDataFlow",
-                    "typeProperties": {
-                        "dataflow": df_ref,
-                        # smallest General Purpose tier (cost)
-                        "compute": {"computeType": "General", "coreCount": 8},
-                        "traceLevel": "Fine",
-                    },
+            df_props: Dict[str, Any] = {
+                "dataflow": df_ref,
+                # smallest General Purpose tier (cost)
+                "compute": {"computeType": "General", "coreCount": 8},
+                "traceLevel": "Fine",
+            }
+            if _dataflow_ttl_minutes() > 0:
+                # Shared cluster: without this every flow runs on AutoResolve
+                # and boots its own Spark cluster (~5 min each) — a 5-flow
+                # medallion spent ~25 min just on cluster startup.
+                df_props["integrationRuntime"] = {
+                    "referenceName": DATAFLOW_IR_NAME,
+                    "type": "IntegrationRuntimeReference",
                 }
-            )
+            common.update({"type": "ExecuteDataFlow", "typeProperties": df_props})
         elif act.type in ("Validation", "GetMetadata"):
             # BRD "verify the file exists / is not empty before processing" asks.
             # Both take one dataset reference; the LLM puts it in source_dataset.
@@ -952,6 +1032,12 @@ def build_all(spec: PipelineSpec) -> Dict[str, Dict[str, Dict[str, Any]]]:
         return _canonical_for_dataset(ds).name
 
     return {
+        # The shared data-flow IR (skipped when the spec has no flows or TTL=0).
+        "integrationRuntimes": (
+            {DATAFLOW_IR_NAME: build_dataflow_ir()}
+            if spec.dataflows and _dataflow_ttl_minutes() > 0
+            else {}
+        ),
         "linkedServices": linked,
         # Delta datasets are inline-only (no ADF dataset resource) — not built.
         "datasets": {
@@ -971,8 +1057,10 @@ def build_all(spec: PipelineSpec) -> Dict[str, Dict[str, Dict[str, Any]]]:
     }
 
 
-# Deploy order: linked services -> datasets -> data flows -> pipelines -> triggers.
-DEPLOY_ORDER = ["linkedServices", "datasets", "dataflows", "pipelines", "triggers"]
+# Deploy order: IR -> linked services -> datasets -> data flows -> pipelines ->
+# triggers. The IR goes first because pipelines' ExecuteDataFlow activities
+# reference it by name.
+DEPLOY_ORDER = ["integrationRuntimes", "linkedServices", "datasets", "dataflows", "pipelines", "triggers"]
 
 
 def artifacts_dir(run_id: str, root: str = "artifacts") -> str:

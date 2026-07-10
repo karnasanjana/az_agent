@@ -156,6 +156,24 @@ def validate(run_id: str, root: str = "artifacts") -> Dict[str, Any]:
                     )
     checks.append(_check("medallion_wiring", not wiring, "; ".join(wiring) or "layer wiring ok"))
 
+    # 7b. Expressions type-check against the (grounded) source schemas: walk each
+    #     flow's transform chain tracking column types; catch arithmetic on uncast
+    #     string columns, coalesce() mixing types, date parts of non-temporal
+    #     columns, sum/avg on text, numeric comparisons on strings. BLOCKING —
+    #     this is the DF-DT-001 class ADF only reports minutes into a run; the
+    #     /plan repair loop feeds these lines back to the model, which adds the
+    #     missing casts itself.
+    from agent.typecheck import check_spec
+
+    type_problems = check_spec(spec)
+    checks.append(
+        _check(
+            "expression_types",
+            not type_problems,
+            "; ".join(type_problems) or "all expressions type-check against source schemas",
+        )
+    )
+
     # 8. No BRD requirement silently dropped: activities the builder can't render
     #    are reported by name. Informational (doesn't block) — the plan review
     #    shows the user exactly what was left out.

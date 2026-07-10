@@ -57,7 +57,7 @@ Preserve:
 
 Store Bronze data as CSV using the folder structure:
 
-bronze/{dataset_name}/{execution_date}/
+bronze/{dataset_name}/
 
 Parameterize the execution date.
 
@@ -126,7 +126,7 @@ Output Columns:
 
 Write the output as CSV using:
 
-gold/monthly_sales/{execution_date}/
+gold/monthly_sales/
 
 ORCHESTRATION:
 

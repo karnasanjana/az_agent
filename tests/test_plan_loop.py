@@ -26,6 +26,12 @@ from models.logical import (
 def _mock_env(monkeypatch):
     monkeypatch.setenv("MOCK", "true")
     monkeypatch.delenv("LEGACY_PARSER", raising=False)
+    # This file exercises the ONE-SHOT extractor loop; the tool-agent path is
+    # covered by tests/test_plantools.py, the auto default by test_plancache.py.
+    monkeypatch.setenv("PLAN_MODE", "oneshot")
+    # These tests stub the extractor and share one BRD text, so a cached plan
+    # from an earlier test would short-circuit the stub under test.
+    monkeypatch.setenv("PLAN_CACHE", "false")
     yield
     for rid in list(app_module._RUNS):
         rd = app_module._RUNS[rid].get("run_dir")
@@ -100,6 +106,88 @@ def test_completeness_repair_loop(monkeypatch):
     assert r.status_code == 200, r.text
     assert calls["n"] >= 1  # repair loop ran
     assert r.json()["preflight"]["passed"]
+
+
+def test_repaired_plan_is_regrounded(tmp_path, monkeypatch):
+    """A refine returns a FULL plan whose source columns are model-authored
+    again. Grounding must be re-applied to it, or every repair round after the
+    first checks (and compiles) against hallucinated columns."""
+    landing = tmp_path / "tenant" / "storage" / "landing"
+    landing.mkdir(parents=True)
+    (landing / "orders.csv").write_text(
+        "order_id,month,amount\n1,2026-07,10.5\n", encoding="utf-8"
+    )
+    import agent.grounding as grounding
+
+    monkeypatch.setattr(grounding, "MOCK_TENANT_DIR", str(tmp_path / "tenant"))
+
+    async def fake_extract(text, message_history=None):
+        bad = _good_plan()
+        bad.outputs[0].aggregations = []  # force one repair round
+        return bad, []
+
+    async def fake_refine(instruction, message_history):
+        p = _good_plan()
+        # the model re-invents the schema on the way back
+        p.sources[0].columns = [LogicalColumn(name="totally_made_up")]
+        return p, message_history
+
+    from agent import extractor
+    monkeypatch.setattr(extractor, "extract_plan", fake_extract)
+    monkeypatch.setattr(extractor, "refine_plan", fake_refine)
+
+    client = TestClient(app_module.app)
+    r = client.post("/plan", data={"brd": "x"})
+    assert r.status_code == 200, r.text
+    plan = app_module._RUNS[r.json()["run_id"]]["logical_plan"]
+    cols = [c.name for c in plan.sources[0].columns]
+    assert cols == ["order_id", "month", "amount"]  # real header, not the model's
+
+
+def test_unsupported_triage_loop(monkeypatch):
+    """A plan with unsupported items triggers ONE triage round carrying the
+    capability card; the model re-expresses what fits. Items still unsupported
+    after triage ride into the response (and gate /approve)."""
+    calls = {"prompts": []}
+
+    async def fake_extract(text, message_history=None):
+        p = _good_plan()
+        p.unsupported = [
+            "Convert first_name to Proper Case",  # expressible — model over-marked
+            "Send a Teams alert on failure",      # genuine gap
+        ]
+        return p, []
+
+    async def fake_refine(instruction, message_history):
+        calls["prompts"].append(instruction)
+        p = _good_plan()  # proper case re-expressed; alerting stays
+        p.unsupported = ["Send a Teams alert on failure"]
+        p.suggestions = ["Alerting not supported -> monitor the run from the UI instead?"]
+        return p, message_history
+
+    from agent import extractor
+    monkeypatch.setattr(extractor, "extract_plan", fake_extract)
+    monkeypatch.setattr(extractor, "refine_plan", fake_refine)
+
+    client = TestClient(app_module.app)
+    r = client.post("/plan", data={"brd": "x"})
+    assert r.status_code == 200, r.text
+    assert len(calls["prompts"]) == 1  # exactly one triage round
+    # the triage prompt carries the live capability card
+    assert "proper" in calls["prompts"][0]
+    assert "validate_first" in calls["prompts"][0]
+    body = r.json()
+    assert body["unsupported"] == ["Send a Teams alert on failure"]
+    assert body["suggestions"] == [
+        "Alerting not supported -> monitor the run from the UI instead?"
+    ]
+    # the genuine gap gates approval until acknowledged
+    a = client.post("/approve", json={"run_id": body["run_id"]})
+    assert a.status_code == 409
+    assert a.json()["detail"]["unsupported"] == ["Send a Teams alert on failure"]
+    a = client.post("/approve", json={"run_id": body["run_id"],
+                                      "acknowledge_unsupported": True})
+    assert a.status_code == 200
 
 
 def test_no_convergence_returns_422(monkeypatch):

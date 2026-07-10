@@ -22,6 +22,24 @@ from typing import Any, List, Optional, Tuple
 from config import default_model_settings, get_model, structured_output
 from models.logical import LogicalPlan
 
+_LAST_USAGE: Any = None
+
+
+def _capture_usage(result: Any) -> None:
+    global _LAST_USAGE
+    usage = getattr(result, "usage", None)
+    _LAST_USAGE = usage() if callable(usage) else usage
+
+
+def last_usage() -> Any:
+    return _LAST_USAGE
+
+
+def clear_usage() -> None:
+    global _LAST_USAGE
+    _LAST_USAGE = None
+
+
 _SYSTEM_PROMPT = """\
 You are a senior data engineer. Read the user's requirements (a BRD document or
 plain sentences) and produce a LogicalPlan: WHAT data exists, HOW it must be
@@ -35,9 +53,47 @@ Rules:
   Use the EXACT file names / URLs / table names the requirements give.
 - transforms: one entry per entity that needs cleaning. Express EVERYTHING as
   structured ops from the closed vocabulary — casts (target types), cleaning
-  ops (trim/upper/lower/replace/...), filters (not_null/eq/gt/...), dedup_keys.
-  There is NO free-text expression field. If logic cannot be expressed with the
-  vocabulary, put one plain-English line in `unsupported` instead.
+  ops (trim/upper/lower/proper/replace/...), filters (not_null/eq/gt/...),
+  dedup_keys. There is NO free-text expression field. If logic cannot be
+  expressed with the vocabulary, put one plain-English line in `unsupported`
+  instead.
+- TYPES FIRST: source files are raw text — every column used in arithmetic,
+  a numeric/temporal filter, an aggregation (sum/avg), or a date-part op MUST
+  appear in that entity's `casts` with its target type. Casts run before
+  cleaning ops, so establish the type, then transform (never the reverse).
+- PROPER CASE: op `proper` capitalizes a column (first letter upper, rest
+  lower) — fully supported, do NOT mark it unsupported.
+- NULL / DEFAULT FILL: use op `coalesce` for "replace null/missing/blank with
+  default". Do NOT use `replace` for this. `replace` is only for string
+  find/replace and must have two string args: old value, new value.
+- ARITHMETIC: derived measures use ops `add`/`subtract`/`multiply`/`divide`.
+  `column` is the FIRST operand; `args` are the remaining operands — each may
+  be another column name or a number. Chain steps via new_column. Example
+  "line_total = quantity * list_price * (1 - discount)":
+  cleaning/derived = [
+    {op: subtract, column: "1", args: [discount], new_column: one_minus_discount},
+    {op: multiply, column: quantity, args: [list_price, one_minus_discount],
+     new_column: line_total}].
+  Fully supported — do NOT mark arithmetic derived columns as unsupported.
+- CONDITIONAL VALUES: op `case` computes a column from ordered WHEN branches
+  tested against `column` (first match wins) plus `otherwise` (the default).
+  Each branch is {op: lt|le|gt|ge|eq|ne, value, then}; `then`/`otherwise` are
+  each a column name or a literal (quote string literals: "'Gold'"). Clamp
+  negative stock to 0: {op: case, column: quantity,
+  when: [{op: lt, value: "0", then: "0"}], otherwise: quantity,
+  new_column: quantity_clamped}. Multi-way buckets (price_band, customer
+  segment tiers) chain more `when` branches, most-specific first — e.g.
+  segment by revenue: when: [{op: ge, value: "10000", then: "'Platinum'"},
+  {op: ge, value: "5000", then: "'Gold'"}], otherwise: "'Bronze'". Put a
+  `case` derived column in an output's `derived` list to compute it from raw
+  source columns, or in `post_agg_derived` to compute it from an aggregation's
+  result (e.g. segment by SUMMED revenue: column = the aggregation's `name`).
+  Fully supported — do NOT mark conditional/case/if-else logic as unsupported.
+- SOURCE VALIDATION: when the requirements say to verify a source file exists /
+  is non-empty before ingesting (Get Metadata / Validation gates), set
+  `validate_first: true` on that source. The pipeline then waits for the file,
+  and a missing/empty file fails the gate and blocks that entity's copy and
+  everything downstream. Fully supported — do NOT mark it unsupported.
 - outputs: one entry per business output the requirements ask for. Joins list
   the key columns on both sides. Aggregations use sum/avg/min/max/count/
   count_distinct/first. "top N" = sort + top_n. Do NOT invent outputs the
@@ -61,10 +117,28 @@ Rules:
   not leave one out. If the BRD does NOT specify any pipeline structure, leave
   `pipelines` empty and one pipeline will be built. Never invent a structure the
   BRD didn't ask for.
-- schedule: only when the requirements state or clearly imply one.
-- unsupported: every requirement you recognized but cannot express (validation
-  gates, alerting, archive/delete steps, SCD2, incremental merge, ForEach
-  patterns). One short line each. NEVER silently drop a requirement.
+- schedule: only when the requirements state or clearly imply a recurring
+  cadence (daily, hourly, every Monday...). "Manual trigger" / "run on demand" /
+  "triggered manually" is NOT a schedule — leave `schedule` unset for it. This
+  is fully supported and is the DEFAULT (a pipeline with no schedule already
+  runs on demand from the ADF UI/API) — never mark manual/on-demand triggering
+  as unsupported; no plan entry is needed at all.
+- BUILT-IN (never mark these unsupported; no plan entry needed):
+  * manual / on-demand trigger — leaving `schedule` unset IS the manual
+    trigger; nothing else to build.
+  * stage ordering / failure handling — "Silver runs only after Bronze
+    succeeds", "a failed activity fails the master": the compiler chains every
+    activity and pipeline with Succeeded dependency conditions automatically.
+  * dataset/pipeline parameterization, naming conventions, linked services —
+    ADF implementation details the compiler owns. If the BRD asks for them,
+    record one line in `assumptions` (e.g. "datasets use compiler naming
+    convention instead of runtime parameters").
+- unsupported: every requirement you recognized but cannot express (alerting,
+  archive/delete steps, SCD2, incremental merge, ForEach patterns). One short
+  line each. NEVER silently drop a requirement.
+- suggestions: for each unsupported item, one line proposing the closest
+  SUPPORTED alternative (e.g. "SCD2 not supported -> keep latest row via
+  dedup_keys instead?"). The user can accept it in chat.
 - assumptions: every decision you made that the requirements left open
   (dedup keys chosen, date formats, join types). Short lines.
 - clarifications: AT MOST 2, ONLY when a core fact is missing (e.g. no source
@@ -74,13 +148,54 @@ Rules:
 """
 
 
+def _system_prompt() -> str:
+    from agent.skills import load_skills
+
+    skills = load_skills()
+    return f"{_SYSTEM_PROMPT}\n\n{skills}" if skills else _SYSTEM_PROMPT
+
+
+def capability_card() -> str:
+    """One-paragraph statement of what the system CAN build, generated from the
+    LIVE op vocabulary — used by the unsupported-triage loop so the feedback
+    prompt never drifts from the code."""
+    from models.spec import _OP_ARITH, _OP_FN
+
+    ops = sorted(set(_OP_FN) | set(_OP_ARITH) | {"proper"})
+    return (
+        "COLUMN OPS (cleaning/derived): " + ", ".join(ops) + ", case. Arithmetic ops "
+        "(add/subtract/multiply/divide) take the first operand in `column` and the "
+        "rest in `args` (column names or numbers), chained through new_column. `case` "
+        "computes a conditional value from ordered `when` branches (lt/le/gt/ge/eq/ne "
+        "vs `column`, first match wins) plus `otherwise` — covers if/else, clamping, "
+        "and multi-way buckets (price bands, customer segments); NOT unsupported.\n"
+        "FILTERS: not_null/null/eq/ne/gt/ge/lt/le (AND-ed). CASTS: target types. "
+        "DEDUP: dedup_keys.\n"
+        "OUTPUTS: joins (inner/left/right/full), aggregations (sum/avg/min/max/"
+        "count/count_distinct/first), group_by (date parts via derived year/month/"
+        "dayofmonth/... columns), sort, top_n, column projection, delta/csv/parquet. "
+        "post_agg_derived: `case`/derived columns computed from an aggregation's "
+        "output (e.g. segment tiers bucketed by a SUMMED revenue column).\n"
+        "SOURCE VALIDATION: validate_first=true on a source — the file must exist "
+        "and be non-empty or that entity's copy and everything downstream is blocked.\n"
+        "BUILT-IN AUTOMATICALLY (never unsupported): manual/on-demand trigger "
+        "(leave `schedule` unset — that IS the manual trigger, nothing else to "
+        "build), medallion stage ordering, Succeeded dependency conditions, "
+        "failure propagation to the master pipeline, schedules, BRD-named "
+        "pipeline organisation.\n"
+        "COMPILER-OWNED IMPLEMENTATION DETAILS (record as assumptions, not "
+        "unsupported): resource naming, dataset/pipeline parameterization, linked "
+        "services, containers."
+    )
+
+
 def build_extractor_agent():
     from pydantic_ai import Agent
 
     return Agent(
         get_model(),
         output_type=structured_output(LogicalPlan),
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=_system_prompt(),
         retries=4,
         model_settings=default_model_settings(),
     )
@@ -93,6 +208,7 @@ async def extract_plan(
     :func:`refine_plan` so the follow-up chat continues the same conversation."""
     agent = build_extractor_agent()
     result = await agent.run(brd_text, message_history=message_history)
+    _capture_usage(result)
     return result.output, result.all_messages()
 
 
@@ -103,10 +219,13 @@ async def refine_plan(
     validation problem, returning the updated ``(plan, message_history)``."""
     agent = build_extractor_agent()
     result = await agent.run(instruction, message_history=message_history)
+    _capture_usage(result)
     return result.output, result.all_messages()
 
 
 def extract_plan_sync(brd_text: str) -> LogicalPlan:
     """Blocking variant for scripts / threads with no running event loop."""
     agent = build_extractor_agent()
-    return agent.run_sync(brd_text).output
+    result = agent.run_sync(brd_text)
+    _capture_usage(result)
+    return result.output

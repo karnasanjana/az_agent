@@ -21,11 +21,14 @@ _STEP_RE = re.compile(r"^([\w, ]+?)\s+(\w+)\(", re.MULTILINE)
 # 'decimal(' (false positive observed on the bike-store BRD).
 _KNOWN_STEPS = {
     "source", "sink", "derive", "filter", "select", "window", "sort",
-    "aggregate", "join", "limit", "union", "exists", "alterRow", "keyGenerate",
+    "aggregate", "join", "rank", "union", "exists", "alterRow", "keyGenerate",
     "pivot", "unpivot", "lookup", "flatten", "surrogateKey", "cast",
 }
 _OUT_RE = re.compile(r"~>\s*(\w+)\s*$", re.MULTILINE)
-_EMPTY_BODY_RE = re.compile(r"\b(derive|filter|select|window|sort|limit)\(\s*\)")
+_EMPTY_BODY_RE = re.compile(r"\b(derive|filter|select|window|sort|rank)\(\s*\)")
+# ADF has no limit() transform — DF-FLO-005 "Transformation 'limit' not
+# registered" (run: flow_gold_top_customers). Top-N = rank(...) + filter.
+_LIMIT_RE = re.compile(r"\blimit\(")
 _EMPTY_GROUPBY_RE = re.compile(r"\bgroupBy\(\s*[),]")
 # aggregate(groupBy(x),   <nothing but whitespace>  ) — empty aggregate section.
 _EMPTY_AGGS_RE = re.compile(r"\baggregate\((?:groupBy\([^)]*\))?\s*,?\s*\)")
@@ -67,6 +70,12 @@ def lint_dataflow_script(name: str, script: str) -> List[str]:
         problems.append(f"{name}: empty groupBy()")
     if _EMPTY_AGGS_RE.search(bare):
         problems.append(f"{name}: aggregate() with no aggregate columns")
+    if _LIMIT_RE.search(bare):
+        problems.append(
+            f"{name}: 'limit(' is not an ADF transform (DF-FLO-005 'limit' not "
+            "registered) - keep top N with rank(desc(<sort col>), "
+            "output(__rowRank as long), dense: false) then filter(__rowRank <= N)"
+        )
 
     # 3. Stream graph: every input stream must be defined before use; >=1 sink.
     defined = set()

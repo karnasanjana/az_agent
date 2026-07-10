@@ -59,3 +59,11 @@ def test_copy_error_targets_owning_pipeline(tmp_path):
     inventory = {"pl_ingest_orders": "pipelines"}
     err = "Operation on target copy_orders failed: some copy error"
     assert _pick_target(err, inventory, run_dir) == ("pl_ingest_orders", "pipelines")
+
+
+def test_unidentified_error_does_not_guess_dataflow(tmp_path):
+    run_dir = str(tmp_path)
+    _write(run_dir, "dataflows", "df_good_flow", {"type": "MappingDataFlow"})
+    inventory = {"df_good_flow": "dataflows"}
+    err = "DFExecutorUserError without artifact or activity name"
+    assert _pick_target(err, inventory, run_dir) is None

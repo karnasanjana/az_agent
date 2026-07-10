@@ -19,7 +19,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from models.spec import _OP_FN, _OP_IDENTITY, _norm_op
+from models.spec import _OP_ARITH, _OP_FN, _OP_IDENTITY, _OP_PROPER, _norm_op
 
 
 def _snake(v: str, *, field: str) -> str:
@@ -68,6 +68,11 @@ class LogicalSource(BaseModel):
     schema_name: Optional[str] = None
     table_name: Optional[str] = None
     columns: List[LogicalColumn] = Field(default_factory=list)  # optional; grounding overrides
+    # BRD asks "verify the source file exists / is non-empty before copying":
+    # the compiler emits a Validation activity gating the bronze copy — it waits
+    # for the file to exist AND have >= 1 byte; on timeout it fails, which blocks
+    # the copy and everything downstream of it. Storage sources only.
+    validate_first: bool = False
 
     @field_validator("entity")
     @classmethod
@@ -91,23 +96,96 @@ class LogicalSource(BaseModel):
         return self
 
 
-class CleaningOp(BaseModel):
-    """One column operation. `op` MUST be in the closed vocabulary."""
+_CASE_CMP_OPS = {"lt", "le", "gt", "ge", "eq", "ne"}
 
-    op: str  # any key of _OP_FN, or identity
-    column: str  # input column
-    args: List[str] = Field(default_factory=list)  # literals (formats etc.)
+
+class CaseBranch(BaseModel):
+    """One WHEN clause of a `case` cleaning op: test `column <op> value`, and
+    if it matches, output `then` (a column name or a literal)."""
+
+    op: str  # lt | le | gt | ge | eq | ne
+    value: str  # threshold compared against the CleaningOp's `column`
+    then: str  # output when this branch matches: a column name or a literal
+
+    @field_validator("op")
+    @classmethod
+    def _known(cls, v: str) -> str:
+        if _norm_op(v) not in _CASE_CMP_OPS:
+            raise ValueError(
+                f"unknown case branch op '{v}'. Allowed: "
+                f"{', '.join(sorted(_CASE_CMP_OPS))}"
+            )
+        return v
+
+
+class CleaningOp(BaseModel):
+    """One column operation. `op` MUST be in the closed vocabulary.
+
+    Arithmetic ops (add/subtract/multiply/divide): `column` is the FIRST operand
+    and `args` are the remaining operands — each may be another column name or a
+    numeric literal. Chain steps through `new_column`, e.g.
+    line_total = quantity * list_price * (1 - discount):
+      {op: subtract, column: "1", args: [discount], new_column: one_minus_discount}
+      {op: multiply, column: quantity, args: [list_price, one_minus_discount],
+       new_column: line_total}
+
+    Conditional values (op `case`): ordered `when` branches tested against
+    `column`, first match wins; `otherwise` is the default. `then`/`otherwise`
+    are each a column name or a literal. Clamp negatives to zero:
+      {op: case, column: quantity, when: [{op: lt, value: "0", then: "0"}],
+       otherwise: quantity, new_column: quantity_clamped}
+    Multi-way buckets (price_band, customer segment) chain more `when`
+    branches — order tightest/most-specific conditions first:
+      {op: case, column: revenue,
+       when: [{op: ge, value: "10000", then: "'Platinum'"},
+              {op: ge, value: "5000", then: "'Gold'"}],
+       otherwise: "'Bronze'", new_column: segment}
+    """
+
+    op: str  # any key of _OP_FN / _OP_ARITH / _OP_PROPER / _OP_IDENTITY, or 'case'
+    column: str  # input column (first operand for arithmetic ops; test column for case)
+    args: List[str] = Field(default_factory=list)  # literals / arithmetic operands
     new_column: Optional[str] = None  # output name; None = replace column in place
+    # case-only:
+    when: List[CaseBranch] = Field(default_factory=list)
+    otherwise: Optional[str] = None
 
     @field_validator("op")
     @classmethod
     def _known(cls, v: str) -> str:
         key = _norm_op(v)
-        if key not in _OP_FN and key not in _OP_IDENTITY:
+        if key == "case":
+            return v
+        if (
+            key not in _OP_FN
+            and key not in _OP_IDENTITY
+            and key not in _OP_ARITH
+            and key not in _OP_PROPER
+        ):
             raise ValueError(
-                f"unknown op '{v}'. Allowed: {', '.join(sorted(_OP_FN))}, identity"
+                f"unknown op '{v}'. Allowed: "
+                f"{', '.join(sorted(set(_OP_FN) | set(_OP_ARITH) | {'proper'}))}, "
+                "identity, case"
             )
         return v
+
+    @model_validator(mode="after")
+    def _case_shape(self) -> "CleaningOp":
+        """`when`/`otherwise` are case-only fields — a hard error either way
+        keeps the two forms from being silently mixed up (a non-case op with a
+        stray `when` would otherwise just ignore it and confuse the author)."""
+        is_case = _norm_op(self.op) == "case"
+        if is_case and (not self.when or self.otherwise is None):
+            raise ValueError(
+                f"case op on '{self.column}': set at least one 'when' branch "
+                "and 'otherwise' (the default value)"
+            )
+        if not is_case and (self.when or self.otherwise is not None):
+            raise ValueError(
+                f"'{self.op}' on '{self.column}': 'when'/'otherwise' are "
+                "case-only — use op 'case' for conditional values"
+            )
+        return self
 
 
 _FILTER_OPS = {
@@ -127,6 +205,21 @@ class FilterRule(BaseModel):
         if _norm_op(v) not in _FILTER_OPS:
             raise ValueError(f"unknown filter op '{v}'")
         return v
+
+    @model_validator(mode="after")
+    def _cmp_needs_value(self) -> "FilterRule":
+        """A comparison filter without a value is unrenderable — downstream it
+        would silently become an EMPTY filter() and fail in Azure as EXE-0001
+        'Dataflow cannot be analyzed as a graph'. Fail at extraction instead,
+        where Pydantic AI feeds the error back and the model retries."""
+        if _norm_op(self.op) in {"eq", "ne", "gt", "ge", "lt", "le"} and (
+            self.value is None or not str(self.value).strip()
+        ):
+            raise ValueError(
+                f"filter op '{self.op}' on column '{self.column}' requires a "
+                "value to compare against"
+            )
+        return self
 
 
 class EntityTransform(BaseModel):
@@ -187,6 +280,11 @@ class OutputPlan(BaseModel):
     group_by: List[str] = Field(default_factory=list)
     aggregations: List[AggregationPlan] = Field(default_factory=list)
     filters: List[FilterRule] = Field(default_factory=list)  # applied BEFORE aggregation
+    # Computed AFTER aggregation, from aggregation/group_by output columns —
+    # e.g. a customer `segment` bucketed by summed Revenue (op case, column =
+    # an aggregation's `name`). Use `derived` instead for anything computed
+    # from raw (pre-aggregation) source columns.
+    post_agg_derived: List[CleaningOp] = Field(default_factory=list)
     sort: List[SortPlan] = Field(default_factory=list)
     top_n: Optional[int] = None
     columns: List[str] = Field(default_factory=list)  # final projection; [] = all
@@ -242,6 +340,9 @@ class LogicalPlan(BaseModel):
     unsupported: List[str] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
     clarifications: List[str] = Field(default_factory=list)
+    # For each unsupported item the triage loop keeps, one proposed CLOSEST
+    # SUPPORTED alternative the user can accept via chat (advisory only).
+    suggestions: List[str] = Field(default_factory=list)
 
     @field_validator("project")
     @classmethod

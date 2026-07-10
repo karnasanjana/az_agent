@@ -46,7 +46,7 @@ INDEX_HTML = r"""<!doctype html>
         font-family:ui-monospace,Consolas,monospace; font-size:12px; margin:6px 0; }
   .check { display:flex; gap:8px; align-items:flex-start; padding:3px 0; }
   .dot { width:9px; height:9px; border-radius:50%; margin-top:6px; flex:0 0 auto; }
-  .dot.ok { background:var(--ok);} .dot.bad{ background:var(--bad);}
+  .dot.ok { background:var(--ok);} .dot.bad{ background:var(--bad);} .dot.warn{ background:var(--warn);}
   .muted { color:var(--mut); }
   /* graph */
   .graph { display:flex; align-items:center; gap:0; flex-wrap:wrap; }
@@ -176,9 +176,17 @@ INDEX_HTML = r"""<!doctype html>
 const $ = (s)=>document.querySelector(s);
 let RUN = null, REVIEW = null, GRAPH = null, POLL = null, UPLOAD = null;
 
+function authHeaders(){ const t = sessionStorage.getItem('api_token'); return t ? {'x-api-token': t} : {}; }
 async function jget(u){ const r = await fetch(u); if(!r.ok) throw new Error((await r.json()).detail||r.status); return r.json(); }
-async function jpost(u, body){ const r = await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok) throw new Error((await r.json()).detail||r.status); return r.json(); }
+async function jpost(u, body){
+  let r = await fetch(u,{method:'POST',headers:{'content-type':'application/json',...authHeaders()},body:JSON.stringify(body)});
+  if(r.status===401){
+    const t = prompt('This server requires an API token (API_TOKEN):');
+    if(t){ sessionStorage.setItem('api_token', t);
+      r = await fetch(u,{method:'POST',headers:{'content-type':'application/json',...authHeaders()},body:JSON.stringify(body)}); }
+  }
+  if(!r.ok){ const d=(await r.json()).detail; throw new Error(typeof d==='string'?d:JSON.stringify(d)||r.status); }
+  return r.json(); }
 
 (async()=>{ try{ const h=await jget('/health');
   const t=$('#modeTag'); if(h.mock){t.textContent='MOCK tenant (no Azure writes)';t.className='tag mock';}
@@ -251,7 +259,12 @@ $('#genBtn').onclick = async ()=>{
   try{
     const fd = new FormData();
     if(UPLOAD){ fd.append('file', UPLOAD); } else { fd.append('brd', brd); }
-    const r = await fetch('/plan',{method:'POST',body:fd});
+    let r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd});
+    if(r.status===401){
+      const t = prompt('This server requires an API token (API_TOKEN):');
+      if(t){ sessionStorage.setItem('api_token', t);
+        r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd}); }
+    }
     const data = await r.json();
     if(!r.ok){ throw new Error(data.detail||'plan failed'); }
     RUN = data.run_id; $('#runTag').textContent = 'run '+RUN;
@@ -295,6 +308,9 @@ function mdToHtml(md){
     if(/^# /.test(line))  return '<h2 style="border:0;margin:.3em 0">'+esc(line.slice(2))+'</h2>';
     let t = esc(line).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`(.+?)`/g,'<code>$1</code>');
     if(/^- /.test(line)) return '<div style="margin-left:1em">&bull; '+t.slice(2)+'</div>';
+    const num = line.match(/^\s+(\d+)\. (.*)$/);
+    if(num) return '<div style="margin-left:2.4em">'+num[1]+'. '+
+      esc(num[2]).replace(/`(.+?)`/g,'<code>$1</code>')+'</div>';
     return line.trim()===''? '<div style="height:.4em"></div>' : '<div>'+t+'</div>';
   }).join('');
 }
@@ -303,10 +319,14 @@ function renderPlan(data){
     $('#planReadable').innerHTML = mdToHtml(data.plan_markdown);
     $('#planReadable').className = 'card';
   }
-  const A = data.assumptions||[], S = data.suggestions||[];
+  const A = data.assumptions||[], S = data.suggestions||[], C = data.plan_changes||[];
   let html='';
-  if(A.length) html += '<h2>Assumptions I made (change any via chat)</h2><div class="card">'+
-    A.map(a=>'<div class="check"><span class="dot ok"></span><div>'+esc(a)+'</div></div>').join('')+'</div>';
+  if(C.length) html += '<h2>What changed since you last reviewed (verify before approving)</h2>'+
+    '<div class="card" style="border-left:3px solid #e5a50a">'+
+    C.map(c=>'<div class="check"><span class="dot warn"></span><div>'+esc(c)+'</div></div>').join('')+'</div>';
+  if(A.length) html += '<details style="margin:8px 0"><summary class="muted" style="cursor:pointer">'+
+    A.length+' assumption(s) made — expand to review, change any via chat</summary><div class="card">'+
+    A.map(a=>'<div class="check"><span class="dot ok"></span><div>'+esc(a)+'</div></div>').join('')+'</div></details>';
   if(S.length) html += '<h2>Optional suggestions</h2><div class="card">'+
     S.map(s=>'<div class="check"><span class="dot"></span><div>'+esc(s)+'</div></div>').join('')+'</div>';
   $('#planNotes').innerHTML = html;
@@ -434,11 +454,27 @@ function renderGate(data){
 
 $('#rejectBtn').onclick = ()=>{ reset(); $('#runTag').textContent=''; RUN=null; };
 
+async function approveRun(ack){
+  const r = await fetch('/approve',{method:'POST',
+    headers:{'content-type':'application/json',...authHeaders()},
+    body:JSON.stringify({run_id:RUN, acknowledge_unsupported:!!ack})});
+  const data = await r.json();
+  if(r.status===409 && data.detail && data.detail.unsupported){
+    const msg = 'These BRD requirements were NOT built:\n\n- '
+      + data.detail.unsupported.join('\n- ')
+      + '\n\nDeploy the pipeline WITHOUT them?';
+    if(confirm(msg)) return approveRun(true);
+    throw new Error('cancelled — unbuilt requirements not acknowledged');
+  }
+  if(!r.ok){ const d=data.detail; throw new Error(typeof d==='string'?d:JSON.stringify(d)||r.status); }
+  return data;
+}
+
 $('#approveBtn').onclick = async ()=>{
   if(!RUN) return;
   $('#approveBtn').disabled=true;
   try{
-    await jpost('/approve',{run_id:RUN});
+    await approveRun(false);
     $('#liveBox').style.display='block';
     $('#stopBtn').style.display=''; $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run';
     POLL = setInterval(poll, 1500); poll();
@@ -471,6 +507,11 @@ function renderDeployReport(s){
     html += '<div style="margin-top:6px">'+rows+'</div>';
     if(dr.pruned && dr.pruned.length){
       html += '<div class="pill">removed '+dr.pruned.length+' stale object(s) from earlier runs</div>';
+    }
+    if(dr.stale && dr.stale.length){
+      html += '<div class="pill" title="'+esc(dr.stale.join(', '))+'">'+dr.stale.length+
+        ' stale object(s) from earlier runs left in the factory — the agent never deletes; '+
+        'remove them yourself or set PRUNE_STALE=true</div>';
     }
     if(dr.prune_error){
       html += '<div class="warn">Cleanup of old objects failed — stale objects may remain in the factory: '+

@@ -222,16 +222,22 @@ def _gemini_model():
 
     Set:
         LLM_PROVIDER=gemini
-        LLM_MODEL=gemini-2.5-flash        # or any Gemini model id
+        LLM_MODEL=gemini-3.5-flash        # or any Gemini model id
         GEMINI_API_KEY=<key from https://aistudio.google.com/apikey>
 
     GOOGLE_API_KEY is accepted as a fallback name. Structured output defaults to
     prompted JSON (see structured_output); override with LLM_OUTPUT_MODE=native
-    to use Gemini's response-schema mode."""
+    to use Gemini's response-schema mode.
+
+    The unset-LLM_MODEL default is the `gemini-flash-latest` ALIAS, not a pinned
+    id: Google retires pinned models (gemini-2.5-flash started 404ing
+    'no longer available' on 2026-07-09 and bricked the plan/heal loops) and the
+    alias always tracks a live one. Pin an explicit id in .env when eval
+    stability matters more than availability."""
     from pydantic_ai.models.google import GoogleModel
     from pydantic_ai.providers.google import GoogleProvider
 
-    model_id = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+    model_id = os.environ.get("LLM_MODEL", "gemini-flash-latest")
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -257,14 +263,14 @@ def get_model():
     """Build a Pydantic AI model for the configured provider — the SINGLE place the
     project is coupled to an LLM. Swap providers with env vars, no code change:
 
-        LLM_PROVIDER=anthropic|openai|gemini   (default: anthropic)
+        LLM_PROVIDER=anthropic|openai|gemini   (default: gemini)
         LLM_MODEL=<provider model id>          (provider default if unset)
 
     Because every agent uses ``output_type=<Pydantic model>`` (structured output),
     any provider with tool/JSON mode drops in. Keys/endpoints come from the
     environment, never hardcoded.
     """
-    provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
+    provider = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
     builder = _MODEL_BUILDERS.get(provider)
     if builder is None:
         raise RuntimeError(
@@ -279,7 +285,11 @@ def get_claude_model():
     return get_model()
 
 
-_REASONING_HINTS = ("gpt-5", "o1", "o3", "o4", "reasoning", "gemini-2.5", "gemini-3")
+_REASONING_HINTS = (
+    "gpt-5", "o1", "o3", "o4", "reasoning", "gemini-2.5", "gemini-3",
+    # Gemini 'latest' aliases resolve to 2.5+ models, all thinking-by-default.
+    "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest",
+)
 
 
 def is_reasoning_model() -> bool:
@@ -317,7 +327,7 @@ def structured_output(model_cls):
     """
     mode = os.environ.get("LLM_OUTPUT_MODE", "").strip().lower()
     if not mode:
-        provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
+        provider = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
         mode = "tool" if provider in {"anthropic", "claude", "foundry"} else "prompted"
     if mode == "prompted":
         from pydantic_ai import PromptedOutput

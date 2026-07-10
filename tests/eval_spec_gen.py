@@ -12,8 +12,13 @@ then builds and pre-flights each spec offline (no Azure writes), and reports:
            as {op,...} instead of a raw DSL string (higher = less model risk)
 
 Usage:
-    python tests/eval_spec_gen.py [runs-per-brd]        # default 3
-    LLM_MODEL=gemini-2.5-flash python tests/eval_spec_gen.py 5
+    python tests/eval_spec_gen.py [runs-per-brd]              # legacy path, default 3
+    python tests/eval_spec_gen.py --logical [runs-per-brd]    # LogicalPlan path
+    python tests/eval_spec_gen.py --logical 3 --mode tools    # tool-agent extractor
+
+--mode oneshot (default) measures the single-call extractor; --mode tools
+measures the tool-agent path (agent/plantools.py) on the SAME stages, so the
+two PLAN_MODE strategies get compared with one number each.
 
 Artifacts go under a temp directory and are deleted afterwards.
 """
@@ -25,6 +30,7 @@ import shutil
 import sys
 import tempfile
 import time
+from typing import Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -52,6 +58,42 @@ No transformations - just land the file as population.csv.
 
 BRDS = {"retail-medallion": RETAIL_BRD, "covid-medallion": COVID_BRD, "copy-only": COPY_ONLY_BRD}
 
+STAGES = ("extract", "check", "build", "preflight", "lint")
+
+
+def _stage_line(
+    rows: List[Dict[str, str]],
+    brd: str,
+    run: int,
+    stage: str,
+    passed: bool,
+    reason: str = "",
+) -> None:
+    rows.append({
+        "brd": brd,
+        "run": str(run),
+        "stage": stage,
+        "status": "PASS" if passed else "FAIL",
+        "reason": reason,
+    })
+
+
+def _print_stage_table(rows: List[Dict[str, str]]) -> None:
+    print("\nStage failure table")
+    print(f"{'brd':<18} {'run':>3}  {'stage':<10} {'status':<5}  reason")
+    for r in rows:
+        print(
+            f"{r['brd']:<18} {r['run']:>3}  {r['stage']:<10} "
+            f"{r['status']:<5}  {r['reason']}"
+        )
+
+
+def _preflight_reason(pf: dict) -> str:
+    fails = [c for c in pf.get("checks", []) if not c.get("passed")]
+    if not fails:
+        return ""
+    return "; ".join(f"{c['name']}: {c.get('detail', '')}" for c in fails[:3])
+
 
 def _ops_adoption(spec) -> str:
     """percentage of transform columns expressed as structured ops."""
@@ -75,7 +117,7 @@ def main() -> int:
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     root = tempfile.mkdtemp(prefix="adf_eval_")
     model = os.environ.get("LLM_MODEL", "<provider default>")
-    provider = os.environ.get("LLM_PROVIDER", "openai")
+    provider = os.environ.get("LLM_PROVIDER", "gemini")  # mirror config.get_model()
     print(f"model={model} provider={provider} runs/brd={runs} artifacts={root}\n")
     print(f"{'brd':<18} {'run':>3}  {'parse':<5} {'build':<5} {'preflight':<9} "
           f"{'ops%':>4}  {'sec':>5}  notes")
@@ -134,27 +176,58 @@ def _raw_expression_count(spec) -> int:
     return n
 
 
+def _parse_logical_args() -> "tuple[int, str]":
+    """(runs, mode) from argv after '--logical'. mode: oneshot (default) | tools."""
+    args = sys.argv[2:]
+    runs, mode = 3, "oneshot"
+    i = 0
+    while i < len(args):
+        if args[i] == "--mode" and i + 1 < len(args):
+            mode = args[i + 1].strip().lower()
+            i += 2
+        elif args[i].isdigit():
+            runs = int(args[i])
+            i += 1
+        else:
+            i += 1
+    if mode not in {"oneshot", "tools"}:
+        raise SystemExit(f"--mode must be oneshot or tools, got '{mode}'")
+    return runs, mode
+
+
 def main_logical() -> int:
     """Logical-path eval: BRD -> extract_plan -> completeness -> compile ->
     build -> preflight -> lint. The gate for the LogicalPlan refactor."""
-    runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    runs, mode = _parse_logical_args()
     root = tempfile.mkdtemp(prefix="adf_eval_logical_")
     model = os.environ.get("LLM_MODEL", "<provider default>")
-    print(f"[LOGICAL] model={model} runs/brd={runs} artifacts={root}\n")
+    print(f"[LOGICAL] model={model} mode={mode} runs/brd={runs} artifacts={root}\n")
     print(f"{'brd':<18} {'run':>3}  {'extract':<7} {'check':<6} {'build':<5} "
           f"{'preflt':<6} {'lint':<5} {'raw':>3}  {'sec':>5}  notes")
 
     try:
         from agent.completeness import check
         from agent.compiler import compile_plan
-        from agent.extractor import extract_plan_sync
+        from agent.grounding import ground_logical_plan
         from agent.lint import lint_dataflow_script
         from agent.review import load_script
+
+        if mode == "tools":
+            import asyncio
+
+            from agent.plantools import extract_plan as _tools_extract
+
+            def extract(brd_text):
+                plan, _ = asyncio.run(_tools_extract(brd_text))
+                return plan
+        else:
+            from agent.extractor import extract_plan_sync as extract
     except Exception as exc:  # noqa: BLE001
         print(f"cannot import logical pipeline: {exc}")
         return 2
 
     passed = total = 0
+    stage_rows: List[Dict[str, str]] = []
     for brd_name, brd in BRDS.items():
         for i in range(1, runs + 1):
             total += 1
@@ -164,8 +237,9 @@ def main_logical() -> int:
             ex_ok = chk_ok = build_ok = pf_ok = lint_ok = False
             raw = "-"
             try:
-                plan = extract_plan_sync(brd)
+                plan = extract(brd)
                 ex_ok = True
+                ground_logical_plan(plan)
                 problems = check(plan)
                 chk_ok = not problems
                 if not chk_ok:
@@ -178,8 +252,7 @@ def main_logical() -> int:
                     pf = preflight.validate(run_id, root=root)
                     pf_ok = bool(pf.get("passed"))
                     if not pf_ok:
-                        fails = [c["name"] for c in pf.get("checks", []) if not c.get("passed")]
-                        note = f"preflight: {', '.join(fails[:3])}"
+                        note = f"preflight: {_preflight_reason(pf)}"
                     lint_problems = []
                     for df in spec.dataflows:
                         lint_problems += lint_dataflow_script(
@@ -197,9 +270,27 @@ def main_logical() -> int:
             print(f"{brd_name:<18} {i:>3}  {mark(ex_ok):<7} {mark(chk_ok):<6} "
                   f"{mark(build_ok):<5} {mark(pf_ok):<6} {mark(lint_ok):<5} {raw:>3}  "
                   f"{secs:>5.1f}  {note}")
+            _stage_line(stage_rows, brd_name, i, "extract", ex_ok, "" if ex_ok else note)
+            _stage_line(
+                stage_rows, brd_name, i, "check", chk_ok,
+                "" if chk_ok else (note if note.startswith("check:") else "not reached" if not ex_ok else note),
+            )
+            _stage_line(
+                stage_rows, brd_name, i, "build", build_ok,
+                "" if build_ok else ("not reached" if not chk_ok else note),
+            )
+            _stage_line(
+                stage_rows, brd_name, i, "preflight", pf_ok,
+                "" if pf_ok else ("not reached" if not build_ok else note),
+            )
+            _stage_line(
+                stage_rows, brd_name, i, "lint", lint_ok,
+                "" if lint_ok else ("not reached" if not build_ok else note),
+            )
 
     rate = 100 * passed // max(total, 1)
     print(f"\n[LOGICAL] pass rate: {passed}/{total} ({rate}%)  gate: >=95%")
+    _print_stage_table(stage_rows)
     shutil.rmtree(root, ignore_errors=True)
     return 0 if rate >= 95 else 1
 

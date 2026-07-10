@@ -22,6 +22,7 @@ from agent.builder import DEPLOY_ORDER
 from config import MOCK_TENANT_DIR, AzureConfig, mock_mode
 
 _RESOURCE_CALL = {
+    "integrationRuntimes": "integration_runtimes",
     "linkedServices": "linked_services",
     "datasets": "datasets",
     "dataflows": "data_flows",
@@ -31,11 +32,33 @@ _RESOURCE_CALL = {
 
 
 def _prune_enabled() -> bool:
-    """Whether to delete factory objects not in the current run. On by default so the
-    factory CONVERGES to exactly this run's objects — without it, ADF's additive
-    create_or_update leaves every object from every prior run behind (stale names from
-    non-deterministic LLM output pile up: 16 -> 32 -> 48). Opt out with PRUNE_STALE=false."""
-    return os.environ.get("PRUNE_STALE", "true").strip().lower() not in {"false", "0", "no"}
+    """Whether to delete AGENT-CREATED factory objects not in the current run.
+
+    OFF by default: the agent never deletes Azure objects on its own — only the
+    user does, deliberately, by setting PRUNE_STALE=true. When off, the deploy
+    still REPORTS the stale agent-created objects a prune would remove (see
+    last_stale / the UI pill) so the user can clean up themselves. Scope guard
+    when enabled: only objects matching this agent's naming convention (see
+    _prunable) are ever deleted — a shared factory's unrelated objects are
+    never touched."""
+    return os.environ.get("PRUNE_STALE", "false").strip().lower() in {"true", "1", "yes", "on"}
+
+
+# Every object the agent creates carries one of these category prefixes (compiler
+# naming formulas + spec.py _PREFIXES). Prune ONLY considers matching names, so
+# manually created / unrelated objects in a shared factory are never deleted.
+_AGENT_PREFIXES = {
+    "integrationRuntimes": "ir-",  # IR names reject underscores (InvalidName)
+    "linkedServices": "ls_",
+    "datasets": "ds_",
+    "dataflows": "df_",
+    "pipelines": "pl_",
+    "triggers": "tr_",
+}
+
+
+def _prunable(category: str, name: str) -> bool:
+    return name.startswith(_AGENT_PREFIXES.get(category, "\x00"))
 
 
 # --------------------------------------------------------------------------- #
@@ -129,10 +152,15 @@ def _mock_deploy(run_dir: str) -> List[str]:
                 json.dump({"name": name, "properties": props}, fh, indent=2)
             deployed.append(f"{category}/{name}")
             keep.add(name)
-        # Converge: drop stale JSON left by earlier runs with different names.
+        # Converge: drop stale JSON left by earlier runs with different names
+        # (same scope guard as the real backend: agent-prefixed objects only).
         if prune:
             for fname in os.listdir(out_dir):
-                if fname.endswith(".json") and fname[:-5] not in keep:
+                if (
+                    fname.endswith(".json")
+                    and fname[:-5] not in keep
+                    and _prunable(category, fname[:-5])
+                ):
                     os.remove(os.path.join(out_dir, fname))
     # Carry the data-flow scripts across too, for inspection.
     src_scripts = os.path.join(run_dir, "dataflows")
@@ -205,12 +233,14 @@ def _real_resource(category: str, properties: Dict[str, Any]):
     from azure.mgmt.datafactory.models import (
         DataFlowResource,
         DatasetResource,
+        IntegrationRuntimeResource,
         LinkedServiceResource,
         PipelineResource,
         TriggerResource,
     )
 
     classes = {
+        "integrationRuntimes": IntegrationRuntimeResource,
         "linkedServices": LinkedServiceResource,
         "datasets": DatasetResource,
         "dataflows": DataFlowResource,
@@ -231,6 +261,21 @@ def _real_deploy_object(adf, cfg: AzureConfig, category: str, name: str, propert
 _PRUNE_ORDER = list(reversed(DEPLOY_ORDER))
 
 
+def _stale_names(adf, cfg: AzureConfig, keep: Dict[str, set]) -> List[str]:
+    """Report-only twin of _real_prune: the agent-created objects a prune WOULD
+    delete, without touching anything."""
+    stale: List[str] = []
+    for category in _PRUNE_ORDER:
+        op = getattr(adf, _RESOURCE_CALL[category])
+        keep_names = keep.get(category, set())
+        stale.extend(
+            f"{category}/{item.name}"
+            for item in op.list_by_factory(cfg.resource_group, cfg.factory_name)
+            if item.name not in keep_names and _prunable(category, item.name)
+        )
+    return stale
+
+
 def _real_prune(adf, cfg: AzureConfig, keep: Dict[str, set]) -> List[str]:
     """Delete every factory object whose name is not in ``keep`` (this run's objects),
     so the factory converges to exactly this run. Triggers are stopped before delete —
@@ -249,7 +294,7 @@ def _real_prune(adf, cfg: AzureConfig, keep: Dict[str, set]) -> List[str]:
         pending = [
             item.name
             for item in op.list_by_factory(cfg.resource_group, cfg.factory_name)
-            if item.name not in keep_names
+            if item.name not in keep_names and _prunable(category, item.name)
         ]
         while pending:
             progressed = False
@@ -337,6 +382,7 @@ def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str
     keep = _intended_keep(run_dir)  # full intended set, known before any write
     deploy_artifacts.last_heals = heals  # type: ignore[attr-defined]
     deploy_artifacts.last_pruned = []  # type: ignore[attr-defined]
+    deploy_artifacts.last_stale = []  # type: ignore[attr-defined]
     deploy_artifacts.last_intended_counts = {  # type: ignore[attr-defined]
         cat: len(names) for cat, names in keep.items()
     }
@@ -366,10 +412,18 @@ def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str
         # failure on last_prune_error so a non-converging factory is VISIBLE instead
         # of silently piling up.
         deploy_artifacts.last_prune_error = None  # type: ignore[attr-defined]
+        deploy_artifacts.last_stale = []  # type: ignore[attr-defined]
         if _prune_enabled():
             try:
                 deploy_artifacts.last_pruned = _real_prune(adf, cfg, keep)  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001 — surface, don't mask/raise
+                deploy_artifacts.last_prune_error = f"{type(exc).__name__}: {exc}"  # type: ignore[attr-defined]
+        else:
+            # Never delete on the agent's own authority — REPORT what a prune
+            # would remove so the user can clean up (or set PRUNE_STALE=true).
+            try:
+                deploy_artifacts.last_stale = _stale_names(adf, cfg, keep)  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
                 deploy_artifacts.last_prune_error = f"{type(exc).__name__}: {exc}"  # type: ignore[attr-defined]
         # Verify: list what the factory really contains now, per category.
         deploy_artifacts.last_factory_counts = _factory_counts_real(adf, cfg)  # type: ignore[attr-defined]
@@ -379,6 +433,7 @@ def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str
 # Most recent deploy-time heals + prunes + verification (populated by deploy_artifacts).
 deploy_artifacts.last_heals = []  # type: ignore[attr-defined]
 deploy_artifacts.last_pruned = []  # type: ignore[attr-defined]
+deploy_artifacts.last_stale = []  # type: ignore[attr-defined]
 deploy_artifacts.last_prune_error = None  # type: ignore[attr-defined]
 deploy_artifacts.last_intended_counts = {}  # type: ignore[attr-defined]
 deploy_artifacts.last_factory_counts = None  # type: ignore[attr-defined]

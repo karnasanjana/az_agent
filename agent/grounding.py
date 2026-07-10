@@ -23,11 +23,14 @@ plan proceeds. Every grounded schema is reported as a note for the plan review.
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import os
+import re
 from typing import Dict, List, Optional
 
 from config import MOCK_TENANT_DIR, mock_mode
+from models.logical import LogicalColumn, LogicalPlan, SourceFormat
 from models.spec import Column, DataFlow, DatasetKind, PipelineSpec, TransformKind
 
 # How much of the file to fetch — plenty for any header row.
@@ -52,29 +55,60 @@ def _read_head_mock(container: str, path: str) -> Optional[bytes]:
         return fh.read(_HEAD_BYTES)
 
 
-def _read_head_real(container: str, path: str) -> Optional[bytes]:
-    from config import (
-        AzureConfig,
-        get_blob_service_client,
-        get_datalake_client,
-        storage_kind,
-    )
+@functools.lru_cache(maxsize=1)
+def _storage_service_client():
+    """ONE storage service client (and therefore one DefaultAzureCredential, one
+    token acquisition) for the whole process. Building it per file turned every
+    header read into a fresh Entra token round-trip — grounding a handful of
+    datasets cost seconds. The client is thread-safe and refreshes its own token."""
+    from config import AzureConfig, get_blob_service_client, get_datalake_client, storage_kind
 
     cfg = AzureConfig.from_env()
+    return get_blob_service_client(cfg) if storage_kind() == "blob" else get_datalake_client(cfg)
+
+
+def _read_head_real(container: str, path: str) -> Optional[bytes]:
+    from config import storage_kind
+
+    service = _storage_service_client()
     if storage_kind() == "blob":
-        client = get_blob_service_client(cfg).get_blob_client(container, path)
+        client = service.get_blob_client(container, path)
         return client.download_blob(offset=0, length=_HEAD_BYTES).readall()
-    client = get_datalake_client(cfg).get_file_system_client(container).get_file_client(path)
+    client = service.get_file_system_client(container).get_file_client(path)
     return client.download_file(offset=0, length=_HEAD_BYTES).readall()
 
 
+# (container, path) -> header bytes, REAL storage only. A file's header does not
+# change within a planning session, and /plan + every /chat refine re-ground the
+# same datasets, so each remote read is paid once. Misses are cached too: an
+# absent bronze/silver file stays absent until the deploy that creates it.
+# MOCK reads hit the local filesystem (microseconds) and tests write files
+# mid-run, so they are never cached.
+_HEAD_CACHE: "Dict[tuple, Optional[bytes]]" = {}
+
+
+def clear_caches() -> None:
+    """Drop memoized heads + the storage client — call after a deploy writes
+    files that grounding previously saw as absent."""
+    _HEAD_CACHE.clear()
+    _storage_service_client.cache_clear()
+
+
 def _read_head(container: str, path: str) -> Optional[bytes]:
-    try:
-        if mock_mode():
+    if mock_mode():
+        try:
             return _read_head_mock(container, path)
-        return _read_head_real(container, path)
+        except Exception:  # noqa: BLE001
+            return None
+    key = (container, path)
+    if key in _HEAD_CACHE:
+        return _HEAD_CACHE[key]
+    try:
+        head = _read_head_real(container, path)
     except Exception:  # noqa: BLE001 — missing file / no data-plane role: skip
-        return None
+        head = None
+    _HEAD_CACHE[key] = head
+    return head
 
 
 def _header_columns(data: bytes) -> List[str]:
@@ -85,6 +119,73 @@ def _header_columns(data: bytes) -> List[str]:
         return []
     names = [c.strip() for c in next(csv.reader(io.StringIO(first_line)))]
     return names if all(names) else []  # a blank header cell -> not a header row
+
+
+# --------------------------------------------------------------------------- #
+# Type inference from sampled data rows
+# --------------------------------------------------------------------------- #
+
+_INT_RE = re.compile(r"[+-]?\d+")
+_FLOAT_RE = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?")
+_BOOL_VALUES = {"true", "false", "yes", "no"}
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?")
+
+_MAX_SAMPLE_ROWS = 200
+
+
+def _classify(value: str) -> str:
+    v = value.strip()
+    if not v:
+        return "empty"
+    if v.lower() in _BOOL_VALUES:
+        return "boolean"
+    if _INT_RE.fullmatch(v):
+        return "long" if abs(int(v)) > 2**31 - 1 else "integer"
+    if _FLOAT_RE.fullmatch(v):
+        return "double"
+    if _TS_RE.fullmatch(v):
+        return "timestamp"
+    if _DATE_RE.fullmatch(v):
+        return "date"
+    return "string"
+
+
+# What a column of mixed observations resolves to (order matters: any string
+# observation wins; int+double -> double; date+timestamp -> timestamp).
+def _merge(a: str, b: str) -> str:
+    if a == b:
+        return a
+    pair = {a, b}
+    if pair <= {"integer", "long"}:
+        return "long"
+    if pair <= {"integer", "long", "double"}:
+        return "double"
+    if pair <= {"date", "timestamp"}:
+        return "timestamp"
+    return "string"
+
+
+def _infer_column_types(data: bytes, names: List[str]) -> Dict[str, str]:
+    """Infer each column's type from the sampled data rows (the bytes already
+    fetched for the header). All-empty or unparseable columns stay string.
+    The last (possibly truncated) row of the sample is discarded."""
+    try:
+        text = data.decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(text)))
+    except Exception:  # noqa: BLE001 — inference is best-effort
+        return {}
+    rows = rows[1:]  # drop header
+    if len(rows) > 1:
+        rows = rows[:-1]  # drop the truncated tail of the 64KB head
+    types: Dict[str, str] = {}
+    for row in rows[:_MAX_SAMPLE_ROWS]:
+        for name, value in zip(names, row):
+            kind = _classify(value)
+            if kind == "empty":
+                continue
+            types[name] = _merge(types[name], kind) if name in types else kind
+    return {n: t for n, t in types.items() if t != "string"}
 
 
 # --------------------------------------------------------------------------- #
@@ -110,13 +211,80 @@ _EXPR_TYPE = {
     "max": "string",
 }
 
+_ARITH_EXPR = re.compile(r"^\((.+)\)$")
+_ARITH_SPLIT = re.compile(r"\s+[+\-*/]\s+")
+_NUMERIC_TYPES = {"integer", "int", "long", "bigint", "double", "float", "decimal", "short"}
+_NUMERIC_LITERAL = re.compile(r"[+-]?\d+(\.\d+)?")
+
+
+def _is_numeric_type(t: str) -> bool:
+    t = (t or "").strip().lower()
+    return t in _NUMERIC_TYPES or t.startswith("decimal")
+
 
 def _expr_type(expression: str, cols: Dict[str, str]) -> str:
     expr = (expression or "").strip()
     if expr in cols:  # bare column reference keeps its type
         return cols[expr]
-    fn = expr.split("(", 1)[0].strip()
+    # Structured arithmetic renders as "(a * b)" / "(1 - discount)". Preserve
+    # that numeric result through grounded schemas so downstream gold flows do
+    # not see derived measures like line_total as string and fail sum().
+    m = _ARITH_EXPR.match(expr)
+    if m:
+        operands = [p.strip() for p in _ARITH_SPLIT.split(m.group(1)) if p.strip()]
+        if operands and all(
+            _NUMERIC_LITERAL.fullmatch(o)
+            or (o in cols and _is_numeric_type(cols[o]))
+            for o in operands
+        ):
+            return "double"
+    fn, _, rest = expr.partition("(")
+    fn = fn.strip()
+    if fn in {"min", "max", "first"} and rest.endswith(")"):
+        arg = rest[:-1].strip()
+        if arg in cols:
+            return cols[arg]
     return _EXPR_TYPE.get(fn, "string")
+
+
+def ground_logical_plan(plan: LogicalPlan) -> List[str]:
+    """Stamp source schemas into a LogicalPlan before completeness.check().
+
+    This is the earliest deterministic grounding point: if the BRD names a CSV
+    file already present in storage/MOCK, read its header and sampled rows, then
+    replace the model's source columns with the real columns/types. Best-effort:
+    unreadable files leave the plan unchanged.
+    """
+    notes: List[str] = []
+    for src in plan.sources:
+        if src.format != SourceFormat.csv:
+            continue
+        if not src.file_name:
+            continue
+        container = src.container or "landing"
+        head = _read_head(container, _join_path(src.folder, src.file_name))
+        if not head:
+            continue
+        names = _header_columns(head)
+        if not names:
+            continue
+        inferred = _infer_column_types(head, names)
+        src.columns = [
+            LogicalColumn(name=n, type=inferred.get(n, "string")) for n in names
+        ]
+        typed = [f"{n}:{t}" for n, t in inferred.items()]
+        note = (
+            f"Grounded LogicalPlan source '{src.entity}' from "
+            f"{container}/{_join_path(src.folder, src.file_name)} "
+            f"({len(names)} columns: {', '.join(names[:8])}"
+            f"{'…' if len(names) > 8 else ''}"
+            + (f"; inferred types: {', '.join(typed[:8])}" if typed else "")
+            + ")"
+        )
+        if note not in plan.assumptions:
+            plan.assumptions.append(note)
+        notes.append(note)
+    return notes
 
 
 def _flow_output_columns(df: DataFlow, source_cols: List[Column]) -> List[Column]:
@@ -230,12 +398,18 @@ def ground_spec(spec: PipelineSpec) -> List[str]:
         names = _header_columns(head)
         if not names:
             continue
-        ds.columns = [Column(name=n) for n in names]
+        # Types inferred from the sampled data rows, not guessed by the model —
+        # a column stays string unless every non-empty observation agrees.
+        inferred = _infer_column_types(head, names)
+        ds.columns = [Column(name=n, type=inferred.get(n, "string")) for n in names]
         grounded[ds.name] = ds.columns
+        typed = [f"{n}:{t}" for n, t in inferred.items()]
         notes.append(
             f"Grounded: {ds.name} schema read from "
             f"{loc.container}/{_join_path(loc.folder, loc.file_name)} "
-            f"({len(names)} columns: {', '.join(names[:8])}{'…' if len(names) > 8 else ''})"
+            f"({len(names)} columns: {', '.join(names[:8])}{'…' if len(names) > 8 else ''}"
+            + (f"; inferred types: {', '.join(typed[:8])}" if typed else "")
+            + ")"
         )
 
     if not grounded:

@@ -279,6 +279,24 @@ corrected 'properties' body. Preserve names, references, and Managed Identity
 auth. Change only what is necessary. Never add keys, SAS tokens, or connection
 strings.
 
+DIAGNOSE THE ROOT CAUSE BEFORE EDITING — follow this protocol:
+1. Locate the exact expression/property the error points at (error codes like
+   DF-DT-001 name the transformation and column).
+2. Determine the column's ACTUAL type from the source/sink schemas provided
+   below, and the type the failing expression or sink expects.
+3. Decide the fix at the TYPE level: an explicit cast (toInteger/toDecimal/
+   toDate/toTimestamp), iif(isNull(col), <typed default>, col), or fixing the
+   sink mapping. Ask yourself: is there an implicit conversion? is coalesce()
+   even the right function, or is iif()/a cast safer?
+4. Regenerate the ENTIRE failing transformation correctly; leave every other
+   line byte-identical.
+
+NEVER silence a type error cosmetically (e.g. rewriting 0 as '0'): that turns
+the column into a string, corrupts the sink schema, and the run fails again
+one step later. Fix the type, not the symptom. coalesce() requires ALL
+arguments to share one type — for a typed default on a numeric column use a
+numeric literal, or cast the column before coalescing.
+
 Data-flow 'scriptLines' are ADF data flow script DSL, NOT Spark SQL.
 Window transform syntax:
   <in> window(over(<partition cols>), asc(<col>, true) | desc(<col>, true),
@@ -287,6 +305,52 @@ Window transform syntax:
 plain dedup, prefer aggregate(groupBy(<keys>), <col> = first(<col>), ...)
 over a window + filter.
 """
+
+
+def _schema_context(run_dir: str, category: str, name: str) -> str:
+    """Source/sink column schemas for the artifact being healed — the healer
+    must see real types to fix DF-DT-001-class errors at the root instead of
+    requoting literals. Best-effort: empty string when the spec is unreadable."""
+    try:
+        from agent.review import load_spec
+
+        spec = load_spec(run_dir)
+        ds_by = {d.name: d for d in spec.datasets}
+
+        def fmt_cols(label: str, cols) -> str:
+            if not cols:
+                return f"{label}: (schema unknown)"
+            return f"{label}: " + ", ".join(f"{c.name} {c.type}" for c in cols)
+
+        def fmt(ds_name: "str | None") -> str:
+            ds = ds_by.get(ds_name or "")
+            if ds is None or not ds.columns:
+                return f"{ds_name}: (schema unknown)"
+            return f"{ds_name}: " + ", ".join(f"{c.name} {c.type}" for c in ds.columns)
+
+        if category == "dataflows":
+            df = next((d for d in spec.dataflows if d.name == name), None)
+            if df is None:
+                return ""
+            primary = df.source_columns or ds_by.get(df.source.dataset, None)
+            primary_cols = primary if isinstance(primary, list) else getattr(primary, "columns", [])
+            lines = [fmt_cols(f"Source {df.source.stream_name} ({df.source.dataset})", primary_cols)]
+            for ep in df.additional_sources:
+                cols = ep.columns or getattr(ds_by.get(ep.dataset), "columns", [])
+                lines.append(fmt_cols(f"Source {ep.stream_name} ({ep.dataset})", cols))
+            lines.append("Sink " + fmt(df.sink.dataset))
+            return "\n".join(lines)
+        if category == "pipelines":
+            pl = next((p for p in spec.pipelines if p.name == name), None)
+            if pl is None:
+                return ""
+            names: List[str] = []
+            for act in pl.activities:
+                names += [n for n in (act.source_dataset, act.sink_dataset) if n]
+            return "\n".join(fmt(n) for n in dict.fromkeys(names))
+    except Exception:  # noqa: BLE001 — context is an aid, never a blocker
+        pass
+    return ""
 
 
 def _artifact_inventory(run_dir: str) -> Dict[str, str]:
@@ -344,11 +408,10 @@ def _pick_target(
         matches.sort(key=lambda nc: 0 if nc[1] in ("dataflows", "datasets") else 1)
         return matches[0]
 
-    # 3. Last resort: any dataflow, else anything.
-    for name, category in inventory.items():
-        if category == "dataflows":
-            return name, category
-    return next(iter(inventory.items()), None)
+    # 3. Fail loud. Healing an arbitrary artifact burns a full Azure retry and
+    # can make a good artifact worse. If the runtime error does not identify a
+    # target, surface the original failure instead of guessing.
+    return None
 
 
 def _log_heal(run_dir: str, record: Dict[str, Any]) -> None:
@@ -390,6 +453,30 @@ def _lint_healed(name: str, properties: Dict[str, Any]) -> List[str]:
     return lint_dataflow_script(name, "\n".join(lines))
 
 
+# Provider blips worth absorbing with a short backoff instead of killing the
+# whole self-heal loop (gemini-2.5-flash returned 503 UNAVAILABLE mid-heal and
+# the run died at attempt 1 with the ADF failure unhealed).
+_TRANSIENT_LLM_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def _run_llm(agent: "Any", user_msg: str, tries: int = 3) -> "Any":
+    """agent.run_sync with exponential backoff on transient provider errors."""
+    import time
+
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    delay = 5.0
+    for attempt in range(tries):
+        try:
+            return agent.run_sync(user_msg)
+        except ModelHTTPError as exc:
+            if exc.status_code not in _TRANSIENT_LLM_STATUSES or attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")
+
+
 def heal_artifact(
     run_dir: str, category: str, name: str, error_message: str, phase: str = "runtime"
 ) -> str:
@@ -402,20 +489,31 @@ def heal_artifact(
         doc = json.load(fh)
     before = doc["properties"]
 
+    from agent.skills import lessons_path
+
+    heal_prompt = _HEAL_PROMPT
+    try:  # lessons distilled from earlier heals — the healer benefits too
+        with open(lessons_path(), "r", encoding="utf-8") as fh:
+            heal_prompt += "\n\nLessons from previous incidents:\n" + fh.read()
+    except OSError:
+        pass
     agent = Agent(
-        get_model(), output_type=structured_output(HealedArtifact), system_prompt=_HEAL_PROMPT
+        get_model(), output_type=structured_output(HealedArtifact), system_prompt=heal_prompt
     )
+    schemas = _schema_context(run_dir, category, name)
     user_msg = (
         f"Artifact category: {category}\nArtifact name: {name}\n"
         f"Runtime error:\n{error_message}\n\n"
-        f"Current properties JSON:\n{json.dumps(before, indent=2)}"
+        + (f"Column schemas (ground truth — use these types):\n{schemas}\n\n" if schemas else "")
+        + f"Current properties JSON:\n{json.dumps(before, indent=2)}"
     )
-    healed = agent.run_sync(user_msg).output
+    healed = _run_llm(agent, user_msg).output
     lint_problems = _lint_healed(name, healed.properties) if category == "dataflows" else []
     if lint_problems:
         # One corrective round-trip: cheaper than discovering the same parse
         # error 5 minutes into the redeployed run.
-        healed = agent.run_sync(
+        healed = _run_llm(
+            agent,
             user_msg
             + "\n\nYour previous correction:\n"
             + json.dumps(healed.properties, indent=2)
@@ -442,6 +540,11 @@ def heal_artifact(
             "after": healed.properties,
         },
     )
+    # Close the loop: distill this incident into a generic rule the planner
+    # (and future heals) will see. Best-effort — never blocks the heal.
+    from agent.skills import record_lesson
+
+    record_lesson(error_message, healed.explanation)
     return healed.explanation
 
 
@@ -524,8 +627,17 @@ def execute(
         _emit({"run_id": report.get("run_id"), "status": "Healing",
                "steps": report.get("steps"), "layers": report.get("layers")})
         name, category = target
-        explanation = heal_artifact(run_dir, category, name, error_blob or report["status"])
-        deploy_object(run_dir, category, name, cfg)
+        try:
+            explanation = heal_artifact(run_dir, category, name, error_blob or report["status"])
+            deploy_object(run_dir, category, name, cfg)
+        except Exception as exc:  # noqa: BLE001 — heal is best-effort: keep the
+            # ADF failure readable instead of replacing it with an LLM/deploy
+            # traceback (gemini 503 UNAVAILABLE killed a run at attempt 1).
+            report["healed"] = {
+                "category": category, "name": name,
+                "fix": f"heal failed ({type(exc).__name__}): {exc}",
+            }
+            break
         # Mutates the dict already inside `attempts`, so history picks it up.
         report["healed"] = {"category": category, "name": name, "fix": explanation}
         # Next attempt resumes from this run's failure point instead of re-running

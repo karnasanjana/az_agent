@@ -262,6 +262,20 @@ _OP_FN = {
 _OP_IDENTITY = {"identity", "copy", "passthrough", "asis", "none"}
 # Window functions that take NO arguments — rendered as fn(), never fn(column).
 _OP_NOARG = {"rownumber", "rank", "denserank"}
+# Proper Case: ADF's data-flow DSL has no initCap, so CODE renders the composite
+# concat(upper(left(col,1)), lower(substring(col,2))) — first letter upper, rest
+# lower. (Chain a `trim` op first when the column may carry whitespace.)
+_OP_PROPER = {"proper", "propercase", "initcap", "titlecase", "title"}
+# Arithmetic: operands are the column plus args; each operand may be ANOTHER
+# COLUMN NAME or a numeric literal — rendered infix, e.g. multiply(quantity,
+# [list_price]) -> (quantity * list_price). This unlocks derived measures like
+# line_total = quantity * list_price * (1 - discount) without any raw DSL.
+_OP_ARITH = {
+    "add": "+", "plus": "+",
+    "subtract": "-", "minus": "-",
+    "multiply": "*", "times": "*", "product": "*",
+    "divide": "/", "dividedby": "/",
+}
 
 
 def _norm_op(op: str) -> str:
@@ -270,13 +284,26 @@ def _norm_op(op: str) -> str:
 
 def _render_literal(value: str) -> str:
     """A structured arg/value as a DSL literal: numbers bare, everything else a
-    single-quoted string (pre-quoted values pass through)."""
+    single-quoted string (pre-quoted values pass through). Boolean/null literals
+    are ADF literals, not strings."""
     s = str(value).strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", s):
         return s
+    if s.lower() in {"true", "false", "null"}:
+        return s.lower()
     if len(s) >= 2 and s.startswith("'") and s.endswith("'"):
         return s
     return "'" + s.replace("'", r"\'") + "'"
+
+
+def _render_operand(value: str) -> str:
+    """An arithmetic operand: bare when it is a column name or a number, quoted
+    literal otherwise (arithmetic on a string literal is almost surely a plan
+    bug, but the DSL error is clearer than silent misquoting)."""
+    s = str(value).strip()
+    if re.fullmatch(r"[A-Za-z_]\w*", s):
+        return s  # column reference
+    return _render_literal(s)
 
 
 def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
@@ -286,6 +313,16 @@ def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
         return column or None
     if key in _OP_NOARG:
         return f"{_OP_FN[key]}()"
+    if key in _OP_PROPER:
+        if not column:
+            return None
+        return f"concat(upper(left({column}, 1)), lower(substring({column}, 2)))"
+    if key in _OP_ARITH:
+        operands = ([column] if column else []) + [str(a) for a in args]
+        if len(operands) < 2:
+            return None  # arithmetic needs at least two operands
+        sym = _OP_ARITH[key]
+        return "(" + f" {sym} ".join(_render_operand(o) for o in operands) + ")"
     fn = _OP_FN.get(key)
     if fn is None:
         return None
@@ -405,8 +442,11 @@ class Transform(BaseModel):
     right_stream: Optional[str] = None
     join_type: str = "inner"  # inner | left_outer | right_outer | full_outer | cross
     # limit-only: keep only the first `take` rows (after `skip`), e.g. "top 10
-    # customers" = sort desc + limit(take=10). A single native ADF transform —
-    # prefer this over hand-rolling window(rowNumber)+filter for row-limiting.
+    # customers" = sort desc + limit(take=10). NOT a native ADF transform (the
+    # broker rejects `limit(` with DF-FLO-005 'not registered', run
+    # flow_gold_top_customers) — the builder lowers it to rank(<sort keys>) +
+    # filter(__rowRank <= take) + select-drop. Keep using this kind in plans;
+    # never hand-roll the rank/window pattern yourself.
     take: Optional[int] = None
     skip: int = 0
 
@@ -419,8 +459,20 @@ class Transform(BaseModel):
         with only a name is an identity mapping (name = name)."""
         if self.predicates and not self.condition:
             clauses = [p.render() for p in self.predicates]
-            if all(clauses):
-                self.condition = " && ".join(clauses)  # type: ignore[arg-type]
+            bad = [p for p, cl in zip(self.predicates, clauses) if not cl]
+            if bad:
+                # Silently skipping these once shipped an EMPTY filter() to
+                # Azure (EXE-0001 'cannot be analyzed as a graph') — the
+                # requirement vanished AND the run burned 5 minutes.
+                raise ValueError(
+                    f"transform '{self.name}': unrenderable predicate(s): "
+                    + "; ".join(
+                        f"op='{p.op}' column='{p.column}' value={p.value!r}" for p in bad
+                    )
+                    + " — op must be one of not_null|null|eq|ne|gt|ge|lt|le, "
+                    "and comparison ops require a value"
+                )
+            self.condition = " && ".join(clauses)  # type: ignore[arg-type]
         for c in self.columns:
             if not c.expression and c.op:
                 c.expression = _render_op(c.op, c.column or c.name, c.args)
@@ -476,7 +528,9 @@ class Transform(BaseModel):
     def _limit_needs_take(self) -> "Transform":
         """A limit transform with no `take` is meaningless. Hard parse error so
         the model retries in seconds instead of building the fragile
-        dummy-partition + window(rowNumber) + filter workaround for 'top N'."""
+        dummy-partition + window(rowNumber) + filter workaround for 'top N'.
+        (The builder lowers limit to rank+filter — ADF has no limit transform —
+        but `take` is still what drives the rank cutoff.)"""
         if self.kind == TransformKind.limit and self.take is None:
             raise ValueError(
                 f"limit '{self.name}': set 'take' (row count to keep) — e.g. "
@@ -716,6 +770,11 @@ class PipelineSpec(BaseModel):
     # schedule trigger?", "consider partitioning silver by date"). Advisory only —
     # only include when it would genuinely change the pipeline, never as filler.
     suggestions: List[str] = Field(default_factory=list)
+
+    # BRD requirements the system recognized but could NOT build (from
+    # LogicalPlan.unsupported). Non-empty means /approve requires an explicit
+    # acknowledgement — a known-incomplete pipeline never deploys silently.
+    unsupported: List[str] = Field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Robust coercion for LLM output

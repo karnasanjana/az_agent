@@ -13,9 +13,13 @@ never edits code for a new failure class.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Set
 
 from models.logical import LogicalPlan, LogicalSource, OutputPlan
+from models.spec import _OP_ARITH, _norm_op
+
+_NUMERIC = re.compile(r"-?\d+(\.\d+)?")
 
 
 def _entity_columns(src: LogicalSource) -> Set[str]:
@@ -110,6 +114,7 @@ def check(plan: LogicalPlan) -> List[str]:
                 available |= _entity_columns(s)
             available |= {d.new_column or d.column for d in out.derived}
             available |= {a.name for a in out.aggregations}
+            available |= {d.new_column or d.column for d in out.post_agg_derived}
             refs: List[tuple] = []
             for j in out.joins:
                 refs += [(k, None) for k in j.left_keys + j.right_keys]
@@ -165,17 +170,33 @@ def check(plan: LogicalPlan) -> List[str]:
         if not cols:
             continue
         available = set(cols)
-        refs = (
-            [c.name for c in t.casts]
-            + [c.column for c in t.cleaning]
-            + [f.column for f in t.filters]
-            + list(t.dedup_keys)
-        )
-        for col in refs:
+        for col in (c.name for c in t.casts):
             if col not in available:
                 problems.append(
                     f"'{col}' is not a column of '{t.entity}' (has: {sorted(available)})"
                 )
-            available.add(col)  # a produced/new column becomes available downstream
+            available.add(col)
+        # Cleaning ops in order: arithmetic args are operands (columns or
+        # numbers), other ops' args are literals; a new_column becomes available
+        # to LATER ops (the compiler splits chained ops into sequential
+        # transforms).
+        for c in t.cleaning:
+            operands = [c.column] + (list(c.args) if _norm_op(c.op) in _OP_ARITH else [])
+            for operand in operands:
+                if _NUMERIC.fullmatch(str(operand).strip()):
+                    continue  # numeric literal, not a column
+                if operand not in available:
+                    problems.append(
+                        f"'{operand}' is not a column of '{t.entity}' "
+                        f"(has: {sorted(available)})"
+                    )
+                    available.add(operand)  # report once
+            available.add(c.new_column or c.column)
+        for col in [f.column for f in t.filters] + list(t.dedup_keys):
+            if col not in available:
+                problems.append(
+                    f"'{col}' is not a column of '{t.entity}' (has: {sorted(available)})"
+                )
+                available.add(col)
 
     return problems

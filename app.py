@@ -31,14 +31,19 @@ it on request (/chat), and (behind SELF_HEAL) self-healing a failed artifact
 
 from __future__ import annotations
 
+import contextlib
+import hmac
+import json
 import os
 import shutil
+import sys
 import threading
+import time
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from agent import builder, graph, preflight, review
@@ -48,17 +53,94 @@ from ui import INDEX_HTML
 
 app = FastAPI(title="BRD -> ADF Medallion Agent")
 
-# In-memory run store (swap for a DB in production).
+# In-memory run store, mirrored to <run_dir>/run_state.json after every status
+# change so a server restart/reload does not orphan built or in-flight runs
+# (see _persist_run/_get_run). Conversation history is process-local: /chat on a
+# rehydrated run returns 409.
 _RUNS: Dict[str, Dict[str, Any]] = {}
+
+
+@app.middleware("http")
+async def _require_api_token(request: Request, call_next):
+    """Optional auth for non-localhost deployments: when API_TOKEN is set, every
+    mutating (POST) endpoint requires a matching X-API-Token header. Unset =
+    open (the default localhost/dev setup). GETs stay open — they expose no
+    deploy controls."""
+    token = os.environ.get("API_TOKEN", "").strip()
+    if token and request.method == "POST":
+        supplied = request.headers.get("x-api-token", "")
+        if not hmac.compare_digest(supplied, token):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid X-API-Token header."},
+            )
+    return await call_next(request)
 
 
 class ApproveRequest(BaseModel):
     run_id: str
+    # Required (true) to deploy a plan with `unsupported` requirements — the
+    # explicit waiver that stops a known-incomplete pipeline slipping through.
+    acknowledge_unsupported: bool = False
 
 
 class ChatRequest(BaseModel):
     run_id: str
     message: str
+
+
+# --------------------------------------------------------------------------- #
+# Run-state persistence — a restart must not orphan a built/deployed run
+# --------------------------------------------------------------------------- #
+
+# JSON-safe subset of a run record (no message history, no threading.Event).
+_PERSIST_KEYS = (
+    "status", "run_dir", "spec", "preflight", "previewed", "mock",
+    "clarifications", "containers_created", "deployed", "deploy_report",
+    "run", "report", "heals", "heal_log", "error",
+)
+# In-flight statuses that cannot survive a restart (the background task died).
+_LIVE_STATUSES = {"APPROVED", "PROVISIONING", "DEPLOYING", "RUNNING"}
+
+
+def _persist_run(run_id: str) -> None:
+    """Mirror the run's JSON-safe state next to its artifacts. Best-effort —
+    persistence must never break the request that triggered it."""
+    run = _RUNS.get(run_id)
+    if not run or not run.get("run_dir") or not os.path.isdir(run["run_dir"]):
+        return
+    try:
+        state = {k: run[k] for k in _PERSIST_KEYS if k in run}
+        with open(os.path.join(run["run_dir"], "run_state.json"), "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, default=str)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _get_run(run_id: str) -> "Optional[Dict[str, Any]]":
+    """The run record — from memory, else rehydrated from run_state.json (server
+    restarted). A run that was mid-deploy/mid-run comes back as INTERRUPTED and
+    can be re-approved (deploys are idempotent). The LLM conversation does not
+    survive a restart, so /chat on a rehydrated run 409s."""
+    run = _RUNS.get(run_id)
+    if run is not None:
+        return run
+    path = os.path.join(builder.artifacts_dir(run_id), "run_state.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+    if state.get("status") in _LIVE_STATUSES:
+        state["status"] = "INTERRUPTED"
+        state["error"] = (
+            "Server restarted while this run was in flight — approve again to "
+            "redeploy (deploys are idempotent)."
+        )
+    _RUNS[run_id] = state
+    return state
 
 
 # --------------------------------------------------------------------------- #
@@ -195,8 +277,20 @@ def _summary(spec: PipelineSpec) -> Dict[str, Any]:
     }
 
 
+def _ground_during_plan() -> bool:
+    """Whether /plan reads source-file HEADERS from storage to ground schemas.
+
+    READ-ONLY (first 64 KB of files the BRD already names) — never a write, so
+    the "nothing is created in your tenant before approval" contract holds. It
+    is on by default because an ungrounded spec is the #1 runtime failure (the
+    LLM guesses column lists, the flow dies with DF-EXPR-010). Set
+    GROUND_PLAN=false for a fully offline plan phase — grounding then runs at
+    /approve, just before the deploy that reads those files anyway."""
+    return os.environ.get("GROUND_PLAN", "true").strip().lower() not in {"false", "0", "no", "off"}
+
+
 def _store_and_respond(
-    run_id: str, spec: PipelineSpec, messages: Any
+    run_id: str, spec: PipelineSpec, messages: Any, phases: "Optional[_Phases]" = None
 ) -> Dict[str, Any]:
     """Persist conversation state and build the /plan|/chat response payload.
 
@@ -228,15 +322,19 @@ def _store_and_respond(
 
     # Ground schemas in REAL data before building: read file headers from storage
     # and stamp them into the spec, overriding whatever columns the LLM guessed
-    # (or omitted). Never blocks — unreadable files just keep the spec as-is.
-    try:
-        from agent.grounding import ground_spec
+    # (or omitted). Read-only; never blocks — unreadable files keep the spec
+    # as-is. Skipped entirely when GROUND_PLAN=false (offline plan phase).
+    if _ground_during_plan():
+        timer = phases.phase("grounding") if phases else contextlib.nullcontext()
+        with timer:
+            try:
+                from agent.grounding import ground_spec
 
-        for note in ground_spec(spec):
-            if note not in spec.assumptions:  # /chat re-runs this — don't duplicate
-                spec.assumptions.append(note)
-    except Exception:  # noqa: BLE001 — grounding is best-effort by design
-        pass
+                for note in ground_spec(spec):
+                    if note not in spec.assumptions:  # /chat re-runs this — don't duplicate
+                        spec.assumptions.append(note)
+            except Exception:  # noqa: BLE001 — grounding is best-effort by design
+                pass
 
     # Rebuild from a clean directory so renamed/removed objects don't linger.
     run_dir = builder.artifacts_dir(run_id)
@@ -252,12 +350,13 @@ def _store_and_respond(
     _RUNS[run_id] = {
         "status": "AWAITING_APPROVAL" if pf["passed"] else "PREFLIGHT_FAILED",
         "run_dir": run_dir,
-        "spec": spec.model_dump(),
+        "spec": spec.model_dump(mode="json"),
         "messages": messages,
         "preflight": pf,
         "previewed": True,  # the response carries the full review
         "mock": mock_mode(),
     }
+    _persist_run(run_id)
     return {
         "run_id": run_id,
         "status": _RUNS[run_id]["status"],
@@ -269,6 +368,9 @@ def _store_and_respond(
         "clarifications": spec.clarifications[:2],
         "assumptions": spec.assumptions,
         "suggestions": spec.suggestions,
+        # Requirements the system could NOT build (post-triage). Non-empty means
+        # /approve will demand an explicit acknowledgement.
+        "unsupported": spec.unsupported,
         "review": review.render(run_id),
         "graph": graph.graph(run_id),
         "plan_text": review.render_text(run_id),
@@ -277,14 +379,139 @@ def _store_and_respond(
 
 
 def _legacy_parser() -> bool:
-    return os.environ.get("LEGACY_PARSER", "").strip().lower() in {"1", "true", "yes", "on"}
+    """DEPRECATED. The pre-LogicalPlan path: the LLM authored the whole ADF
+    PipelineSpec (names, datasets, DSL expressions) in one shot. It has none of
+    the deterministic guarantees the compiler path gives — no typecheck, no
+    completeness critic, no closed op vocabulary — and exists only as an escape
+    hatch while the new path proves out. Slated for removal; do not build on it."""
+    on = os.environ.get("LEGACY_PARSER", "").strip().lower() in {"1", "true", "yes", "on"}
+    if on:
+        import warnings
+
+        warnings.warn(
+            "LEGACY_PARSER=true uses the deprecated LLM-authors-ADF-JSON path "
+            "(no typecheck, no completeness critic). It will be removed — unset "
+            "it to use the LogicalPlan compiler path.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return on
+
+
+def _plan_mode() -> str:
+    """'auto' (default): FIRST generation is one-shot (a single model call —
+    the fast, cheap path); every repair/refine goes through the tool agent,
+    which edits the existing plan precisely instead of re-emitting all of it.
+    'tools': everything through validated tool calls (most robust, most turns).
+    'oneshot': everything through whole-plan re-emission (legacy behavior)."""
+    mode = os.environ.get("PLAN_MODE", "auto").strip().lower()
+    if mode in {"oneshot", "one-shot", "extract"}:
+        return "oneshot"
+    if mode == "tools":
+        return "tools"
+    return "auto"
+
+
+def _plan_fns():
+    """(extract, refine) for the active PLAN_MODE, normalized to one signature:
+    refine(instruction, messages, base_plan).
+
+    auto: extract = one-shot; refine = tool agent on a FRESH conversation whose
+    context is the plan itself (the session is rebuilt from base_plan) — the
+    one-shot history belongs to a different agent/system prompt and must not
+    leak into the tool loop."""
+    mode = _plan_mode()
+    if mode == "tools":
+        from agent.plantools import extract_plan, refine_plan
+
+        return extract_plan, refine_plan
+    if mode == "auto":
+        from agent.extractor import extract_plan
+        from agent.plantools import refine_plan as _tools_refine
+
+        async def _refine(instruction, messages, base_plan=None):
+            return await _tools_refine(instruction, None, base_plan)
+
+        return extract_plan, _refine
+    from agent.extractor import extract_plan, refine_plan
+
+    async def _refine(instruction, messages, base_plan=None):
+        return await refine_plan(instruction, messages)
+
+    return extract_plan, _refine
 
 
 _MAX_PLAN_REPAIRS = 3       # completeness-check repair rounds (before build)
 _MAX_PREFLIGHT_REPAIRS = 2  # preflight repair rounds (after build)
 
 
-async def _run_logical(run_id: str, produce) -> Dict[str, Any]:
+class _Phases:
+    """Wall-clock ms per phase (extract / repair / triage / compile / preflight /
+    grounding) + the model-call count. Rides on the /plan|/chat response so a
+    slow or chatty run is measurable instead of guessed at."""
+
+    def __init__(self) -> None:
+        self.ms: Dict[str, int] = {}
+        self.llm_calls = 0
+        self.usage: list = []
+
+    @contextlib.contextmanager
+    def phase(self, name: str, *, llm: bool = False):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.ms[name] = self.ms.get(name, 0) + int((time.perf_counter() - start) * 1000)
+            if llm:
+                self.llm_calls += 1
+
+    def report(self) -> Dict[str, Any]:
+        out = {"ms": dict(self.ms), "total_ms": sum(self.ms.values()), "llm_calls": self.llm_calls}
+        if self.usage:
+            out["usage"] = self.usage
+        return out
+
+    def add_usage(self, phase: str, usage: Any) -> None:
+        if usage is None:
+            return
+        if hasattr(usage, "model_dump"):
+            payload = usage.model_dump()
+        elif hasattr(usage, "__dict__"):
+            payload = dict(usage.__dict__)
+        else:
+            payload = str(usage)
+        self.usage.append({"phase": phase, "usage": payload})
+
+
+def _latest_plan_usage() -> Any:
+    for mod_name in ("agent.plantools", "agent.extractor"):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        getter = getattr(mod, "last_usage", None)
+        if callable(getter):
+            usage = getter()
+            if usage is not None:
+                return usage
+    return None
+
+
+def _clear_plan_usage() -> None:
+    for mod_name in ("agent.plantools", "agent.extractor"):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        clear = getattr(mod, "clear_usage", None)
+        if callable(clear):
+            clear()
+
+
+async def _run_logical(
+    run_id: str,
+    produce,
+    cache_key: "Optional[str]" = None,
+    requirements_text: "Optional[str]" = None,
+) -> Dict[str, Any]:
     """New path: BRD/instruction -> LogicalPlan -> compile -> spec, with the model
     fixing its OWN plan against the deterministic checks. `produce` is an async
     callable returning (plan, messages) — extract_plan(text) or
@@ -295,23 +522,72 @@ async def _run_logical(run_id: str, produce) -> Dict[str, Any]:
       2. preflight failures fed back after build (rare — compiler output is
          normally clean). Never deploys a failing spec; if neither loop
          converges the user sees the problems, exactly as the legacy path does.
+
+    `cache_key` (first generation only) short-circuits the extract phase when
+    the identical BRD was already planned by this model — zero LLM calls.
     """
     from agent.completeness import check
     from agent.compiler import compile_plan
-    from agent.extractor import refine_plan
+    from agent import plancache
 
-    plan, messages = await produce()
+    _, refine_plan = _plan_fns()
+    phases = _Phases()
 
-    # Loop 1 — logical consistency, before building anything.
+    # The plan the human last reviewed (None on first generation) — diffed
+    # against the new plan below so a refine shows exactly what changed.
+    prev_plan = (_RUNS.get(run_id) or {}).get("logical_plan")
+
+    cached = plancache.get(cache_key) if cache_key else None
+    if cached is not None:
+        plan, messages, phases.ms["extract_cached"] = cached, [], 0
+    else:
+        _clear_plan_usage()
+        with phases.phase("extract", llm=True):
+            plan, messages = await produce()
+        phases.add_usage("extract", _latest_plan_usage())
+
+    def _ground(p):
+        """Stamp real source schemas over whatever columns the model wrote.
+
+        Every refine returns a FULL plan, so its sources carry freshly invented
+        columns — grounding once after extract would leave repair rounds 2..n
+        checking against hallucinated schemas. Head reads are memoized per
+        (container, path), so re-grounding costs nothing after the first pass."""
+        with phases.phase("ground_logical"):
+            try:
+                from agent.grounding import ground_logical_plan
+
+                ground_logical_plan(p)
+            except Exception:  # noqa: BLE001 - grounding helps checks; must not block planning
+                pass
+        return p
+
+    _ground(plan)
+
+    def _with_requirements(instruction: str) -> str:
+        if not requirements_text:
+            return instruction
+        return (
+            "Original BRD / requirements:\n"
+            f"{requirements_text}\n\n"
+            f"{instruction}"
+        )
+
+    # Loop 1 — logical consistency, before building anything. (In tools mode
+    # most problems are already caught per tool call; this is the safety net.)
     for _ in range(_MAX_PLAN_REPAIRS):
         problems = check(plan)
         if not problems:
             break
-        feedback = (
+        feedback = _with_requirements(
             "Your plan has problems. Fix ALL of them and return the full "
             "corrected plan:\n" + "\n".join(f"- {p}" for p in problems)
         )
-        plan, messages = await refine_plan(feedback, messages)
+        _clear_plan_usage()
+        with phases.phase("repair_completeness", llm=True):
+            plan, messages = await refine_plan(feedback, messages, plan)
+        phases.add_usage("repair_completeness", _latest_plan_usage())
+        _ground(plan)
     else:
         raise HTTPException(
             status_code=422,
@@ -321,8 +597,37 @@ async def _run_logical(run_id: str, produce) -> Dict[str, Any]:
             },
         )
 
-    spec = compile_plan(plan)
-    resp = _store_and_respond(run_id, spec, messages)
+    # Loop 1c — unsupported triage. Models over-mark: requirements land in
+    # `unsupported` that the vocabulary CAN express (or that are built-in).
+    # One feedback round with the capability card (generated from the live
+    # vocabulary); whatever comes back still unsupported is a genuine gap —
+    # it keeps a proposed alternative in `suggestions`, rides into the plan
+    # review, and gates /approve until explicitly acknowledged.
+    if plan.unsupported and cached is None:
+        from agent.extractor import capability_card
+
+        triage = _with_requirements(
+            "You marked these requirements as unsupported:\n"
+            + "\n".join(f"- {u}" for u in plan.unsupported)
+            + "\n\nRe-check EACH against what the system CAN build:\n"
+            + capability_card()
+            + "\n\nReturn the FULL updated plan: express every item the "
+            "vocabulary covers (and remove it from unsupported). For each item "
+            "that genuinely cannot be built, keep its unsupported line AND add "
+            "one `suggestions` line proposing the closest supported alternative "
+            "the user could accept instead."
+        )
+        _clear_plan_usage()
+        with phases.phase("triage_unsupported", llm=True):
+            cand, cand_msgs = await refine_plan(triage, messages, plan)
+        phases.add_usage("triage_unsupported", _latest_plan_usage())
+        _ground(cand)
+        if not check(cand):  # accept the triaged plan only if still consistent
+            plan, messages = cand, cand_msgs
+
+    with phases.phase("compile"):
+        spec = compile_plan(plan)
+    resp = _store_and_respond(run_id, spec, messages, phases)
 
     # Loop 2 — compiled pipeline must pass preflight. Feed failures back.
     for _ in range(_MAX_PREFLIGHT_REPAIRS):
@@ -333,15 +638,58 @@ async def _run_logical(run_id: str, produce) -> Dict[str, Any]:
             for c in _RUNS[run_id].get("preflight", {}).get("checks", [])
             if not c["passed"]
         ]
-        plan, messages = await refine_plan(
-            "The compiled pipeline failed validation. Adjust the plan to fix:\n"
-            + "\n".join(f"- {f}" for f in failed),
-            messages,
-        )
+        _clear_plan_usage()
+        with phases.phase("repair_preflight", llm=True):
+            plan, messages = await refine_plan(
+                _with_requirements(
+                    "The compiled pipeline failed validation. Adjust the plan to fix:\n"
+                    + "\n".join(f"- {f}" for f in failed)
+                ),
+                messages,
+                plan,
+            )
+        phases.add_usage("repair_preflight", _latest_plan_usage())
+        _ground(plan)
+        logical_problems = check(plan)
+        if logical_problems:
+            _clear_plan_usage()
+            with phases.phase("repair_logical_after_preflight", llm=True):
+                plan, messages = await refine_plan(
+                    _with_requirements(
+                        "Your previous preflight repair introduced logical plan "
+                        "problems. Fix ALL of these first, then return the full "
+                        "corrected plan:\n"
+                        + "\n".join(f"- {p}" for p in logical_problems)
+                    ),
+                    messages,
+                    plan,
+                )
+            phases.add_usage("repair_logical_after_preflight", _latest_plan_usage())
+            _ground(plan)
         if check(plan):  # a repair that reintroduced a logical problem — spend the round
             continue
-        spec = compile_plan(plan)
-        resp = _store_and_respond(run_id, spec, messages)
+        with phases.phase("compile"):
+            spec = compile_plan(plan)
+        resp = _store_and_respond(run_id, spec, messages, phases)
+
+    # Cache only a plan that survived every check — never a broken one.
+    if cache_key and cached is None and _RUNS[run_id].get("preflight", {}).get("passed"):
+        plancache.put(cache_key, plan)
+
+    # Approval-gate transparency: on a refine, show the human exactly what the
+    # model changed since the plan they last reviewed (deterministic diff — the
+    # UI renders it before re-approval; empty on first generation).
+    from agent.plandiff import diff as plan_diff
+
+    resp["plan_changes"] = plan_diff(prev_plan, plan)
+    _RUNS[run_id]["plan_changes"] = resp["plan_changes"]
+    resp["timings"] = phases.report()
+
+    # The accepted plan rides on the run (in-memory, like `messages`) so /chat
+    # in tools mode can rebuild the agent's session from it.
+    _RUNS[run_id]["logical_plan"] = plan
+    if requirements_text:
+        _RUNS[run_id]["brd_text"] = requirements_text
 
     # Audit: persist the logical plan next to the built artifacts.
     run_dir = _RUNS[run_id].get("run_dir")
@@ -376,9 +724,15 @@ async def plan(
 
             spec, messages = await parse_brd(text)
             return _store_and_respond(run_id, spec, messages)
-        from agent.extractor import extract_plan
+        from agent import plancache
 
-        return await _run_logical(run_id, lambda: extract_plan(text))
+        extract_plan, _ = _plan_fns()
+        # Identical BRD + same mode + same model -> reuse the cached plan, no LLM.
+        cache_key = plancache.key(text, _plan_mode())
+
+        return await _run_logical(
+            run_id, lambda: extract_plan(text), cache_key, requirements_text=text
+        )
     except HTTPException:
         raise
     except RuntimeError as exc:  # missing Foundry / model config
@@ -390,11 +744,15 @@ async def plan(
 @app.post("/chat")
 async def chat(req: ChatRequest) -> Dict[str, Any]:
     """Refine an existing run: answer the agent's questions or request changes."""
-    run = _RUNS.get(req.run_id)
+    run = _get_run(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
     if "messages" not in run:
-        raise HTTPException(status_code=409, detail="This run has no conversation to continue.")
+        raise HTTPException(
+            status_code=409,
+            detail="This run has no conversation to continue (a server restart "
+                   "drops chat history — submit the BRD again to refine it).",
+        )
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=422, detail="Type a change or an answer.")
@@ -405,9 +763,13 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
 
             spec, messages = await refine_spec(message, run["messages"])
             return _store_and_respond(req.run_id, spec, messages)
-        from agent.extractor import refine_plan
+        _, refine_plan = _plan_fns()
 
-        return await _run_logical(req.run_id, lambda: refine_plan(message, run["messages"]))
+        return await _run_logical(
+            req.run_id,
+            lambda: refine_plan(message, run["messages"], run.get("logical_plan")),
+            requirements_text=run.get("brd_text"),
+        )
     except HTTPException:
         raise
     except RuntimeError as exc:
@@ -422,7 +784,7 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
 
 
 def _require_built(run_id: str) -> Dict[str, Any]:
-    run = _RUNS.get(run_id)
+    run = _get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
     if "run_dir" not in run:
@@ -466,6 +828,13 @@ def _azure_error_hint(exc: Exception) -> str:
     deploy/run failures are missing role assignments, not code bugs — surface the
     fix instead of a bare stack trace."""
     blob = f"{type(exc).__name__}: {exc}".lower()
+    # LLM provider errors FIRST — a ModelHTTPError 404 ('model no longer
+    # available', gemini-2.5-flash retirement) otherwise falls into the Azure
+    # 404 branch and sends the user auditing resource groups that are fine.
+    if "modelhttperror" in blob or "model_name" in blob or "generativelanguage" in blob:
+        return ("LLM provider error — check LLM_PROVIDER / LLM_MODEL in .env. A 404 "
+                "usually means the pinned model was retired; list live models for "
+                "your key and update LLM_MODEL.")
     if "authorizationpermissionmismatch" in blob or "authorizationfailure" in blob or "403" in blob:
         if "dfs.core.windows.net" in blob or "blob.core.windows.net" in blob or "filesystem" in blob or "container" in blob:
             return ("403 on storage — the DEPLOY identity needs 'Storage Blob Data "
@@ -487,6 +856,131 @@ def _azure_error_hint(exc: Exception) -> str:
     return ""
 
 
+def _source_file_checks(spec: PipelineSpec) -> list:
+    """Read-only check that concrete Copy source files exist before deploy.
+
+    A 403 is non-blocking because many setups let the app deploy ADF while the
+    ADF managed identity owns the data-plane read. A real 404/missing file is
+    blocked early instead of five minutes into an ADF run.
+    """
+    if mock_mode():
+        return [{"name": "source_files", "passed": True, "detail": "MOCK=true"}]
+    from config import AzureConfig, get_blob_service_client, get_datalake_client, storage_kind
+
+    cfg = AzureConfig.from_env()
+    ds_by_name = {d.name: d for d in spec.datasets}
+    source_names = {
+        act.source_dataset
+        for pl in spec.pipelines
+        for act in pl.activities
+        if act.type == "Copy" and act.source_dataset
+    }
+    checks = []
+    blob_service = None
+    datalake_service = None
+    for name in sorted(source_names):
+        ds = ds_by_name.get(name)
+        loc = ds.location if ds else None
+        if loc is None or not loc.container or not loc.file_name:
+            continue
+        path = "/".join(p.strip("/") for p in (loc.folder, loc.file_name) if p)
+        try:
+            if storage_kind() == "blob":
+                blob_service = blob_service or get_blob_service_client(cfg)
+                blob_service.get_blob_client(loc.container, path).get_blob_properties()
+            else:
+                datalake_service = datalake_service or get_datalake_client(cfg)
+                (
+                    datalake_service
+                    .get_file_system_client(loc.container)
+                    .get_file_client(path)
+                    .get_file_properties()
+                )
+            checks.append({
+                "name": f"source_file:{name}",
+                "passed": True,
+                "detail": f"{loc.container}/{path}",
+            })
+        except Exception as exc:  # noqa: BLE001
+            blob = f"{exc}".lower()
+            if "403" in blob or "authorizationpermissionmismatch" in blob:
+                checks.append({
+                    "name": f"source_file:{name}",
+                    "passed": True,
+                    "detail": f"could not verify with deploy identity: {type(exc).__name__}",
+                })
+            else:
+                checks.append({
+                    "name": f"source_file:{name}",
+                    "passed": False,
+                    "detail": f"{loc.container}/{path}: {type(exc).__name__}: {exc}",
+                })
+    return checks or [{"name": "source_files", "passed": True, "detail": "no concrete file sources"}]
+
+
+def _source_schema_checks(spec: PipelineSpec) -> list:
+    """Declared dataflow source columns vs the REAL landing file header.
+
+    Preflight/typecheck validate the spec against its OWN schema — if that
+    schema was model-invented (file not yet uploaded when the plan was made),
+    every offline check passes and the run dies ~5 minutes in with DF-EXPR-010
+    'Column X used in expression is unavailable or invalid'. Approval is the
+    moment the file MUST exist, so it is the last cheap place to compare.
+
+    Each dataflow reads a bronze dataset that a Copy fills from landing; the
+    copy is byte-for-byte, so the landing CSV header IS the flow's real input
+    schema. Skips non-CSV/URL/Delta sources and unreadable files (existence is
+    _source_file_checks' job) — this only ever blocks on a PROVEN mismatch.
+    """
+    if mock_mode():
+        return []
+    from agent.grounding import _header_columns, _read_head
+
+    ds_by_name = {d.name: d for d in spec.datasets}
+    landing_for = {
+        act.sink_dataset: act.source_dataset
+        for pl in spec.pipelines
+        for act in pl.activities
+        if act.type == "Copy" and act.source_dataset and act.sink_dataset
+    }
+    checks = []
+    for df in spec.dataflows:
+        declared = [c.name for c in df.source_columns]
+        if not declared:
+            continue
+        ds = ds_by_name.get(landing_for.get(df.source.dataset, ""))
+        loc = ds.location if ds else None
+        if (
+            loc is None or not loc.container or not loc.file_name
+            or not loc.file_name.lower().endswith(".csv")
+            or (ds.relative_url or "").strip()
+        ):
+            continue
+        path = "/".join(p.strip("/") for p in (loc.folder, loc.file_name) if p)
+        head = _read_head(loc.container, path)
+        real = set(_header_columns(head)) if head else set()
+        if not real:
+            continue
+        missing = [c for c in declared if c not in real]
+        if missing:
+            checks.append({
+                "name": f"source_schema:{df.name}",
+                "passed": False,
+                "detail": (
+                    f"flow expects column(s) {missing} that {loc.container}/{path} "
+                    f"does not have (real header: {sorted(real)}) — re-plan against "
+                    "the uploaded file or fix the file"
+                ),
+            })
+        else:
+            checks.append({
+                "name": f"source_schema:{df.name}",
+                "passed": True,
+                "detail": f"{len(declared)} column(s) verified in {loc.container}/{path}",
+            })
+    return checks
+
+
 def _deploy_and_run(run_id: str) -> None:
     from agent.deployer import deploy_artifacts, provision_containers
     from agent.validator import execute
@@ -500,13 +994,36 @@ def _deploy_and_run(run_id: str) -> None:
 
     def on_update(rec: Dict[str, Any]) -> None:
         run["run"] = rec
+        _persist_run(run_id)
 
     heals: list = []
     try:
+        # GROUND_PLAN=false keeps the plan phase fully offline, so the schemas
+        # are grounded HERE instead — still before any write, and the artifacts
+        # are rebuilt from the grounded spec so what deploys is what was checked.
+        if not _ground_during_plan():
+            run["status"] = "GROUNDING"
+            _persist_run(run_id)
+            try:
+                from agent.grounding import ground_spec
+
+                ground_spec(spec)
+                run["spec"] = spec.model_dump(mode="json")
+                builder.write_artifacts(spec, run_id)
+            except Exception:  # noqa: BLE001 — best-effort, same contract as /plan
+                pass
+
+        # The deploy + run create files grounding may have cached as absent.
+        from agent.grounding import clear_caches
+
+        clear_caches()
+
         run["status"] = "PROVISIONING"
+        _persist_run(run_id)
         run["containers_created"] = provision_containers(containers)
 
         run["status"] = "DEPLOYING"
+        _persist_run(run_id)
         run["deployed"] = deploy_artifacts(run["run_dir"])
         heals += list(getattr(deploy_artifacts, "last_heals", []) or [])
         # Verification: intended vs actual factory contents + what prune did.
@@ -514,6 +1031,9 @@ def _deploy_and_run(run_id: str) -> None:
             "intended_counts": getattr(deploy_artifacts, "last_intended_counts", {}),
             "factory_counts": getattr(deploy_artifacts, "last_factory_counts", None),
             "pruned": getattr(deploy_artifacts, "last_pruned", []),
+            # Stale agent-created objects found but NOT deleted (prune is off by
+            # default — the agent never deletes Azure objects on its own).
+            "stale": getattr(deploy_artifacts, "last_stale", []),
             "prune_error": getattr(deploy_artifacts, "last_prune_error", None),
         }
 
@@ -523,6 +1043,7 @@ def _deploy_and_run(run_id: str) -> None:
             return
 
         run["status"] = "RUNNING"
+        _persist_run(run_id)
         report = execute(run["run_dir"], on_update=on_update, stop_event=stop_event)
         run["report"] = report
         # Collect any runtime artifact fixes from the self-heal loop.
@@ -551,20 +1072,36 @@ def _deploy_and_run(run_id: str) -> None:
                 run["heal_log"] = log
         except Exception:  # noqa: BLE001 — audit must not break status
             pass
+        _persist_run(run_id)
 
 
 @app.post("/approve")
 def approve(req: ApproveRequest, background: BackgroundTasks) -> Dict[str, Any]:
-    run = _RUNS.get(req.run_id)
+    run = _get_run(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    if run["status"] not in {"AWAITING_APPROVAL"}:
+    # INTERRUPTED = a restart killed the in-flight background task; deploys are
+    # idempotent, so re-approval is the recovery path.
+    if run["status"] not in {"AWAITING_APPROVAL", "INTERRUPTED"}:
         raise HTTPException(status_code=409, detail=f"Run is '{run['status']}', not approvable")
     # Gate: must have been previewed AND pre-flight must pass.
     if not run.get("previewed"):
         raise HTTPException(status_code=409, detail="Preview the plan before approving.")
     if not run.get("preflight", {}).get("passed"):
         raise HTTPException(status_code=409, detail="Pre-flight failed — cannot approve.")
+    # Gate: BRD requirements the system could NOT build need an explicit waiver —
+    # a known-incomplete pipeline must never deploy on a routine click.
+    unsupported = (run.get("spec") or {}).get("unsupported") or []
+    if unsupported and not req.acknowledge_unsupported:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "This plan has requirements that were NOT built. "
+                           "Re-approve with acknowledge_unsupported=true to "
+                           "deploy anyway.",
+                "unsupported": unsupported,
+            },
+        )
     # Real deploys need a target — fail here with a clear message, not mid-deploy.
     if not mock_mode():
         missing = [
@@ -579,8 +1116,48 @@ def approve(req: ApproveRequest, background: BackgroundTasks) -> Dict[str, Any]:
                        f"panel first (missing: {', '.join(missing)}).",
             )
 
+        azure_test = test_azure_config()
+        if not azure_test.get("ok"):
+            failed = [
+                f"{c['name']}: {c.get('detail', '')}"
+                for c in azure_test.get("checks", [])
+                if not c.get("passed")
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail="Azure target check failed before deploy: " + "; ".join(failed),
+            )
+        spec_for_checks = PipelineSpec.model_validate(run["spec"])
+        source_checks = _source_file_checks(spec_for_checks)
+        failed_sources = [
+            f"{c['name']}: {c.get('detail', '')}"
+            for c in source_checks
+            if not c.get("passed")
+        ]
+        if failed_sources:
+            raise HTTPException(
+                status_code=409,
+                detail="Source file check failed before deploy: " + "; ".join(failed_sources),
+            )
+        # The landing file may have been uploaded AFTER planning — drop the
+        # memoized "file absent" heads so the schema check reads fresh bytes.
+        from agent.grounding import clear_caches
+
+        clear_caches()
+        failed_schemas = [
+            f"{c['name']}: {c.get('detail', '')}"
+            for c in _source_schema_checks(spec_for_checks)
+            if not c.get("passed")
+        ]
+        if failed_schemas:
+            raise HTTPException(
+                status_code=409,
+                detail="Source schema check failed before deploy: " + "; ".join(failed_schemas),
+            )
+
     run["status"] = "APPROVED"
     run["_stop_event"] = threading.Event()
+    _persist_run(req.run_id)
     background.add_task(_deploy_and_run, req.run_id)
     return {"run_id": req.run_id, "status": "APPROVED", "mock": mock_mode()}
 
@@ -589,7 +1166,7 @@ def approve(req: ApproveRequest, background: BackgroundTasks) -> Dict[str, Any]:
 def stop(run_id: str) -> Dict[str, Any]:
     """Abort a live run: stop the self-heal loop and cancel the in-flight ADF
     pipeline run (recursively, so child ExecutePipeline runs die too)."""
-    run = _RUNS.get(run_id)
+    run = _get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
     event = run.get("_stop_event")
@@ -606,7 +1183,7 @@ def stop(run_id: str) -> Dict[str, Any]:
 
 @app.get("/status/{run_id}")
 def status(run_id: str) -> Dict[str, Any]:
-    run = _RUNS.get(run_id)
+    run = _get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Unknown run_id")
     keep = (
