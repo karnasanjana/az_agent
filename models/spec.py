@@ -2,7 +2,7 @@
 
 This is the ONE source of truth the whole system agrees on. The LLM (via
 Pydantic AI) must return a validated ``PipelineSpec`` instance; the deterministic
-builder, review, preflight, graph, and deployer all consume the same object.
+builder, review, preflight, and deployer all consume the same object.
 Nothing downstream parses free text.
 
 The spec is BRD-driven and source-agnostic: HTTP file, Azure Blob/ADLS, and a
@@ -230,6 +230,11 @@ _OP_FN = {
     "length": "length",
     "substring": "substring",
     "replace": "replace",
+    "regexreplace": "regexReplace",
+    "regexmatch": "regexMatch",
+    "rlike": "rlike",
+    "startswith": "startsWith",
+    "endswith": "endsWith",
     "concat": "concat",
     "coalesce": "coalesce",
     "count": "count",
@@ -266,6 +271,19 @@ _OP_NOARG = {"rownumber", "rank", "denserank"}
 # concat(upper(left(col,1)), lower(substring(col,2))) — first letter upper, rest
 # lower. (Chain a `trim` op first when the column may carry whitespace.)
 _OP_PROPER = {"proper", "propercase", "initcap", "titlecase", "title"}
+# Quarter: the DSL has no quarter() function (its date parts stop at year/month/
+# week/day), so CODE renders floor((month(col) - 1) / 3) + 1 -> 1..4.
+_OP_QUARTER = {"quarter"}
+# Common BRD cleansing words that are easier and safer as named operations than
+# as model-authored raw expressions.
+_OP_REMOVE_SPECIAL = {
+    "removespecialcharacters", "removespecialchars", "stripspecialcharacters",
+    "stripspecialchars", "alphanumeric", "onlyalphanumeric",
+}
+_OP_BLANK_DEFAULT = {
+    "replaceempty", "replaceblank", "emptytodefault", "blanktodefault",
+    "emptystringtodefault", "replaceemptystring", "replaceblankstring",
+}
 # Arithmetic: operands are the column plus args; each operand may be ANOTHER
 # COLUMN NAME or a numeric literal — rendered infix, e.g. multiply(quantity,
 # [list_price]) -> (quantity * list_price). This unlocks derived measures like
@@ -280,6 +298,22 @@ _OP_ARITH = {
 
 def _norm_op(op: str) -> str:
     return re.sub(r"[^a-z]", "", (op or "").lower())
+
+
+_DSL_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def dsl_name(name: str) -> str:
+    """A column reference in data-flow script. Names that aren't plain
+    identifiers ('Country Name', 'unit-price') must be brace-escaped
+    ({Country Name}) or the Spark broker rejects the script at runtime
+    (population.csv run: DFExecutorUserError on a spaced groupBy column)."""
+    s = (name or "").strip()
+    if _DSL_IDENT.fullmatch(s) or (s.startswith("{") and s.endswith("}")):
+        return s
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return s  # numeric literal (arithmetic's first operand can be "1")
+    return "{" + s + "}"
 
 
 def _render_literal(value: str) -> str:
@@ -303,36 +337,83 @@ def _render_operand(value: str) -> str:
     s = str(value).strip()
     if re.fullmatch(r"[A-Za-z_]\w*", s):
         return s  # column reference
+    if s.startswith("{") and s.endswith("}"):
+        return s  # already brace-escaped column reference
     return _render_literal(s)
 
 
 def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
-    """Render {op, column, args} to a DSL expression; None when op is unknown."""
+    """Render {op, column, args} to a DSL expression; None when op is unknown.
+    The `column` field is always a COLUMN REFERENCE — brace-escaped when the
+    name isn't a plain identifier ('Country Name' -> {Country Name})."""
     key = _norm_op(op)
+    col = dsl_name(column) if column else column
     if key in _OP_IDENTITY:
-        return column or None
+        return col or None
     if key in _OP_NOARG:
         return f"{_OP_FN[key]}()"
     if key in _OP_PROPER:
-        if not column:
+        if not col:
             return None
-        return f"concat(upper(left({column}, 1)), lower(substring({column}, 2)))"
+        return f"concat(upper(left({col}, 1)), lower(substring({col}, 2)))"
+    if key in _OP_QUARTER:
+        if not col:
+            return None
+        return f"(floor((month({col}) - 1) / 3) + 1)"
+    if key in _OP_REMOVE_SPECIAL:
+        if not col:
+            return None
+        replacement = args[0] if args else ""
+        return f"regexReplace({col}, '[^A-Za-z0-9 ]', {_render_literal(replacement)})"
+    if key in _OP_BLANK_DEFAULT:
+        if not col or not args:
+            return None
+        default = _render_literal(args[0])
+        return f"iif(isNull({col}) || trim({col}) == '', {default}, {col})"
     if key in _OP_ARITH:
-        operands = ([column] if column else []) + [str(a) for a in args]
+        operands = ([col] if col else []) + [str(a) for a in args]
         if len(operands) < 2:
             return None  # arithmetic needs at least two operands
         sym = _OP_ARITH[key]
         return "(" + f" {sym} ".join(_render_operand(o) for o in operands) + ")"
+    if key == "concat":
+        # concat args may be COLUMN NAMES or pre-quoted literals ("' '").
+        # Rendering bare identifiers through _render_literal turned the column
+        # last_name into the string 'last_name' — every CustomerName came out
+        # "John last_name" (bike-store run). Same operand rule as arithmetic.
+        parts = ([col] if col else []) + [_render_operand(str(a)) for a in args]
+        if not parts:
+            return None
+        return f"concat({', '.join(parts)})"
     fn = _OP_FN.get(key)
     if fn is None:
         return None
-    parts = ([column] if column else []) + [_render_literal(a) for a in args]
+    parts = ([col] if col else []) + [_render_literal(a) for a in args]
     return f"{fn}({', '.join(parts)})"
 
 
 _PRED_CMP = {"eq": "==", "ne": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
 _PRED_NOT_NULL = {"notnull", "isnotnull", "notempty", "exists"}
 _PRED_NULL = {"null", "isnull", "missing"}
+_PRED_LIKE = {"like", "notlike"}
+_PRED_REGEX = {"regex", "regexmatch", "rlike", "matches", "notregex", "notrlike"}
+_PRED_IN = {"in", "notin"}
+_PRED_BETWEEN = {"between", "notbetween"}
+
+
+def _split_predicate_values(value: "str | None") -> List[str]:
+    """Split a BRD/tool value such as "A,B,C", "A|B|C", or "[A, B, C]".
+
+    This is intentionally simple: the LogicalPlan layer carries strings, not a
+    full expression AST, and these values are business literals in normal BRDs.
+    """
+    if value is None:
+        return []
+    s = str(value).strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    sep = "|" if "|" in s else ","
+    return [p.strip().strip("'\"") for p in s.split(sep) if p.strip()]
 
 
 class Predicate(BaseModel):
@@ -344,14 +425,36 @@ class Predicate(BaseModel):
 
     def render(self) -> "str | None":
         key = _norm_op(self.op)
+        col = dsl_name(self.column)
         if key in _PRED_NOT_NULL:
-            return f"!isNull({self.column})"
+            return f"!isNull({col})"
         if key in _PRED_NULL:
-            return f"isNull({self.column})"
+            return f"isNull({col})"
         cmp = _PRED_CMP.get(key)
+        if cmp is not None and self.value is not None:
+            return f"{col} {cmp} {_render_literal(self.value)}"
+        if key in _PRED_LIKE and self.value is not None:
+            expr = f"like({col}, {_render_literal(self.value)})"
+            return f"!({expr})" if key == "notlike" else expr
+        if key in _PRED_REGEX and self.value is not None:
+            fn = "rlike" if key in {"rlike", "notrlike"} else "regexMatch"
+            expr = f"{fn}({col}, {_render_literal(self.value)})"
+            return f"!({expr})" if key in {"notregex", "notrlike"} else expr
+        if key in _PRED_IN and self.value is not None:
+            values = ", ".join(_render_literal(v) for v in _split_predicate_values(self.value))
+            if not values:
+                return None
+            expr = f"in([{values}], {col})"
+            return f"!({expr})" if key == "notin" else expr
+        if key in _PRED_BETWEEN and self.value is not None:
+            values = _split_predicate_values(self.value)
+            if len(values) != 2:
+                return None
+            expr = f"between({col}, {_render_literal(values[0])}, {_render_literal(values[1])})"
+            return f"!({expr})" if key == "notbetween" else expr
         if cmp is None or self.value is None:
             return None
-        return f"{self.column} {cmp} {_render_literal(self.value)}"
+        return f"{col} {cmp} {_render_literal(self.value)}"
 
 
 class DerivedColumn(BaseModel):
@@ -445,7 +548,7 @@ class Transform(BaseModel):
     # customers" = sort desc + limit(take=10). NOT a native ADF transform (the
     # broker rejects `limit(` with DF-FLO-005 'not registered', run
     # flow_gold_top_customers) — the builder lowers it to rank(<sort keys>) +
-    # filter(__rowRank <= take) + select-drop. Keep using this kind in plans;
+    # filter(xRowRank <= take) + select-drop. Keep using this kind in plans;
     # never hand-roll the rank/window pattern yourself.
     take: Optional[int] = None
     skip: int = 0
@@ -469,8 +572,8 @@ class Transform(BaseModel):
                     + "; ".join(
                         f"op='{p.op}' column='{p.column}' value={p.value!r}" for p in bad
                     )
-                    + " — op must be one of not_null|null|eq|ne|gt|ge|lt|le, "
-                    "and comparison ops require a value"
+                    + " — op must be one of not_null|null|eq|ne|gt|ge|lt|le|"
+                    "like|regex|in|between, and value-based ops require a value"
                 )
             self.condition = " && ".join(clauses)  # type: ignore[arg-type]
         for c in self.columns:

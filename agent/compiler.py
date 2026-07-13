@@ -84,11 +84,100 @@ def _server_token(server: str) -> str:
 
 
 # LogicalColumn.type -> ADF data-flow cast function.
+# Delta rejects these characters in column names with DF-SINK-005
+# ("Column name(s) [Country Name] are invalid for delta format").
+_DELTA_UNSAFE = re.compile(r"[ ,;{}()=\n\t]")
+
+
+def _delta_safe(name: str) -> str:
+    s = _DELTA_UNSAFE.sub("_", name or "")
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "col"
+
+
+def _sanitize_delta_columns(plan: LogicalPlan):
+    """Silver/Gold sink as Delta, and Delta forbids spaces & co in column
+    names — grounded CSV headers like 'Country Name' must be renamed before
+    the sink. Returns (plan-copy with every reference renamed, rename map,
+    original per-entity columns). The silver flow keeps the ORIGINAL names in
+    its source projection (they must match the file header) and renames via a
+    select right after the source."""
+    rename: Dict[str, str] = {}
+    original: Dict[str, list] = {}
+    for s in plan.sources:
+        original[s.entity] = [c.model_copy() for c in s.columns]
+        taken = {c.name for c in s.columns}
+        for c in s.columns:
+            if _DELTA_UNSAFE.search(c.name):
+                safe = _delta_safe(c.name)
+                while safe in taken or safe in rename.values():
+                    safe += "_c"
+                rename[c.name] = safe
+    if not rename:
+        return plan, rename, original
+
+    plan = plan.model_copy(deep=True)
+
+    def fix(n: str) -> str:
+        return rename.get(n, n)
+
+    for s in plan.sources:
+        for c in s.columns:
+            c.name = fix(c.name)
+    for t in plan.transforms:
+        for c in t.casts:
+            c.name = fix(c.name)
+        for op in t.cleaning:
+            if op.column:
+                op.column = fix(op.column)
+            if op.new_column:
+                op.new_column = fix(op.new_column)
+            op.args = [rename.get(a, a) for a in op.args]
+        for f in t.filters:
+            f.column = fix(f.column)
+        t.dedup_keys = [fix(k) for k in t.dedup_keys]
+    for out in plan.outputs:
+        for j in out.joins:
+            j.left_keys = [fix(k) for k in j.left_keys]
+            j.right_keys = [fix(k) for k in j.right_keys]
+        out.group_by = [fix(g) for g in out.group_by]
+        for a in out.aggregations:
+            a.column = fix(a.column)
+        for srt in out.sort:
+            srt.column = fix(srt.column)
+        for f in out.filters:
+            f.column = fix(f.column)
+        for d in list(out.derived) + list(out.post_agg_derived):
+            if d.column:
+                d.column = fix(d.column)
+            d.args = [rename.get(a, a) for a in d.args]
+        out.columns = [fix(c) for c in out.columns]
+    return plan, rename, original
+
+
+def _sanitize_select(original_cols, current_cols) -> Transform:
+    """select() right after the silver source: maps every ORIGINAL (header)
+    name to its Delta-safe name; unchanged columns map to themselves."""
+    from models.spec import DerivedColumn, dsl_name
+
+    return Transform(
+        kind=TransformKind.select,
+        name="sanitizeNames",
+        columns=[
+            DerivedColumn(name=cur.name, expression=dsl_name(orig.name))
+            for orig, cur in zip(original_cols, current_cols)
+        ],
+    )
+
+
 def _cast_expression(col: LogicalColumn) -> str:
+    from models.spec import dsl_name
+
+    name = dsl_name(col.name)
     t = (col.type or "string").strip().lower()
     m = re.fullmatch(r"decimal\((\d+)\s*,\s*(\d+)\)", t)
     if m:
-        return f"toDecimal({col.name}, {m.group(1)}, {m.group(2)})"
+        return f"toDecimal({name}, {m.group(1)}, {m.group(2)})"
     fn = {
         "integer": "toInteger",
         "int": "toInteger",
@@ -104,13 +193,15 @@ def _cast_expression(col: LogicalColumn) -> str:
         "datetime": "toTimestamp",
         "string": "toString",
     }.get(t, "toString")
-    return f"{fn}({col.name})"
+    return f"{fn}({name})"
 
 
 _DS_KIND_BY_FORMAT = {
     SourceFormat.csv: DatasetKind.delimited_text,
+    SourceFormat.text: DatasetKind.delimited_text,
     SourceFormat.parquet: DatasetKind.parquet,
     SourceFormat.json: DatasetKind.json,
+    SourceFormat.binary: DatasetKind.binary,
     SourceFormat.http_csv: DatasetKind.delimited_text,
     SourceFormat.sql_table: DatasetKind.azure_sql_table,
 }
@@ -122,9 +213,18 @@ _DS_KIND_BY_FORMAT = {
 
 
 def compile_plan(plan: LogicalPlan) -> PipelineSpec:
+    # Delta-safe column names first: every downstream reference sees the safe
+    # names; the silver source projection keeps the file's original header.
+    plan, _delta_renames, _original_cols = _sanitize_delta_columns(plan)
+
     project = plan.project
     src_by_entity: Dict[str, LogicalSource] = {s.entity: s for s in plan.sources}
     xf_by_entity: Dict[str, EntityTransform] = {t.entity: t for t in plan.transforms}
+    # Layer sink containers — the BRD's names when it gives them ("copy into
+    # the raw container"), medallion defaults otherwise.
+    c_bronze, c_silver, c_gold = (
+        plan.containers.bronze, plan.containers.silver, plan.containers.gold
+    )
 
     linked_services: List[LinkedService] = []
     datasets: List[Dataset] = []
@@ -190,16 +290,28 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
         bronze_name = f"ds_bronze_{ent}"
         bronze_ds[ent] = bronze_name
 
-        if s.format in (SourceFormat.csv, SourceFormat.parquet, SourceFormat.json):
+        if s.format in (
+            SourceFormat.csv,
+            SourceFormat.text,
+            SourceFormat.parquet,
+            SourceFormat.json,
+            SourceFormat.binary,
+        ):
             container = s.container or "landing"
             if container == "landing":
                 used_landing_container = True
+            # Models routinely echo the container into the folder ("in landing"
+            # -> container=landing, folder=landing) which doubles the path to
+            # landing/landing/<file> and fails the source-file gate.
+            folder = (s.folder or "").strip().strip("/")
+            if folder.lower() == container.lower():
+                folder = ""
             landing = Dataset(
                 name=landing_name,
                 kind=kind,
                 linked_service=STORAGE_LS,
                 location=DatasetLocation(
-                    container=container, folder=s.folder, file_name=s.file_name
+                    container=container, folder=folder or None, file_name=s.file_name
                 ),
                 columns=cols,
             )
@@ -226,21 +338,33 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
             bronze_file = f"{ent}.csv"
 
         bronze_kind = (
-            kind if s.format in (SourceFormat.csv, SourceFormat.parquet, SourceFormat.json)
+            kind if s.format in (
+                SourceFormat.csv,
+                SourceFormat.text,
+                SourceFormat.parquet,
+                SourceFormat.json,
+                SourceFormat.binary,
+            )
             else DatasetKind.delimited_text
         )
         bronze = Dataset(
             name=bronze_name,
             kind=bronze_kind,
             linked_service=STORAGE_LS,
-            location=DatasetLocation(container="bronze", folder=ent, file_name=bronze_file),
+            location=DatasetLocation(container=c_bronze, folder=ent, file_name=bronze_file),
             columns=cols,
         )
         datasets.extend([landing, bronze])
 
         copy_deps: List[str] = []
         if s.validate_first:
-            if s.format in (SourceFormat.csv, SourceFormat.parquet, SourceFormat.json):
+            if s.format in (
+                SourceFormat.csv,
+                SourceFormat.text,
+                SourceFormat.parquet,
+                SourceFormat.json,
+                SourceFormat.binary,
+            ):
                 # Validation gate: waits for the landing file to exist AND have
                 # >= 1 byte; on timeout it FAILS, blocking this copy and every
                 # activity downstream of it (silver/gold via dependsOn).
@@ -288,12 +412,29 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                 name=silver_name,
                 kind=DatasetKind.delta,
                 linked_service=STORAGE_LS,
-                location=DatasetLocation(container="silver", folder=ent),
+                location=DatasetLocation(container=c_silver, folder=ent),
             )
         )
 
         transforms = _silver_transforms(xf, src_by_entity[ent].columns)
-        src_cols = [Column(name=c.name, type=c.type) for c in src_by_entity[ent].columns]
+        cur_cols = src_by_entity[ent].columns
+        orig_cols = _original_cols.get(ent) or cur_cols
+        entity_renamed = [o.name for o in orig_cols] != [c.name for c in cur_cols]
+        if entity_renamed:
+            # Source projection must match the FILE header; rename to the
+            # Delta-safe names immediately after the source.
+            transforms.insert(0, _sanitize_select(orig_cols, cur_cols))
+            for orig, cur in zip(orig_cols, cur_cols):
+                if orig.name != cur.name:
+                    assumptions.append(
+                        f"'{ent}': column '{orig.name}' renamed to "
+                        f"'{cur.name}' (Delta forbids spaces/special "
+                        "characters in column names)"
+                    )
+        src_cols = [
+            Column(name=o.name, type=c.type)
+            for o, c in zip(orig_cols, cur_cols)
+        ] if entity_renamed else [Column(name=c.name, type=c.type) for c in cur_cols]
         dataflows.append(
             DataFlow(
                 name=f"df_silver_{ent}",
@@ -332,10 +473,19 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                     name=silver_name,
                     kind=DatasetKind.delta,
                     linked_service=STORAGE_LS,
-                    location=DatasetLocation(container="silver", folder=ent),
+                    location=DatasetLocation(container=c_silver, folder=ent),
                 )
             )
-            src_cols = [Column(name=c.name, type=c.type) for c in src_by_entity[ent].columns]
+            cur_cols = src_by_entity[ent].columns
+            orig_cols = _original_cols.get(ent) or cur_cols
+            entity_renamed = [o.name for o in orig_cols] != [c.name for c in cur_cols]
+            pass_transforms = (
+                [_sanitize_select(orig_cols, cur_cols)] if entity_renamed else []
+            )
+            src_cols = [
+                Column(name=o.name, type=c.type)
+                for o, c in zip(orig_cols, cur_cols)
+            ] if entity_renamed else [Column(name=c.name, type=c.type) for c in cur_cols]
             dataflows.append(
                 DataFlow(
                     name=f"df_silver_{ent}",
@@ -343,7 +493,7 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                     source=DataFlowEndpoint(stream_name=f"src{camel}", dataset=bronze_ds[ent]),
                     sink=DataFlowEndpoint(stream_name=f"sink{camel}", dataset=silver_name),
                     source_columns=src_cols,
-                    transforms=[],
+                    transforms=pass_transforms,
                 )
             )
             silver_acts.append(
@@ -402,7 +552,7 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
             "parquet": DatasetKind.parquet,
         }[out.format.value]
         gold_loc = DatasetLocation(
-            container="gold",
+            container=c_gold,
             folder=out.name,
             file_name=f"{out.name}.csv" if out.format.value == "csv" else None,
         )
@@ -561,9 +711,14 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
     # ------------------------------------------------------------------ #
     # Storage + assumptions + capability contract
     # ------------------------------------------------------------------ #
-    containers = ["bronze", "silver", "gold"]
+    containers = [c_bronze, c_silver, c_gold]
     if used_landing_container:
         containers = ["landing"] + containers
+    if plan.containers != type(plan.containers)():  # BRD named its own containers
+        assumptions.append(
+            "Layer containers from the BRD: bronze -> "
+            f"'{c_bronze}', silver -> '{c_silver}', gold -> '{c_gold}'"
+        )
     account = os.environ.get("ADLS_ACCOUNT_NAME", "storage")
 
     for line in plan.unsupported:
@@ -822,11 +977,19 @@ def _silver_transforms(
     return transforms
 
 
+# ADF data-flow script joinType values — the DSL takes [outer,left,cross,
+# inner,right], NOT the SQL names (DF-ARG-005 "Join type should be one of
+# [outer,left,cross,inner,right]", stress BRD 10: 'left_outer' rejected).
 _JOIN_TYPE = {
     "inner": "inner",
-    "left": "left_outer",
-    "right": "right_outer",
-    "full": "full_outer",
+    "left": "left",
+    "left_outer": "left",
+    "right": "right",
+    "right_outer": "right",
+    "full": "outer",
+    "full_outer": "outer",
+    "outer": "outer",
+    "cross": "cross",
 }
 
 
@@ -846,10 +1009,20 @@ def _gold_transforms(
     for i, j in enumerate(out.joins):
         left_stream = f"src{_camel(j.left_entity)}"
         right_stream = f"src{_camel(j.right_entity)}"
+        from models.spec import dsl_name
+
         cond = " && ".join(
-            f"{left_stream}@{lk} == {right_stream}@{rk}"
+            f"{left_stream}@{dsl_name(lk)} == {right_stream}@{dsl_name(rk)}"
             for lk, rk in zip(j.left_keys, j.right_keys)
         )
+        if not cond:
+            # Defense in depth: completeness flags keyless joins for repair;
+            # an empty condition compiled to `join()` and failed at runtime
+            # with DF-ARG-005 (stress BRD 10) — never emit it.
+            raise ValueError(
+                f"output {out.name}: join {j.left_entity} -> {j.right_entity} "
+                "has no key columns"
+            )
         transforms.append(
             Transform(
                 kind=TransformKind.join,

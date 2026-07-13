@@ -129,8 +129,10 @@ def test_top_n_renders_rank_not_limit():
     script = builder.build_dataflow_script(gold, datasets)
     assert "limit(" not in script
     assert "rank(desc(total_amount)" in script  # keys from the preceding sort
-    assert "__rowRank <= 10" in script
-    assert "match(name != '__rowRank')" in script
+    assert "xRowRank <= 10" in script
+    assert "match(name != 'xRowRank')" in script
+    # DF-DSL-001: ADF rejects identifiers starting with double underscore
+    assert "__" not in script
     assert "~> limitRows\n" in script or script.rstrip().endswith("~> limitRows") \
         or "limitRows sink(" in script
 
@@ -256,6 +258,43 @@ def test_gold_date_part_grouping(monkeypatch):
     assert "year(order_purchase_timestamp)" in exprs
     assert "month(order_purchase_timestamp)" in exprs
     run_id = "test_gold_dateparts"
+    run_dir = builder.artifacts_dir(run_id)
+    try:
+        builder.write_artifacts(spec, run_id)
+        assert preflight.validate(run_id)["passed"]
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def test_gold_quarter_grouping(monkeypatch):
+    """OrderQuarter from a timestamp: ADF's DSL has no quarter() function, so
+    the op renders the floor((month-1)/3)+1 composite — not marked unsupported
+    (the bike-store BRD gap)."""
+    monkeypatch.setenv("MOCK", "true")
+    plan = LogicalPlan(
+        project="bike_store",
+        sources=[
+            LogicalSource(entity="orders", format="csv", file_name="o.csv",
+                          columns=[LogicalColumn(name="order_id"),
+                                   LogicalColumn(name="order_date"),
+                                   LogicalColumn(name="amount", type="decimal(18,2)")]),
+        ],
+        transforms=[EntityTransform(entity="orders",
+                                    casts=[LogicalColumn(name="order_date", type="timestamp")])],
+        outputs=[OutputPlan(
+            name="quarterly_sales",
+            from_entities=["orders"],
+            derived=[CleaningOp(op="year", column="order_date", new_column="order_year"),
+                     CleaningOp(op="quarter", column="order_date", new_column="order_quarter")],
+            group_by=["order_year", "order_quarter"],
+            aggregations=[AggregationPlan(name="revenue", op="sum", column="amount")],
+        )],
+    )
+    spec = compile_plan(plan)
+    gold = next(df for df in spec.dataflows if df.name == "df_gold_quarterly_sales")
+    exprs = [c.expression for t in gold.transforms for c in t.columns]
+    assert "(floor((month(order_date) - 1) / 3) + 1)" in exprs
+    run_id = "test_gold_quarter"
     run_dir = builder.artifacts_dir(run_id)
     try:
         builder.write_artifacts(spec, run_id)

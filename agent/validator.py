@@ -1,9 +1,8 @@
 """Validator: trigger the master pipeline, poll live ADF state, surface results.
 
-v1 policy is FAIL-LOUD: on a failed run we stop and surface the error clearly in
-the UI. The Claude self-heal loop (patch failing artifact -> redeploy -> retry,
-cap 3) is OPT-IN behind SELF_HEAL=true, so it can be enabled once the real
-failure modes in a given tenant are understood.
+On a failed run we surface the error clearly in the UI. The self-heal loop
+(patch failing artifact -> redeploy -> retry, cap 3) is enabled by default and
+can be disabled with SELF_HEAL=false when a tenant needs fail-loud behavior.
 
 Per-layer status (Bronze -> Silver -> Gold) and run IDs are streamed back to the
 caller via an ``on_update`` callback so the UI can show progress live. MOCK mode
@@ -33,7 +32,7 @@ UpdateFn = Callable[[Dict[str, Any]], None]
 
 
 def self_heal_enabled() -> bool:
-    return os.environ.get("SELF_HEAL", "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("SELF_HEAL", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _noop(_: Dict[str, Any]) -> None:
@@ -263,7 +262,7 @@ def _run_mock(run_dir: str, on_update: UpdateFn) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Optional self-heal (OFF by default)
+# Optional self-heal (ON by default; SELF_HEAL=false disables it)
 # --------------------------------------------------------------------------- #
 
 
@@ -453,28 +452,12 @@ def _lint_healed(name: str, properties: Dict[str, Any]) -> List[str]:
     return lint_dataflow_script(name, "\n".join(lines))
 
 
-# Provider blips worth absorbing with a short backoff instead of killing the
-# whole self-heal loop (gemini-2.5-flash returned 503 UNAVAILABLE mid-heal and
-# the run died at attempt 1 with the ADF failure unhealed).
-_TRANSIENT_LLM_STATUSES = {408, 429, 500, 502, 503, 504}
-
-
 def _run_llm(agent: "Any", user_msg: str, tries: int = 3) -> "Any":
-    """agent.run_sync with exponential backoff on transient provider errors."""
-    import time
+    """agent.run_sync with exponential backoff on transient provider errors
+    (shared policy — see agent/retry.py)."""
+    from agent.retry import retry_sync
 
-    from pydantic_ai.exceptions import ModelHTTPError
-
-    delay = 5.0
-    for attempt in range(tries):
-        try:
-            return agent.run_sync(user_msg)
-        except ModelHTTPError as exc:
-            if exc.status_code not in _TRANSIENT_LLM_STATUSES or attempt == tries - 1:
-                raise
-            time.sleep(delay)
-            delay *= 2
-    raise RuntimeError("unreachable")
+    return retry_sync(lambda: agent.run_sync(user_msg), tries=tries)
 
 
 def heal_artifact(
@@ -562,11 +545,11 @@ def execute(
 ) -> Dict[str, Any]:
     """Run the master pipeline and report the outcome.
 
-    Default (v1): fail-loud — one run, surface the error. With SELF_HEAL=true and
-    a real backend, patch the failing artifact and retry up to RETRY_CAP. Retries
-    are ADF recovery reruns: layers that already succeeded (e.g. bronze) are
-    skipped and the run restarts at the failed activity. `stop_event` (a
-    threading.Event) aborts the loop and cancels the in-flight ADF run.
+    Default: self-heal is enabled. When SELF_HEAL=false, run once and surface
+    the error. With the default real backend, the app patches the failing
+    artifact and retries up to RETRY_CAP. Retries are ADF recovery reruns:
+    layers that already succeeded are skipped and the run restarts at the failed
+    activity. `stop_event` (a threading.Event) aborts the loop and cancels the in-flight ADF run.
     """
     on_update = on_update or _noop
     parameters = parameters or _default_params()
@@ -577,12 +560,12 @@ def execute(
 
     cfg = cfg or AzureConfig.from_env()
 
-    # Fail-loud single attempt (v1 default).
+    # Explicit fail-loud single attempt when SELF_HEAL=false.
     if not self_heal_enabled():
         report = _run_real(run_dir, cfg, parameters, on_update, stop_event=stop_event)
         return {"status": report["status"], "attempts": [report]}
 
-    # Opt-in self-heal loop.
+    # Self-heal loop.
     inventory = _artifact_inventory(run_dir)
     attempts: List[Dict[str, Any]] = []
     prev_run_id: Optional[str] = None

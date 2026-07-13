@@ -360,7 +360,7 @@ def _factory_counts_real(adf, cfg: AzureConfig) -> Dict[str, int]:
 def deploy_artifacts(run_dir: str, cfg: "AzureConfig | None" = None) -> List[str]:
     """Deploy every artifact in dependency order. Idempotent. MOCK-aware.
 
-    With SELF_HEAL=true, a deploy-time rejection (malformed ARM body) is sent back
+    With self-heal enabled (default), a deploy-time rejection (malformed ARM body) is sent back
     to Claude once to correct the artifact, then redeployed — the same heal loop
     used at runtime, applied at create_or_update time. Recorded fixes are exposed
     on ``deploy_artifacts.last_heals`` for the UI.

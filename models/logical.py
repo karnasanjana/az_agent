@@ -19,7 +19,16 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from models.spec import _OP_ARITH, _OP_FN, _OP_IDENTITY, _OP_PROPER, _norm_op
+from models.spec import (
+    _OP_ARITH,
+    _OP_BLANK_DEFAULT,
+    _OP_FN,
+    _OP_IDENTITY,
+    _OP_PROPER,
+    _OP_QUARTER,
+    _OP_REMOVE_SPECIAL,
+    _norm_op,
+)
 
 
 def _snake(v: str, *, field: str) -> str:
@@ -33,8 +42,10 @@ def _snake(v: str, *, field: str) -> str:
 
 class SourceFormat(str, Enum):
     csv = "csv"
+    text = "text"
     parquet = "parquet"
     json = "json"
+    binary = "binary"
     sql_table = "sql_table"
     http_csv = "http_csv"  # CSV fetched from a public HTTP(S) URL
 
@@ -161,10 +172,13 @@ class CleaningOp(BaseModel):
             and key not in _OP_IDENTITY
             and key not in _OP_ARITH
             and key not in _OP_PROPER
+            and key not in _OP_QUARTER
+            and key not in _OP_REMOVE_SPECIAL
+            and key not in _OP_BLANK_DEFAULT
         ):
             raise ValueError(
                 f"unknown op '{v}'. Allowed: "
-                f"{', '.join(sorted(set(_OP_FN) | set(_OP_ARITH) | {'proper'}))}, "
+                f"{', '.join(sorted(set(_OP_FN) | set(_OP_ARITH) | {'proper', 'quarter', 'remove_special_characters', 'replace_empty_string'}))}, "
                 "identity, case"
             )
         return v
@@ -191,6 +205,8 @@ class CleaningOp(BaseModel):
 _FILTER_OPS = {
     "notnull", "null", "eq", "ne", "gt", "ge", "lt", "le",
     "isnull", "isnotnull", "notempty", "exists", "missing",
+    "like", "notlike", "regex", "regexmatch", "rlike", "matches", "notregex", "notrlike",
+    "in", "notin", "between", "notbetween",
 }
 
 
@@ -212,7 +228,11 @@ class FilterRule(BaseModel):
         would silently become an EMPTY filter() and fail in Azure as EXE-0001
         'Dataflow cannot be analyzed as a graph'. Fail at extraction instead,
         where Pydantic AI feeds the error back and the model retries."""
-        if _norm_op(self.op) in {"eq", "ne", "gt", "ge", "lt", "le"} and (
+        if _norm_op(self.op) in {
+            "eq", "ne", "gt", "ge", "lt", "le", "like", "notlike", "regex",
+            "regexmatch", "rlike", "matches", "notregex", "notrlike", "in",
+            "notin", "between", "notbetween",
+        } and (
             self.value is None or not str(self.value).strip()
         ):
             raise ValueError(
@@ -322,6 +342,45 @@ class LogicalPipeline(BaseModel):
     invokes: List[str] = Field(default_factory=list)  # child pipeline names, in run order
 
 
+_AZ_CONTAINER = re.compile(r"[a-z0-9](?:[a-z0-9-]{1,61})[a-z0-9]")
+
+
+class ContainerPlan(BaseModel):
+    """WHERE each medallion layer lands — the BRD's container names ('copy into
+    the raw container', 'write gold to analytics'). Defaults to the medallion
+    convention; the compiler uses these names for every sink dataset and for
+    container provisioning."""
+
+    bronze: str = "bronze"
+    silver: str = "silver"
+    gold: str = "gold"
+
+    @field_validator("bronze", "silver", "gold")
+    @classmethod
+    def _azure_name(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if not _AZ_CONTAINER.fullmatch(s):
+            raise ValueError(
+                f"'{v}' is not a valid Azure container name (3-63 chars, "
+                "lowercase letters/digits/hyphens, starts and ends alphanumeric)"
+            )
+        return s
+
+
+class AzureTargetPlan(BaseModel):
+    """Deploy target NAMED BY THE BRD (resource group / factory / storage).
+    Advisory only: the UI pre-fills its Azure config from it and the USER
+    confirms — BRD text is untrusted input and never silently picks where the
+    agent deploys."""
+
+    resource_group: Optional[str] = None
+    factory_name: Optional[str] = None
+    storage_account: Optional[str] = None
+
+    def is_empty(self) -> bool:
+        return not (self.resource_group or self.factory_name or self.storage_account)
+
+
 class LogicalPlan(BaseModel):
     """Complete business description of the pipeline. NO ADF concepts."""
 
@@ -343,6 +402,11 @@ class LogicalPlan(BaseModel):
     # For each unsupported item the triage loop keeps, one proposed CLOSEST
     # SUPPORTED alternative the user can accept via chat (advisory only).
     suggestions: List[str] = Field(default_factory=list)
+    # Deploy target the BRD names (if any) — UI pre-fill + user confirm only.
+    azure_target: Optional[AzureTargetPlan] = None
+    # Layer -> container names; defaults to bronze/silver/gold unless the BRD
+    # names them ("copy into the raw container").
+    containers: ContainerPlan = Field(default_factory=ContainerPlan)
 
     @field_validator("project")
     @classmethod

@@ -34,6 +34,8 @@ from models.spec import (
     Transform,
     TransformKind,
     _OP_ARITH,
+    _OP_BLANK_DEFAULT,
+    _OP_REMOVE_SPECIAL,
     _norm_op,
 )
 
@@ -42,7 +44,7 @@ _TEMPORAL_TYPES = {"date", "timestamp", "datetime"}
 _NUM_LIT = re.compile(r"-?\d+(\.\d+)?")
 
 _DATE_PART_OPS = {
-    "year", "month", "dayofmonth", "day", "dayofweek", "dayofyear",
+    "year", "month", "quarter", "dayofmonth", "day", "dayofweek", "dayofyear",
     "hour", "minute", "second", "weekofyear", "week",
 }
 _NUMERIC_FN_OPS = {"round", "abs", "floor", "ceil"}
@@ -50,6 +52,8 @@ _NUMERIC_AGG_OPS = {"sum", "avg", "mean"}
 _STRING_FN_OPS = {
     "trim", "upper", "lower", "proper", "propercase", "initcap",
     "titlecase", "title", "replace", "concat", "substring",
+    "regexreplace", "regexmatch", "rlike", "startswith", "endswith",
+    *_OP_REMOVE_SPECIAL, *_OP_BLANK_DEFAULT,
 }
 
 # result type of a cast/renderer function (mirrors grounding._EXPR_TYPE, kept
@@ -78,6 +82,8 @@ def _expr_result_type(expression: "Optional[str]", cols: Dict[str, str]) -> str:
     """Result type of a rendered/raw expression: bare column ref keeps its type,
     otherwise the leading function decides; unknown stays string."""
     expr = (expression or "").strip()
+    if expr.startswith("{") and expr.endswith("}"):
+        expr = expr[1:-1]  # brace-escaped column ref ({Country Name})
     if expr in cols:
         return cols[expr]
     fn = _norm_op(expr.split("(", 1)[0])
@@ -85,7 +91,10 @@ def _expr_result_type(expression: "Optional[str]", cols: Dict[str, str]) -> str:
 
 
 def _select_ref(c: DerivedColumn) -> str:
-    return (c.expression or c.name).strip()
+    s = (c.expression or c.name).strip()
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1]  # brace-escaped column ref ({Country Name})
+    return s
 
 
 def _op_result_type(key: str, column: "Optional[str]", cols: Dict[str, str]) -> str:
@@ -98,7 +107,9 @@ def _op_result_type(key: str, column: "Optional[str]", cols: Dict[str, str]) -> 
     if key in _FN_RESULT:
         return _FN_RESULT[key]
     if key in ("trim", "upper", "lower", "proper", "propercase", "initcap",
-               "titlecase", "title", "replace", "concat", "substring"):
+               "titlecase", "title", "replace", "concat", "substring",
+               "regexreplace", "regexmatch", "rlike", "startswith", "endswith",
+               *_OP_REMOVE_SPECIAL, *_OP_BLANK_DEFAULT):
         return "string"
     if key in ("min", "max", "first", "identity", "copy", "passthrough", "asis", "none"):
         return cols.get(column or "", "string")
@@ -110,6 +121,28 @@ def _op_result_type(key: str, column: "Optional[str]", cols: Dict[str, str]) -> 
         # a safe best-effort guess otherwise.
         return cols.get(column or "", "string")
     return "string"
+
+
+_QUOTED_TOKEN = re.compile(r"'([A-Za-z_]\w*)'")
+
+
+def _check_literal_shadows_column(
+    flow: str, transform: str, c: DerivedColumn, cols: Dict[str, str], problems: List[str]
+) -> None:
+    """A quoted string literal that exactly matches an available column name is
+    almost surely a mis-quoted column reference — concat(first_name, ' ',
+    'last_name') writes the TEXT last_name into every row and no other check
+    catches it (it is type-valid). Flag it before it ships."""
+    texts = [c.expression or ""] + [str(a) for a in c.args]
+    for text in texts:
+        for token in _QUOTED_TOKEN.findall(text):
+            if token in cols:
+                problems.append(
+                    f"{flow}/{transform}: string literal '{token}' matches the "
+                    f"column '{token}' — if you meant the column, remove the "
+                    "quotes; a literal identical to a column name is almost "
+                    "always a mistake"
+                )
 
 
 def _check_structured_op(
@@ -284,6 +317,7 @@ def check_dataflow(df: DataFlow) -> List[str]:
     for t in df.transforms:
         if t.kind in (TransformKind.cast, TransformKind.derived, TransformKind.window):
             for c in t.columns:
+                _check_literal_shadows_column(df.name, t.name, c, cols, problems)
                 if c.op:
                     _check_structured_op(df.name, t.name, c, cols, problems)
                     cols[c.name] = _op_result_type(_norm_op(c.op), c.column or c.name, cols)

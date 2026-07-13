@@ -222,8 +222,33 @@ def _is_numeric_type(t: str) -> bool:
     return t in _NUMERIC_TYPES or t.startswith("decimal")
 
 
+def _split_args(s: str) -> "List[str]":
+    """Split a function's argument list on TOP-LEVEL commas (respects nested
+    parens and single-quoted strings)."""
+    out: "List[str]" = []
+    cur, depth, quoted = "", 0, False
+    for ch in s:
+        if ch == "'":
+            quoted = not quoted
+        if not quoted:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                out.append(cur.strip())
+                cur = ""
+                continue
+        cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
 def _expr_type(expression: str, cols: Dict[str, str]) -> str:
     expr = (expression or "").strip()
+    if expr.startswith("{") and expr.endswith("}"):
+        expr = expr[1:-1]  # brace-escaped column ref ({Country Name})
     if expr in cols:  # bare column reference keeps its type
         return cols[expr]
     # Structured arithmetic renders as "(a * b)" / "(1 - discount)". Preserve
@@ -244,6 +269,20 @@ def _expr_type(expression: str, cols: Dict[str, str]) -> str:
         arg = rest[:-1].strip()
         if arg in cols:
             return cols[arg]
+    # coalesce keeps its column argument's type; iif on a same-column clamp
+    # ('replace negative quantity with 0') mirrors its column/otherwise branch.
+    # Without this, 'cast to integer then coalesce(col, 0)' came out STRING and
+    # a grounded gold join failed with a false type mismatch (bike-store run
+    # 5ee8ff8cc21a: products@category_id string vs categories@category_id int).
+    if fn in {"coalesce", "iif"} and rest.endswith(")"):
+        args = _split_args(rest[:-1])
+        candidates = args if fn == "coalesce" else list(reversed(args))
+        for a in candidates:
+            if a in cols:
+                return cols[a]
+        for a in candidates:
+            if _NUMERIC_LITERAL.fullmatch(a):
+                return "double"
     return _EXPR_TYPE.get(fn, "string")
 
 

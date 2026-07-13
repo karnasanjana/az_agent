@@ -30,6 +30,7 @@ from models.spec import (
     TransformKind,
     Trigger,
     TriggerKind,
+    dsl_name,
 )
 
 # --------------------------------------------------------------------------- #
@@ -402,14 +403,18 @@ def _transform_dsl(
     is the most recent sort transform in the chain — a limit needs its keys to
     rank deterministically (ADF has no native limit transform)."""
     if t.kind in (TransformKind.cast, TransformKind.derived):
-        assigns = ",\n        ".join(f"{c.name} = {c.expression}" for c in t.columns)
+        assigns = ",\n        ".join(
+            f"{dsl_name(c.name)} = {c.expression}" for c in t.columns
+        )
         return f"{input_stream} derive({assigns}) ~> {t.name}"
 
     if t.kind == TransformKind.filter:
         return f"{input_stream} filter({t.condition}) ~> {t.name}"
 
     if t.kind == TransformKind.aggregate:
-        group = ", ".join(t.group_by)
+        group = ", ".join(
+            g if "=" in g else dsl_name(g) for g in t.group_by
+        )
         # A computed group-by key is 'Name = expr'; its output column is Name.
         key_names = [g.split("=", 1)[0].strip() if "=" in g else g for g in t.group_by]
         # ADF outputs groupBy columns automatically; an aggregate column with the
@@ -424,7 +429,9 @@ def _transform_dsl(
             quoted = ", ".join(f"'{k}'" for k in key_names)
             aggs = f"each(match(!in([{quoted}], name)), $$ = first($$))"
         else:
-            aggs = ",\n        ".join(f"{c.name} = {c.expression}" for c in agg_cols)
+            aggs = ",\n        ".join(
+                f"{dsl_name(c.name)} = {c.expression}" for c in agg_cols
+            )
         if not t.group_by:
             # Global aggregate (one row, no grouping) — no groupBy() clause, which
             # ADF's DSL rejects when empty (lint 'empty groupBy()').
@@ -432,11 +439,11 @@ def _transform_dsl(
         return f"{input_stream} aggregate(groupBy({group}),\n        {aggs}) ~> {t.name}"
 
     if t.kind == TransformKind.sort:
-        keys = ", ".join(f"{k.order}({k.column})" for k in t.order_by)
+        keys = ", ".join(f"{k.order}({dsl_name(k.column)})" for k in t.order_by)
         return f"{input_stream} sort({keys}) ~> {t.name}"
 
     if t.kind == TransformKind.select:
-        cols = ", ".join(f"{c.name} = {c.expression}" for c in t.columns)
+        cols = ", ".join(f"{dsl_name(c.name)} = {c.expression}" for c in t.columns)
         return f"{input_stream} select(mapColumn({cols})) ~> {t.name}"
 
     if t.kind == TransformKind.window:
@@ -444,9 +451,9 @@ def _transform_dsl(
         # A raw `condition` is the legacy escape hatch — the one place models
         # emit Spark partitionBy/orderBy (DF-DSL-001, run 24756f0f5aa8).
         if t.partition_by and t.columns:
-            parts = [f"over({', '.join(t.partition_by)})"]
-            parts += [f"{k.order}({k.column}, true)" for k in t.order_by]
-            parts += [f"{c.name} = {c.expression}" for c in t.columns]
+            parts = [f"over({', '.join(dsl_name(p) for p in t.partition_by)})"]
+            parts += [f"{k.order}({dsl_name(k.column)}, true)" for k in t.order_by]
+            parts += [f"{dsl_name(c.name)} = {c.expression}" for c in t.columns]
             body = ",\n  ".join(parts)
             return f"{input_stream} window({body}) ~> {t.name}"
         return f"{input_stream} window({t.condition or ''}) ~> {t.name}"
@@ -460,7 +467,10 @@ def _transform_dsl(
         # the first `take` ranks, then drop the helper column so the sink
         # schema is unchanged. The final stream keeps t.name so downstream
         # chaining (next transform / sink input) is unaffected.
-        rank_col = "__rowRank"
+        # ADF DSL rejects identifiers starting with double underscore
+        # (DF-DSL-001 parse error at runtime) — keep the helper name
+        # underscore-free.
+        rank_col = "xRowRank"
         if prev_sort is not None and prev_sort.order_by:
             keys = ",\n    ".join(f"{k.order}({k.column})" for k in prev_sort.order_by)
             head = (
@@ -569,7 +579,7 @@ def _source_block(
     delta: "Dataset | None" = None,
 ) -> List[str]:
     """One ADF `source(...) ~> Stream` block with an optional inline schema."""
-    schema = ",\n    ".join(f"{c.name} as {c.type}" for c in columns)
+    schema = ",\n    ".join(f"{dsl_name(c.name)} as {c.type}" for c in columns)
     body = f"\n    {schema}\n  " if schema else ""
     lines = [
         f"source(output({body}),",

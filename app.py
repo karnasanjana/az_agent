@@ -4,15 +4,14 @@ Endpoints
 ---------
 POST /plan           BRD (text, .txt/.md, or PDF upload) -> parse + build +
                      pre-flight. Returns run_id, summary, preflight, clarifications,
-                     review, graph, and the human-readable governance plan. No
+                     review, and the human-readable governance plan. No
                      Azure writes.
 POST /chat           Continue the conversation for a run: answer the agent's
                      clarifying questions or request small changes. Re-parses with
                      full memory, rebuilds, re-runs pre-flight, returns the updated
-                     review/graph/plan. No Azure writes.
+                     review/plan. No Azure writes.
 GET  /preview/{id}        review JSON.
 GET  /preview/{id}/text   plain-text governance plan (the approval-gate artifact).
-GET  /graph/{id}          graph JSON.
 POST /approve        Requires a prior preview AND a passing pre-flight, THEN
                      connects to Azure (or the MOCK tenant), builds all objects,
                      and runs the master pipeline.
@@ -25,7 +24,7 @@ POST /azure-config/test      Read-only connectivity check of the target.
 GET  /               The single-page UI.
 
 The single agent reasons in a few tight places — parsing the BRD (/plan), refining
-it on request (/chat), and (behind SELF_HEAL) self-healing a failed artifact
+it on request (/chat), and self-healing a failed artifact during deploy/run
 (/approve). Every reasoning step returns a validated PipelineSpec.
 """
 
@@ -34,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import json
+import logging
 import os
 import shutil
 import sys
@@ -46,7 +46,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from agent import builder, graph, preflight, review
+from agent import builder, preflight, review
 from config import mock_mode
 from models.spec import PipelineSpec
 from ui import INDEX_HTML
@@ -171,7 +171,7 @@ def health() -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Azure connection — set from the UI, not hardcoded in the repo
+# Azure connection - set from environment or API, not hardcoded in the repo
 # --------------------------------------------------------------------------- #
 
 # UI field -> environment variable the rest of the system reads.
@@ -372,7 +372,6 @@ def _store_and_respond(
         # /approve will demand an explicit acknowledgement.
         "unsupported": spec.unsupported,
         "review": review.render(run_id),
-        "graph": graph.graph(run_id),
         "plan_text": review.render_text(run_id),
         "plan_markdown": review.render_markdown(run_id),
     }
@@ -416,23 +415,37 @@ def _plan_fns():
     """(extract, refine) for the active PLAN_MODE, normalized to one signature:
     refine(instruction, messages, base_plan).
 
-    auto: extract = one-shot; refine = tool agent on a FRESH conversation whose
-    context is the plan itself (the session is rebuilt from base_plan) — the
-    one-shot history belongs to a different agent/system prompt and must not
-    leak into the tool loop."""
+    auto: extract = one-shot with a TOOL-AGENT FALLBACK — a large BRD can defeat
+    the single giant JSON emission ('Exceeded maximum output retries'), and the
+    tool agent builds the same plan in small validated calls, so auto retries
+    that way once before failing. refine = tool agent on a FRESH conversation
+    whose context is the plan itself (the session is rebuilt from base_plan) —
+    the one-shot history belongs to a different agent/system prompt and must
+    not leak into the tool loop."""
     mode = _plan_mode()
     if mode == "tools":
         from agent.plantools import extract_plan, refine_plan
 
         return extract_plan, refine_plan
     if mode == "auto":
-        from agent.extractor import extract_plan
-        from agent.plantools import refine_plan as _tools_refine
+        from agent import extractor, plantools
+
+        async def _extract(text, message_history=None):
+            try:
+                return await extractor.extract_plan(text, message_history)
+            except Exception as exc:  # noqa: BLE001
+                from pydantic_ai.exceptions import AgentRunError
+
+                if not isinstance(exc, AgentRunError):
+                    raise
+                # One-shot emission failed on model output (transient HTTP was
+                # already retried inside extract_plan) — build incrementally.
+                return await plantools.extract_plan(text)
 
         async def _refine(instruction, messages, base_plan=None):
-            return await _tools_refine(instruction, None, base_plan)
+            return await plantools.refine_plan(instruction, None, base_plan)
 
-        return extract_plan, _refine
+        return _extract, _refine
     from agent.extractor import extract_plan, refine_plan
 
     async def _refine(instruction, messages, base_plan=None):
@@ -560,6 +573,16 @@ async def _run_logical(
                 ground_logical_plan(p)
             except Exception:  # noqa: BLE001 - grounding helps checks; must not block planning
                 pass
+        try:
+            # Deterministic name alignment (TenureBand vs tenure_band) — after
+            # grounding so real schemas are in; each fix rides as an assumption.
+            from agent.completeness import align_plan
+
+            for note in align_plan(p):
+                if note not in p.assumptions:
+                    p.assumptions.append(note)
+        except Exception:  # noqa: BLE001
+            pass
         return p
 
     _ground(plan)
@@ -575,6 +598,16 @@ async def _run_logical(
 
     # Loop 1 — logical consistency, before building anything. (In tools mode
     # most problems are already caught per tool call; this is the safety net.)
+    # Every problem a round FIXES is logged as a lesson candidate (repeated
+    # model mistakes distill into skills/99-learned-lessons.md); whatever the
+    # rounds CANNOT fix becomes questions for the user, not a dead-end error.
+    from agent import triage
+
+    # Repaired problems buffer here and are recorded as lesson candidates ONLY
+    # if this run ends with a passing preflight — a run that ultimately failed
+    # must not teach anything (guards against learning bad lessons).
+    lesson_buffer: list = []
+
     for _ in range(_MAX_PLAN_REPAIRS):
         problems = check(plan)
         if not problems:
@@ -588,14 +621,34 @@ async def _run_logical(
             plan, messages = await refine_plan(feedback, messages, plan)
         phases.add_usage("repair_completeness", _latest_plan_usage())
         _ground(plan)
+        remaining = set(check(plan))
+        lesson_buffer.extend(p for p in problems if p not in remaining)
     else:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "Could not produce a consistent plan from the requirements.",
-                "problems": check(plan),
-            },
-        )
+        # Rounds exhausted — but the LAST refine may have converged (the loop
+        # only re-checks at the top of an iteration). Route to the user only
+        # when problems genuinely remain.
+        problems = check(plan)
+        if problems:
+            questions = triage.questions_for(problems)
+            prev = _RUNS.get(run_id, {})
+            _RUNS[run_id] = {
+                **prev,
+                "status": "NEEDS_CLARIFICATION",
+                "clarifications": questions,
+                "messages": messages,
+                "logical_plan": plan,
+                "previewed": False,
+            }
+            if requirements_text:
+                _RUNS[run_id]["brd_text"] = requirements_text
+            return {
+                "run_id": run_id,
+                "status": "NEEDS_CLARIFICATION",
+                "clarifications": questions,
+                "problems": problems,
+                "mock": mock_mode(),
+                "timings": phases.report(),
+            }
 
     # Loop 1c — unsupported triage. Models over-mark: requirements land in
     # `unsupported` that the vocabulary CAN express (or that are built-in).
@@ -606,7 +659,7 @@ async def _run_logical(
     if plan.unsupported and cached is None:
         from agent.extractor import capability_card
 
-        triage = _with_requirements(
+        triage_prompt = _with_requirements(
             "You marked these requirements as unsupported:\n"
             + "\n".join(f"- {u}" for u in plan.unsupported)
             + "\n\nRe-check EACH against what the system CAN build:\n"
@@ -619,7 +672,7 @@ async def _run_logical(
         )
         _clear_plan_usage()
         with phases.phase("triage_unsupported", llm=True):
-            cand, cand_msgs = await refine_plan(triage, messages, plan)
+            cand, cand_msgs = await refine_plan(triage_prompt, messages, plan)
         phases.add_usage("triage_unsupported", _latest_plan_usage())
         _ground(cand)
         if not check(cand):  # accept the triaged plan only if still consistent
@@ -671,6 +724,50 @@ async def _run_logical(
         with phases.phase("compile"):
             spec = compile_plan(plan)
         resp = _store_and_respond(run_id, spec, messages, phases)
+        # A check that failed before this round and passes now = a repaired
+        # model mistake -> lesson candidate (compare by check NAME; the detail
+        # text changes between fail and pass).
+        passing_now = {
+            c["name"]
+            for c in _RUNS[run_id].get("preflight", {}).get("checks", [])
+            if c["passed"]
+        }
+        lesson_buffer.extend(
+            f for f in failed if f.split(":", 1)[0] in passing_now
+        )
+
+    if not _RUNS[run_id].get("preflight", {}).get("passed"):
+        # Preflight still failing after every repair round: route the residue
+        # to the user as questions (the chat continues the same plan) instead
+        # of leaving only a red FAIL panel.
+        still_failed = [
+            f"{c['name']}: {c['detail']}"
+            for c in _RUNS[run_id].get("preflight", {}).get("checks", [])
+            if not c["passed"]
+        ]
+        resp["clarifications"] = (
+            list(resp.get("clarifications") or []) + triage.questions_for(still_failed)
+        )
+        _RUNS[run_id]["clarifications"] = resp["clarifications"]
+
+    if _RUNS[run_id].get("preflight", {}).get("passed") and not mock_mode():
+        # Green run: repaired mistakes become lesson candidates (deduped);
+        # repeated signatures distill in the background. Never in MOCK.
+        triage.record_candidates(dict.fromkeys(lesson_buffer))
+        triage.spawn_distiller()
+
+        # Semantic review — one advisory LLM pass comparing BRD vs plan.
+        # Deterministic preflight proved the plan BUILDS; this asks whether it
+        # says what the BRD says. Never gates approval; skipped on cache hits
+        # (the cached plan was reviewed when first built).
+        from agent import reviewer
+
+        if reviewer.enabled() and requirements_text and cached is None:
+            with phases.phase("plan_review", llm=True):
+                findings = await reviewer.review_plan(requirements_text, plan)
+            if findings:
+                resp["review_findings"] = findings
+                _RUNS[run_id]["review_findings"] = findings
 
     # Cache only a plan that survived every check — never a broken one.
     if cache_key and cached is None and _RUNS[run_id].get("preflight", {}).get("passed"):
@@ -684,6 +781,11 @@ async def _run_logical(
     resp["plan_changes"] = plan_diff(prev_plan, plan)
     _RUNS[run_id]["plan_changes"] = resp["plan_changes"]
     resp["timings"] = phases.report()
+
+    # Deploy target the BRD names — UI pre-fills its Azure config from this and
+    # the USER confirms; the server never applies it silently.
+    if plan.azure_target and not plan.azure_target.is_empty():
+        resp["azure_target"] = plan.azure_target.model_dump()
 
     # The accepted plan rides on the run (in-memory, like `messages`) so /chat
     # in tools mode can rebuild the agent's session from it.
@@ -735,10 +837,42 @@ async def plan(
         )
     except HTTPException:
         raise
-    except RuntimeError as exc:  # missing Foundry / model config
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:  # parse / model error — surface, don't 500
-        raise HTTPException(status_code=502, detail=f"BRD parse failed: {exc}") from exc
+    except Exception as exc:  # parse / model / config error — surface, don't 500
+        raise _plan_http_error(exc, "BRD parse failed") from exc
+
+
+def _plan_http_error(exc: Exception, prefix: str) -> HTTPException:
+    """Map a plan-phase failure to the right status. pydantic-ai's AgentRunError
+    subclasses RuntimeError, so a plain RuntimeError->503 mapping mislabelled
+    'Exceeded maximum output retries' as 'service unavailable' — a model output
+    problem, not an outage. Only config errors (missing key/endpoint) are 503."""
+    from pydantic_ai.exceptions import AgentRunError
+
+    if isinstance(exc, AgentRunError):
+        # Cap exhaustion means the model churned instead of converging —
+        # in practice the BRD is missing core facts (no source files named)
+        # or asks mostly-unsupported things. Say so; a raw
+        # 'UsageLimitExceeded' reads like an outage and helps nobody.
+        return HTTPException(status_code=502, detail=(
+            _describe(exc, prefix)
+            + " — the model could not settle on a valid plan for this BRD. "
+            "This usually means core facts are missing (source file names, "
+            "container) or most of the requirements are outside what the "
+            "system can build. Add specifics or split the BRD into smaller "
+            "parts, then regenerate."
+        ))
+    if isinstance(exc, RuntimeError):  # missing Foundry / model config
+        return HTTPException(status_code=503, detail=str(exc))
+    return HTTPException(status_code=502, detail=_describe(exc, prefix))
+
+
+def _describe(exc: Exception, prefix: str) -> str:
+    """Error detail that never goes blank: some exceptions (TimeoutError,
+    ReadError) stringify to '' and the UI showed 'BRD parse failed: ' with no
+    clue. Always include the type; log the traceback for the server console."""
+    logging.getLogger("app").exception("%s (run aborted)", prefix)
+    msg = str(exc).strip() or repr(exc)
+    return f"{prefix}: {type(exc).__name__}: {msg}"
 
 
 @app.post("/chat")
@@ -772,14 +906,12 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
         )
     except HTTPException:
         raise
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Refine failed: {exc}") from exc
+        raise _plan_http_error(exc, "Refine failed") from exc
 
 
 # --------------------------------------------------------------------------- #
-# Preview / graph (read-only)
+# Preview (read-only)
 # --------------------------------------------------------------------------- #
 
 
@@ -810,12 +942,6 @@ def preview_markdown(run_id: str) -> str:
     """Human-readable architecture plan (Markdown, no raw JSON)."""
     _require_built(run_id)
     return review.render_markdown(run_id)
-
-
-@app.get("/graph/{run_id}")
-def graph_view(run_id: str) -> Dict[str, Any]:
-    _require_built(run_id)
-    return graph.graph(run_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,8 +1238,8 @@ def approve(req: ApproveRequest, background: BackgroundTasks) -> Dict[str, Any]:
         if missing:
             raise HTTPException(
                 status_code=409,
-                detail="Azure connection not set — fill in the 'Azure connection' "
-                       f"panel first (missing: {', '.join(missing)}).",
+                detail="Azure connection not set - configure the server environment "
+                       f"or POST /azure-config first (missing: {', '.join(missing)}).",
             )
 
         azure_test = test_azure_config()

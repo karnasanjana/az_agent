@@ -109,6 +109,72 @@ Rules for the rule:
 """
 
 
+_PLAN_LESSON_PROMPT = """\
+You maintain a lessons file for an agent that turns BRDs into Azure Data
+Factory pipelines. During planning, the model repeatedly made the same class of
+mistake; a repair round fixed it each time. Distill the mistake into ONE
+generic, reusable rule for FUTURE plan generation so it stops recurring.
+
+Rules for the rule:
+- MODEL-INDEPENDENT: describe how to use the plan vocabulary correctly (ops,
+  casts, derived columns, group_by, joins, filters) — never mention a model
+  name, a model behavior, or this incident's entity/column names.
+- Imperative, max 2 sentences, phrased as an instruction the planner follows
+  while building the plan.
+- If the existing lessons already cover this mistake class, return covered=true
+  and no lesson.
+"""
+
+# Keep the prompt-visible lessons bounded — past this, new rules are dropped
+# and the file needs a human prune (quality of 30 rules beats quantity of 300).
+_MAX_LESSONS = 30
+
+
+def record_plan_lesson(problem_example: str, skills_dir: str = _SKILLS_DIR) -> Optional[str]:
+    """Distill a repeatedly-repaired PLANNING mistake into a generic rule and
+    append it to skills/99-learned-lessons.md. Returns the rule, or None when
+    covered/capped. Never raises."""
+    from pydantic import BaseModel, Field
+
+    class Lesson(BaseModel):
+        covered: bool = Field(description="True when existing lessons already cover this mistake class.")
+        lesson: str = Field(default="", description="The single generic rule; empty when covered.")
+
+    try:
+        from pydantic_ai import Agent
+
+        from config import get_model, structured_output
+
+        path = lessons_path(skills_dir)
+        existing = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        if existing.count("\n- ") >= _MAX_LESSONS:
+            return None
+
+        agent = Agent(
+            get_model(), output_type=structured_output(Lesson), system_prompt=_PLAN_LESSON_PROMPT
+        )
+        out = agent.run_sync(
+            f"Repeated planning mistake (one example):\n{problem_example}\n\n"
+            f"Existing lessons file:\n{existing or '(empty)'}"
+        ).output
+        rule = (out.lesson or "").strip()
+        if out.covered or not rule or rule in existing:
+            return None
+
+        os.makedirs(skills_dir, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            if not existing:
+                fh.write(_LESSONS_HEADER + "\n")
+            fh.write(f"- {rule}\n")
+        load_skills.cache_clear()
+        return rule
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def lessons_path(skills_dir: str = _SKILLS_DIR) -> str:
     return os.path.join(skills_dir, _LESSONS_FILE)
 

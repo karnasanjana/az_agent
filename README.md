@@ -9,7 +9,7 @@ approval.
 
 ```
 BRD in  →  agent GENERATES pipelines  →  SHOW user (JSON + Data Flow scripts + visual
-graph + governance plan)  →  user APPROVES  →  agent CONNECTS TO AZURE, BUILDS + RUNS
+governance plan)  →  user APPROVES  →  agent CONNECTS TO AZURE, BUILDS + RUNS
 for real  →  live run status streamed back.
 ```
 
@@ -44,7 +44,7 @@ Claude fills structured transform fields; code emits the JSON. (`tests/smoke_tes
 is the spike that proves this offline.)
 
 **v1 is fail-loud.** On a failed run the error is surfaced in the UI; the Claude
-self-heal retry loop is opt-in behind `SELF_HEAL=true` once you know your tenant's real
+self-heal retry loop is enabled by default and can be disabled with `SELF_HEAL=false`.
 failure modes.
 
 ## Three-phase validation plan
@@ -68,13 +68,12 @@ models/spec.py      PipelineSpec + sub-models (Http/Blob/Rest sources, Dataset,
 config.py           Foundry/Claude client + Azure config + RETRY_CAP + MOCK flag (lazy)
 agent/parser.py     Pydantic AI agent: BRD text -> validated PipelineSpec
 agent/builder.py    PipelineSpec -> ADF JSON + Data Flow script DSL (pure, offline)
-agent/review.py     render() / render_text() — all three layers (Bronze=Copy no-script)
+agent/review.py     render() / render_text() - basic execution flow and governance plan
 agent/preflight.py  validate() — offline safety guard; blocks approval on failure
-agent/graph.py      graph() — nodes+edges for the visual Bronze->Silver->Gold view
 agent/deployer.py   provision_containers() + deploy_artifacts() (Azure or MOCK), idempotent
-agent/validator.py  execute() — live run + per-layer status; fail-loud; self-heal opt-in
+agent/validator.py  execute() — live run + per-layer status; fail-loud; self-heal default-on
 ui.py               single-page UI (inline HTML/CSS/JS, no external deps)
-app.py              FastAPI: /plan /preview /graph /approve /status /
+app.py              FastAPI: /plan /preview /approve /status /
 samples.py          shipped COVID BRD + sample spec
 tests/smoke_test.py offline spike / local dry-run
 Dockerfile, docker-compose.yml
@@ -129,7 +128,7 @@ Flags:
 
 ```bash
 export MOCK=false        # true = local dry-run, writes to mock_tenant/, simulates the run
-export SELF_HEAL=false   # true = enable the Claude self-heal retry loop
+export SELF_HEAL=true    # default; set false to disable the self-heal retry loop
 export PRUNE_STALE=false # true = delete agent-created objects not in this run.
                          # OFF by default: the agent NEVER deletes from your tenant.
                          # When off, stale objects are reported, never removed.
@@ -186,13 +185,11 @@ run. The UI shows a **MOCK** banner.
 
 1. Complete the Azure prerequisites and export the env vars above (`MOCK=false`).
 2. `uvicorn app:app --reload` and open `http://127.0.0.1:8000`.
-3. **Paste or upload your BRD** (or click *Load COVID example*) → **Generate pipelines**.
+3. **Paste or upload your BRD** -> **Generate pipelines**.
 4. Review:
    - **Pre-flight** must be green (spec valid, naming, cross-refs resolve, JSON well-formed,
      Bronze Copy present, Silver/Gold scripts present). If it fails, fix the BRD and regenerate
      — approval stays disabled.
-   - **Pipeline graph**: click **Bronze** (Copy Activity, no script), **Silver**, **Gold**
-     (Data Flow JSON + script).
    - **Governance plan**: expand the plain-text plan for the audit/approval record.
    - **All objects**: every linked service / dataset / data flow / pipeline / trigger JSON.
 5. **Approve — build & run.** The app connects to Azure, creates the bronze/silver/gold
@@ -212,10 +209,9 @@ run. The UI shows a **MOCK** banner.
 
 | Method & path | Purpose |
 | --- | --- |
-| `POST /plan` (form: `brd` text or `file` upload) | parse + build + pre-flight; returns run_id, summary, preflight, clarifications, review, graph, governance plan. **No Azure writes.** |
+| `POST /plan` (form: `brd` text or `file` upload) | parse + build + pre-flight; returns run_id, summary, preflight, clarifications, review, governance plan. **No Azure writes.** |
 | `GET /preview/{run_id}` | review JSON (all three layers) |
 | `GET /preview/{run_id}/text` | plain-text governance plan |
-| `GET /graph/{run_id}` | graph nodes + edges |
 | `POST /approve` (`{run_id}`) | **gate**: requires prior preview AND passing pre-flight, then deploys + runs (Azure or MOCK) |
 | `GET /status/{run_id}` | live deploy + Bronze→Silver→Gold run state + run IDs + errors |
 | `GET /` | the UI |
@@ -225,7 +221,7 @@ run. The UI shows a **MOCK** banner.
 - **Ambiguity → clarifications.** If the BRD is unclear, the parser returns a
   `clarifications` list and builds nothing — it never invents components.
 - **Run store is in-memory** (`app._RUNS`); swap for a DB to survive restarts.
-- **Self-heal is opt-in** (`SELF_HEAL=true`) — v1 fails loud so you see real errors first.
+- **Self-heal is enabled by default**; set `SELF_HEAL=false` to fail loud without retries.
 - **MOCK is for development only** and clearly labelled in the UI; real Azure is the
   default, primary path.
 - **Manual trigger** is created as an artifact but exercised via `create_run` on demand

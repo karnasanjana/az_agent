@@ -190,7 +190,40 @@ def test_unsupported_triage_loop(monkeypatch):
     assert a.status_code == 200
 
 
-def test_no_convergence_returns_422(monkeypatch):
+def test_convergence_on_final_round_is_not_a_clarification(monkeypatch):
+    """A plan fixed by the LAST repair round must proceed to build — the
+    for/else exhaustion path fired even when that final refine converged
+    (held-out BRD 4: NEEDS_CLARIFICATION with EMPTY clarifications)."""
+    calls = {"n": 0}
+
+    async def fake_extract(text, message_history=None):
+        bad = _good_plan()
+        bad.outputs[0].aggregations = []
+        return bad, []
+
+    async def fake_refine(instruction, message_history):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            bad = _good_plan()
+            bad.outputs[0].aggregations = []
+            return bad, message_history
+        return _good_plan(), message_history  # converges on the FINAL round
+
+    from agent import extractor
+    monkeypatch.setattr(extractor, "extract_plan", fake_extract)
+    monkeypatch.setattr(extractor, "refine_plan", fake_refine)
+
+    client = TestClient(app_module.app)
+    r = client.post("/plan", data={"brd": "x"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "AWAITING_APPROVAL"
+    assert r.json()["preflight"]["passed"]
+
+
+def test_no_convergence_asks_the_user(monkeypatch):
+    """Repair-loop exhaustion is triaged to the USER as chat questions
+    (NEEDS_CLARIFICATION), not a dead-end 422 — the run keeps its messages and
+    plan so /chat can continue with the user's answer."""
     async def fake_extract(text, message_history=None):
         bad = _good_plan()
         bad.outputs[0].aggregations = []
@@ -207,5 +240,10 @@ def test_no_convergence_returns_422(monkeypatch):
 
     client = TestClient(app_module.app)
     r = client.post("/plan", data={"brd": "x"})
-    assert r.status_code == 422
-    assert "problems" in r.json()["detail"]
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "NEEDS_CLARIFICATION"
+    assert body["clarifications"]  # residual problems phrased as questions
+    assert "problems" in body
+    run = app_module._RUNS[body["run_id"]]
+    assert "messages" in run and "logical_plan" in run  # /chat can continue

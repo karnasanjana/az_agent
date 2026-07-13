@@ -29,6 +29,8 @@ from pydantic import ValidationError
 
 from agent.completeness import check
 from models.logical import (
+    AzureTargetPlan,
+    ContainerPlan,
     EntityTransform,
     LogicalPipeline,
     LogicalPlan,
@@ -72,6 +74,8 @@ class PlanSession:
         self.outputs: "Dict[str, OutputPlan]" = {}
         self.pipelines: "List[LogicalPipeline]" = []
         self.schedule: "Optional[SchedulePlan]" = None
+        self.azure_target: "Optional[AzureTargetPlan]" = None
+        self.containers: "Optional[ContainerPlan]" = None
         self.notes: "Dict[str, List[str]]" = {k: [] for k in _NOTE_KINDS}
         self.finalized: bool = False
 
@@ -90,6 +94,8 @@ class PlanSession:
         s.outputs = {o.name: o for o in plan.outputs}
         s.pipelines = list(plan.pipelines)
         s.schedule = plan.schedule
+        s.azure_target = plan.azure_target
+        s.containers = plan.containers
         s.notes = {
             "unsupported": list(plan.unsupported),
             "assumption": list(plan.assumptions),
@@ -106,6 +112,8 @@ class PlanSession:
             outputs=list(self.outputs.values()),
             pipelines=list(self.pipelines) if include_pipelines else [],
             schedule=self.schedule,
+            azure_target=self.azure_target,
+            containers=self.containers or ContainerPlan(),
             unsupported=list(self.notes["unsupported"]),
             assumptions=list(self.notes["assumption"]),
             clarifications=list(self.notes["clarification"]),
@@ -260,6 +268,41 @@ class PlanSession:
             )
         except ValidationError as exc:
             return _err(_fmt_validation(exc), self._state())
+        return _ok(self._state())
+
+    def set_containers(
+        self,
+        bronze: Optional[str] = None,
+        silver: Optional[str] = None,
+        gold: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Container names the BRD gives for each layer; unset fields keep the
+        medallion default."""
+        base = self.containers or ContainerPlan()
+        try:
+            self.containers = ContainerPlan(
+                bronze=(bronze or base.bronze),
+                silver=(silver or base.silver),
+                gold=(gold or base.gold),
+            )
+        except ValidationError as exc:
+            return _err(_fmt_validation(exc), self._state())
+        return _ok(self._state())
+
+    def set_azure_target(
+        self,
+        resource_group: Optional[str] = None,
+        factory_name: Optional[str] = None,
+        storage_account: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record the deploy target the BRD NAMES. Advisory: the user confirms
+        it in the UI before any deploy — never applied silently."""
+        target = AzureTargetPlan(
+            resource_group=(resource_group or "").strip() or None,
+            factory_name=(factory_name or "").strip() or None,
+            storage_account=(storage_account or "").strip() or None,
+        )
+        self.azure_target = None if target.is_empty() else target
         return _ok(self._state())
 
     def add_note(self, kind: str, text: str) -> Dict[str, Any]:

@@ -74,7 +74,7 @@ def lint_dataflow_script(name: str, script: str) -> List[str]:
         problems.append(
             f"{name}: 'limit(' is not an ADF transform (DF-FLO-005 'limit' not "
             "registered) - keep top N with rank(desc(<sort col>), "
-            "output(__rowRank as long), dense: false) then filter(__rowRank <= N)"
+            "output(xRowRank as long), dense: false) then filter(xRowRank <= N)"
         )
 
     # 3. Stream graph: every input stream must be defined before use; >=1 sink.

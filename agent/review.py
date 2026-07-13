@@ -20,7 +20,7 @@ BRONZE_LABEL = "raw landing, no transformation"
 
 
 # --------------------------------------------------------------------------- #
-# Loading helpers (shared by review / preflight / graph)
+# Loading helpers (shared by review / preflight)
 # --------------------------------------------------------------------------- #
 
 
@@ -263,22 +263,33 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
     # operations one per bullet with the real expression — that's where runtime
     # errors live, so that's what the human verifies. No prose explanations.
     out.append("## Steps")
+    # Sink formats ride on every line — the reviewer and the human must see
+    # WHERE each stage lands and AS WHAT (Delta/CSV/Parquet), not infer it.
+    ds_kind = {d.name: d.kind.value for d in spec.datasets}
+
+    def _fmt(ds_name: str) -> str:
+        kind = ds_kind.get(ds_name)
+        return f" [{kind}]" if kind else ""
+
     _, bronze_act = find_bronze_copy(spec)
     if bronze_act is not None:
         out.append(
             f"- **Bronze**: copy `{bronze_act.source_dataset}` → "
-            f"`{bronze_act.sink_dataset}` (raw, no transform)"
+            f"`{bronze_act.sink_dataset}`{_fmt(bronze_act.sink_dataset)} (raw, no transform)"
         )
     for pl in spec.pipelines:
         for act in pl.activities:
             if act.type == "Copy" and act is not bronze_act:
                 out.append(
                     f"- **Copy** `{act.name}`: "
-                    f"`{act.source_dataset}` → `{act.sink_dataset}`"
+                    f"`{act.source_dataset}` → `{act.sink_dataset}`{_fmt(act.sink_dataset)}"
                 )
     for df in spec.dataflows:
         label = df.layer.value.capitalize() if df.layer else "Transform"
-        out.append(f"- **{label}** `{df.name}` (`{df.source.dataset}` → `{df.sink.dataset}`):")
+        out.append(
+            f"- **{label}** `{df.name}` (`{df.source.dataset}` → "
+            f"`{df.sink.dataset}`{_fmt(df.sink.dataset)}):"
+        )
         for i, t in enumerate(df.transforms, 1):
             out.append(f"  {i}. {_transform_english(t)}")
         if not df.transforms:
@@ -287,11 +298,18 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
 
     # Orchestration
     out.append("## Orchestration")
+    master_lines = 0
     for pl in spec.pipelines:
         acts = [a for a in pl.activities if a.type == "ExecutePipeline"]
         if acts and len(acts) == len(pl.activities):
-            chain = " → ".join(a.invoked_pipeline for a in pl.activities)
+            chain = " -> ".join(a.invoked_pipeline for a in pl.activities)
             out.append(f"- **{pl.name}** (master): {chain} (each on Succeeded).")
+            master_lines += 1
+    if master_lines == 0:
+        for pl in spec.pipelines:
+            work = " -> ".join(a.name for a in pl.activities)
+            if work:
+                out.append(f"- **{pl.name}**: {work}.")
     for tr in spec.triggers:
         detail = "manual" if tr.kind.value == "manual" else f"{tr.frequency or 'Day'} schedule"
         out.append(f"- Trigger `{tr.name}`: {detail} → `{tr.pipeline}`.")
@@ -299,11 +317,12 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
         out.append("- No triggers — the pipeline runs on demand.")
     out.append("")
 
-    # Counts live in the UI summary pills, not here.
-
-    # Assumptions and suggestions are NOT repeated here — the UI renders them
-    # as their own cards from the response's assumptions/suggestions fields
-    # (they were duplicated when this markdown also carried them).
+    out.append("## Cannot build")
+    if spec.unsupported:
+        out.extend(f"- {u}" for u in spec.unsupported)
+    else:
+        out.append("- Nothing identified as unsupported for this plan.")
+    out.append("")
 
     # Only genuine blockers
     if spec.clarifications:

@@ -21,7 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import builder, graph, preflight, review  # noqa: E402
+from agent import builder, preflight, review  # noqa: E402
 from models.spec import validate_naming  # noqa: E402
 from samples import sample_covid_spec  # noqa: E402
 
@@ -82,11 +82,6 @@ def main() -> int:
         conds = sorted({c for d in act["dependsOn"] for c in d["dependencyConditions"]})
         print(f"- {act['name']:7s} [{act['type']}]" + (f"  depends_on={deps} {conds}" if deps else "  (root)"))
 
-    rule("GRAPH (nodes + edges for the UI)")
-    g = graph.graph(RUN_ID)
-    print("nodes:", [n["id"] for n in g["nodes"]])
-    print("edges:", [(e["from"], e["to"], e["condition"]) for e in g["edges"]])
-
     # Structural assertions so regressions fail loudly.
     by_name = {a["name"]: a for a in master["activities"]}
     assert by_name["Silver"]["dependsOn"][0]["activity"] == "Bronze"
@@ -96,8 +91,6 @@ def main() -> int:
     assert silver_json["typeProperties"]["sinks"][0]["dataset"]["referenceName"] == "ds_adls_silver"
     assert any("Dedup" in l for l in silver_json["typeProperties"]["scriptLines"])
     assert "case_fatality_rate" in rev["layers"]["gold"]["script"]
-    assert [(e["from"], e["to"]) for e in g["edges"]] == [("bronze", "silver"), ("silver", "gold")]
-
     rule("RESULT")
     print("Local dry-run passed - deployable ADF JSON generated with zero cloud calls.")
     return 0

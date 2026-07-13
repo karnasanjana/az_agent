@@ -64,7 +64,9 @@ that from your plan.
 WORKFLOW — follow this order:
 1. add_source for every business entity (file/table) the requirements name.
    Use the EXACT file names / URLs / table names given. entity = short
-   snake_case business name (orders, customers).
+   snake_case business name (orders, customers). Storage formats: csv, text,
+   parquet, json, binary. Binary is Bronze byte-copy only; do not transform it
+   or use it in outputs.
 2. add_transform for every entity that needs cleaning.
 3. add_output for every business output asked for. Do NOT invent outputs.
 4. set_pipelines ONLY if the requirements name pipelines or say how work is
@@ -91,6 +93,12 @@ RULES:
   appear in that entity's `casts` with its target type.
 - NULL / DEFAULT FILL: op `coalesce` replaces null/missing/blank with a
   default. `replace` is ONLY string find/replace (two string args: old, new).
+- EMPTY / INVALID STRING CLEANING: use op `replace_empty_string` with args
+  [default] for blank string defaults, `regex_replace` for regex cleaning, and
+  `remove_special_characters` to strip punctuation/special chars.
+- FILTERS: supported filter ops are not_null/null/eq/ne/gt/ge/lt/le plus LIKE,
+  regex/rlike, IN, and BETWEEN. For IN pass a comma-separated value string; for
+  BETWEEN pass "low,high". Multiple filters are AND-ed.
 - ARITHMETIC: derived measures use add/subtract/multiply/divide. `column` is
   the FIRST operand; `args` the rest (column names or numbers). Chain through
   new_column, e.g. line_total = quantity * list_price * (1 - discount):
@@ -110,7 +118,12 @@ RULES:
   first. Put it in `derived` for raw source columns, or `post_agg_derived`
   for a column computed from an aggregation's result (e.g. segment by SUMMED
   revenue: column = the aggregation's name). Fully supported — do NOT mark
-  conditional/if-else/case logic as unsupported.
+  conditional/if-else/case logic as unsupported. When the requirements name
+  buckets/tiers WITHOUT thresholds, pick sensible ones, order branches so no
+  branch is dead, and note('assumption', ...) each chosen threshold.
+- NULL-KEY REMOVAL: "remove records with null primary/business keys" = a
+  not_null filter on each key column in that entity's transform (same columns
+  as dedup_keys). Fully supported.
 - SOURCE VALIDATION: "verify the file exists / is non-empty before ingesting"
   = validate_first=true on that source. Fully supported.
 - top N = sort + top_n. PROPER CASE = op `proper`. All fully supported.
@@ -154,8 +167,8 @@ def build_plan_agent():
         columns: Optional[List[LogicalColumn]] = None,
         validate_first: bool = False,
     ) -> Dict[str, Any]:
-        """Add (or replace) one business entity to ingest. format: csv | parquet
-        | json | sql_table | http_csv. Storage sources need file_name (or
+        """Add (or replace) one business entity to ingest. format: csv | text |
+        parquet | json | binary | sql_table | http_csv. Storage sources need file_name (or
         folder); http_csv needs http_url; sql_table needs server, database,
         table_name. columns: known schema [{name, type}] when the requirements
         state it. validate_first: gate the copy on the file existing and being
@@ -212,9 +225,11 @@ def build_plan_agent():
         parts for grouping go here). post_agg_derived runs AFTER aggregation —
         use it for a column computed from an aggregation's result, e.g. a
         customer segment bucketed by SUMMED revenue ({op: case, column:
-        <aggregation name>, when: [...], otherwise: ...}). group_by needs
-        aggregations. top_n needs sort. columns = final projection ([] = all).
-        format: delta | csv | parquet."""
+        <aggregation name>, when: [...], otherwise: ...}). Filters whose column
+        names an aggregation result apply AFTER the aggregation automatically —
+        post-aggregation filters (e.g. QuantityOnHand > 0) are supported.
+        group_by needs aggregations. top_n needs sort. columns = final
+        projection ([] = all). format: delta | csv | parquet."""
         return ctx.deps.upsert_output({
             "name": name, "from_entities": from_entities,
             "joins": [j.model_dump() for j in (joins or [])],
@@ -241,6 +256,31 @@ def build_plan_agent():
     def set_project(ctx: RunContext[PlanSession], project: str) -> Dict[str, Any]:
         """Set the short snake_case project name (names the master pipeline)."""
         return ctx.deps.set_project(project)
+
+    @agent.tool
+    def set_containers(
+        ctx: RunContext[PlanSession],
+        bronze: Optional[str] = None,
+        silver: Optional[str] = None,
+        gold: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Set the storage CONTAINER each layer lands in when the requirements
+        name them ('copy into the raw container' -> bronze='raw'). Unset fields
+        keep the bronze/silver/gold defaults. Lowercase letters/digits/hyphens."""
+        return ctx.deps.set_containers(bronze, silver, gold)
+
+    @agent.tool
+    def set_azure_target(
+        ctx: RunContext[PlanSession],
+        resource_group: Optional[str] = None,
+        factory_name: Optional[str] = None,
+        storage_account: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record the Azure deploy target the requirements EXPLICITLY name
+        (resource group / Data Factory / storage account). Use the exact names
+        given; leave a field out if not stated. Do NOT invent names. The user
+        confirms this target in the UI before any deploy."""
+        return ctx.deps.set_azure_target(resource_group, factory_name, storage_account)
 
     @agent.tool
     def set_schedule(
@@ -290,9 +330,30 @@ async def _run(
     message_history: "Optional[List[Any]]",
     base_plan: "Optional[LogicalPlan]",
 ) -> "Tuple[LogicalPlan, List[Any]]":
-    session = PlanSession.from_plan(base_plan)
-    agent = build_plan_agent()
-    result = await agent.run(prompt, deps=session, message_history=message_history)
+    import os
+
+    from pydantic_ai.usage import UsageLimits
+
+    from agent.retry import retry_async
+
+    # pydantic-ai defaults to 50 requests per run — a big BRD (or a small model
+    # needing more correction rounds) hits that mid-build and dies with
+    # UsageLimitExceeded. Tunable; 100 covers a 9-entity/8-output plan.
+    limits = UsageLimits(
+        request_limit=int(os.environ.get("PLAN_TOOL_REQUEST_LIMIT", "100"))
+    )
+
+    async def attempt() -> "Tuple[PlanSession, Any]":
+        # Fresh session per attempt: a mid-run provider blip may have already
+        # applied tool calls, and replaying onto that state would double them.
+        session = PlanSession.from_plan(base_plan)
+        agent = build_plan_agent()
+        result = await agent.run(
+            prompt, deps=session, message_history=message_history, usage_limits=limits
+        )
+        return session, result
+
+    session, result = await retry_async(attempt)
     _capture_usage(result)
     return session.plan(), result.all_messages()
 

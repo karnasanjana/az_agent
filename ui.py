@@ -1,9 +1,8 @@
 """Single self-contained UI page (inline HTML/CSS/JS, no external deps).
 
 Served at GET /. A data engineer pastes or uploads a BRD, generates the plan,
-reviews all three layers (visual graph + JSON + Silver/Gold scripts + the
-human-readable governance plan), then approves to build + run for real (or in the
-MOCK tenant), watching live Bronze->Silver->Gold status.
+reviews the human-readable governance plan, then approves to build + run for real
+(or in the MOCK tenant), watching live Bronze->Silver->Gold status.
 """
 
 INDEX_HTML = r"""<!doctype html>
@@ -48,17 +47,6 @@ INDEX_HTML = r"""<!doctype html>
   .dot { width:9px; height:9px; border-radius:50%; margin-top:6px; flex:0 0 auto; }
   .dot.ok { background:var(--ok);} .dot.bad{ background:var(--bad);} .dot.warn{ background:var(--warn);}
   .muted { color:var(--mut); }
-  /* graph */
-  .graph { display:flex; align-items:center; gap:0; flex-wrap:wrap; }
-  .node { width:190px; border:2px solid var(--line); border-radius:12px; padding:12px; cursor:pointer;
-          background:var(--panel2); transition:.12s; }
-  .node:hover { transform:translateY(-2px); }
-  .node.sel { outline:2px solid var(--accent); }
-  .node .l { font-weight:700; letter-spacing:.05em; }
-  .node .k { font-size:11px; color:var(--mut); }
-  .node.bronze { border-color:var(--bronze);} .node.silver{ border-color:var(--silver);} .node.gold{ border-color:var(--gold);}
-  .arrow { padding:0 10px; color:var(--mut); font-size:22px; }
-  .arrow small { display:block; font-size:9px; text-align:center; color:var(--mut); }
   details { border:1px solid var(--line); border-radius:8px; margin:6px 0; background:var(--panel); }
   summary { cursor:pointer; padding:8px 10px; font-weight:600; }
   .status-grid { display:flex; gap:10px; margin:8px 0; flex-wrap:wrap; }
@@ -68,8 +56,6 @@ INDEX_HTML = r"""<!doctype html>
   .err { color:var(--bad); white-space:pre-wrap; }
   .pill { font-size:11px; color:var(--mut); }
   label.file { font-size:12px; color:var(--mut); cursor:pointer; }
-  .azin { width:100%; margin:3px 0; background:var(--panel2); color:var(--ink);
-          border:1px solid var(--line); border-radius:8px; padding:8px; }
   .warn { color:var(--warn); white-space:pre-wrap; }
 </style>
 </head>
@@ -82,33 +68,6 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <main>
   <section class="left">
-    <h2>0. Azure connection</h2>
-    <details id="azBox" class="card" style="padding:0">
-      <summary>Deploy target <span id="azSummary" class="pill"></span></summary>
-      <div style="padding:10px">
-        <div class="muted" style="margin-bottom:8px">Where pipelines get deployed. Saved for this
-          server session only — never written into the code.</div>
-        <input id="az_subscription_id" class="azin" placeholder="Subscription ID"/>
-        <input id="az_resource_group" class="azin" placeholder="Resource group"/>
-        <input id="az_factory_name" class="azin" placeholder="Data Factory name"/>
-        <input id="az_storage_account" class="azin" placeholder="Storage account name"/>
-        <div class="row">
-          <select id="az_storage_kind" class="azin" style="flex:1">
-            <option value="">storage kind (auto)</option>
-            <option value="adls">ADLS Gen2 (hierarchical namespace)</option>
-            <option value="blob">Plain Blob storage</option>
-          </select>
-          <input id="az_location" class="azin" placeholder="Region (e.g. eastus)" style="flex:1"/>
-        </div>
-        <div class="row">
-          <button id="azSaveBtn" class="sec">Save</button>
-          <button id="azTestBtn" class="sec">Test connection</button>
-        </div>
-        <div id="azState" class="pill"></div>
-        <div id="azChecks"></div>
-      </div>
-    </details>
-
     <h2>1. What do you want to build?</h2>
     <textarea id="brd" placeholder="Describe it in plain English or paste a full BRD &mdash; e.g. &quot;copy the daily sales CSVs from https://... into the lake and aggregate revenue by region&quot;. Or upload a .txt/.md/.pdf."></textarea>
     <div class="row">
@@ -117,7 +76,6 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="row">
       <button id="genBtn">Generate pipelines</button>
-      <button id="sampleBtn" class="sec">Load COVID example</button>
     </div>
     <div id="genState" class="pill"></div>
 
@@ -159,12 +117,6 @@ INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section class="right">
-    <h2>2. Pipeline graph (click a step)</h2>
-    <div id="graph" class="muted">Generate a plan to see the pipeline steps.</div>
-
-    <h2>Step detail</h2>
-    <div id="detail" class="card muted">Select a step above.</div>
-
     <h2>Plan &mdash; what I'll build</h2>
     <div id="summary"></div>
     <div id="planReadable" class="card muted">Generate a plan to see it in plain English.</div>
@@ -174,7 +126,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const $ = (s)=>document.querySelector(s);
-let RUN = null, REVIEW = null, GRAPH = null, POLL = null, UPLOAD = null;
+let RUN = null, REVIEW = null, POLL = null, UPLOAD = null;
 
 function authHeaders(){ const t = sessionStorage.getItem('api_token'); return t ? {'x-api-token': t} : {}; }
 async function jget(u){ const r = await fetch(u); if(!r.ok) throw new Error((await r.json()).detail||r.status); return r.json(); }
@@ -194,38 +146,6 @@ async function jpost(u, body){
   if(h.self_heal){ $('#healTag').style.display=''; }
 }catch(e){} })();
 
-// --- Azure connection panel: read/set the deploy target from the UI ---------
-const AZ_FIELDS = ['subscription_id','resource_group','factory_name','storage_account','storage_kind','location'];
-function azSummary(cfg){
-  const ok = cfg.subscription_id && cfg.resource_group && cfg.factory_name && cfg.storage_account;
-  $('#azSummary').textContent = ok ? (cfg.factory_name+' / '+cfg.storage_account) : 'not set — click to configure';
-  if(!ok) $('#azBox').open = true;
-}
-(async()=>{ try{
-  const cfg = await jget('/azure-config');
-  AZ_FIELDS.forEach(f=>{ const el=$('#az_'+f); if(el && cfg[f]) el.value=cfg[f]; });
-  azSummary(cfg);
-}catch(e){} })();
-
-$('#azSaveBtn').onclick = async ()=>{
-  const body={}; AZ_FIELDS.forEach(f=>{ body[f]=$('#az_'+f).value.trim(); });
-  try{
-    const cfg = await jpost('/azure-config', body);
-    $('#azState').textContent='Saved for this session.'; azSummary(cfg); $('#azChecks').innerHTML='';
-  }catch(e){ $('#azState').textContent='Save failed: '+e.message; }
-};
-
-$('#azTestBtn').onclick = async ()=>{
-  $('#azState').textContent='Testing…'; $('#azChecks').innerHTML='';
-  try{
-    const r = await jpost('/azure-config/test', {});
-    $('#azState').textContent = r.ok ? 'Connection OK.' : 'Connection has problems:';
-    $('#azChecks').innerHTML = '<div class="card">'+r.checks.map(c=>
-      '<div class="check"><span class="dot '+(c.passed?'ok':'bad')+'"></span><div><b>'+
-      esc(c.name)+'</b><div class="muted">'+esc(c.detail||'')+'</div></div></div>').join('')+'</div>';
-  }catch(e){ $('#azState').textContent='Test failed: '+e.message; }
-};
-
 $('#file').addEventListener('change', async (e)=>{
   const f=e.target.files[0]; if(!f) return; $('#fileName').textContent=f.name;
   const isPdf = /\.pdf$/i.test(f.name) || f.type==='application/pdf';
@@ -237,9 +157,6 @@ $('#file').addEventListener('change', async (e)=>{
   }
 });
 
-$('#sampleBtn').onclick = async ()=>{
-  $('#brd').value = SAMPLE_BRD; $('#fileName').textContent=''; UPLOAD=null;
-};
 
 // Live "elapsed seconds" timer on a button so long LLM calls don't look frozen.
 function startTimer(sel, label){
@@ -255,7 +172,7 @@ $('#genBtn').onclick = async ()=>{
   if(!brd && !UPLOAD){ alert('Paste or upload a BRD first.'); return; }
   reset();
   $('#genState').textContent='Large BRDs can take 1–2 minutes to generate — please wait.';
-  const stop = startTimer('#genBtn','Generating&hellip;');
+  const stop = startTimer('#genBtn','Generating');
   try{
     const fd = new FormData();
     if(UPLOAD){ fd.append('file', UPLOAD); } else { fd.append('brd', brd); }
@@ -281,7 +198,7 @@ function applyPlan(data){
     renderClar(data.clarifications);
     renderPlan(data);  // show any assumptions the agent already made
     $('#approveBox').style.display='none';
-    REVIEW=GRAPH=null; $('#graph').textContent=''; $('#summary').innerHTML='';
+    REVIEW=null; $('#summary').innerHTML='';
     $('#preflight').innerHTML='';
     return;
   }
@@ -294,9 +211,9 @@ function applyPlan(data){
   // A refine reopens the approval gate — stop any stale live run/poll.
   if(POLL){ clearInterval(POLL); POLL=null; }
   $('#liveBox').style.display='none';
-  REVIEW = data.review; GRAPH = data.graph;
+  REVIEW = data.review;
   renderPreflight(data.preflight);
-  renderGraph(GRAPH); renderSummary(REVIEW);
+  renderSummary(REVIEW);
   renderPlan(data);
   renderGate(data);
 }
@@ -320,7 +237,22 @@ function renderPlan(data){
     $('#planReadable').className = 'card';
   }
   const A = data.assumptions||[], S = data.suggestions||[], C = data.plan_changes||[];
+  const RF = data.review_findings||[], AZ = data.azure_target||null;
   let html='';
+  if(RF.length) html += '<h2>Reviewer findings (advisory — verify against your BRD)</h2>'+
+    '<div class="card" style="border-left:3px solid #e5a50a">'+
+    RF.map((f,i)=>'<div class="check"><span class="dot warn"></span><div><b>'+esc(f.severity||'')+
+    ':</b> '+esc(f.requirement||'')+' &mdash; '+esc(f.issue||'')+
+    ' <a href="#" onclick="fixViaChat('+i+');return false" style="white-space:nowrap">Fix via chat →</a></div></div>').join('')+
+    '<div class="muted" style="margin-top:6px">These do not block approval. Click “Fix via chat” to have the agent repair the plan — you send the message, nothing changes without you.</div></div>';
+  window._REVIEW_FINDINGS = RF;
+  if(AZ) html += '<h2>Deploy target named in the BRD</h2><div class="card" id="azTargetCard">'+
+    ['resource_group','factory_name','storage_account'].filter(k=>AZ[k]).map(k=>
+      '<div class="check"><span class="dot"></span><div>'+esc(k)+': <code>'+esc(AZ[k])+'</code></div></div>').join('')+
+    '<div class="row" style="margin-top:8px"><button class="sec" onclick="applyAzureTarget()">Use this target</button>'+
+    '<span class="muted">Nothing is applied until you click — verify these are YOUR resources.</span></div>'+
+    '<div id="azTargetState" class="pill"></div></div>';
+  window._AZ_TARGET = AZ;
   if(C.length) html += '<h2>What changed since you last reviewed (verify before approving)</h2>'+
     '<div class="card" style="border-left:3px solid #e5a50a">'+
     C.map(c=>'<div class="check"><span class="dot warn"></span><div>'+esc(c)+'</div></div>').join('')+'</div>';
@@ -330,6 +262,40 @@ function renderPlan(data){
   if(S.length) html += '<h2>Optional suggestions</h2><div class="card">'+
     S.map(s=>'<div class="check"><span class="dot"></span><div>'+esc(s)+'</div></div>').join('')+'</div>';
   $('#planNotes').innerHTML = html;
+}
+
+// One click drops a reviewer finding into the chat box as a repair request —
+// the user reviews the wording and presses Send; the agent edits the plan in
+// place. This is the interactive fix path: agent asks/flags, human decides.
+function fixViaChat(i){
+  const f = (window._REVIEW_FINDINGS||[])[i]; if(!f) return;
+  const box = $('#chatBox'); if(box) box.style.display='';
+  const inp = $('#chatInput'); if(!inp) return;
+  inp.value = 'Fix this reviewer finding: '+(f.requirement||'')+' — '+(f.issue||'');
+  inp.focus();
+}
+
+// Explicit user confirmation applies the BRD-named deploy target to the
+// server session (POST /azure-config), then runs the read-only connectivity
+// test. Never automatic — BRD text must not silently pick a deploy target.
+async function applyAzureTarget(){
+  const az = window._AZ_TARGET; if(!az) return;
+  const st = $('#azTargetState'); st.textContent = 'applying…';
+  try{
+    const r = await fetch('/azure-config', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({resource_group: az.resource_group||null,
+                            factory_name: az.factory_name||null,
+                            storage_account: az.storage_account||null})});
+    if(!r.ok) throw new Error((await r.json()).detail||r.status);
+    let msg = 'applied';
+    try{
+      const t = await fetch('/azure-config/test', {method:'POST'});
+      const tb = await t.json();
+      msg += t.ok ? ' — connectivity OK' : (' — test: '+esc(JSON.stringify(tb)));
+    }catch(e){ msg += ' — connectivity test unavailable'; }
+    st.textContent = msg;
+  }catch(e){ st.textContent = 'failed: '+e.message; }
 }
 
 // --- chat: refine the spec or answer the agent's questions ---
@@ -344,7 +310,7 @@ async function sendChat(){
   const msg = $('#chatInput').value.trim();
   if(!msg || !RUN) return;
   chatAppend('you', msg); $('#chatInput').value='';
-  const stop = startTimer('#chatBtn','Working&hellip;');
+  const stop = startTimer('#chatBtn','Working');
   try{
     const data = await jpost('/chat',{run_id:RUN, message:msg});
     if(data.status==='NEEDS_CLARIFICATION'){
@@ -361,12 +327,11 @@ $('#chatBtn').onclick = sendChat;
 $('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat(); });
 
 function reset(){
-  REVIEW=GRAPH=null; if(POLL){clearInterval(POLL);POLL=null;}
-  ['preflight','clar','graph','summary','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
-  $('#detail').innerHTML='Select a step above.'; $('#detail').className='card muted';
+  REVIEW=null; if(POLL){clearInterval(POLL);POLL=null;}
+  ['preflight','clar','summary','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
   $('#planReadable').innerHTML='Generate a plan to see it in plain English.'; $('#planReadable').className='card muted';
   $('#approveBox').style.display='none'; $('#liveBox').style.display='none';
-  $('#chatBox').style.display='none'; $('#graph').textContent=''; $('#runErr').textContent='';
+  $('#chatBox').style.display='none'; $('#runErr').textContent='';
 }
 
 function renderClar(items){
@@ -376,58 +341,15 @@ function renderClar(items){
 }
 
 function renderPreflight(pf){
+  if(pf && pf.passed){
+    $('#preflight').innerHTML='';
+    return;
+  }
   const rows = pf.checks.map(c=>'<div class="check"><span class="dot '+(c.passed?'ok':'bad')+'"></span>'+
      '<div><b>'+esc(c.name)+'</b><div class="muted">'+esc(c.detail||'')+'</div></div></div>').join('');
   $('#preflight').innerHTML='<h2>Pre-flight ('+(pf.passed?'PASS':'FAIL')+')</h2><div class="card">'+rows+'</div>';
 }
 
-function orderedNodes(g){
-  // Topological order from the edges (works for any pipeline shape);
-  // falls back to the server's node order for anything unreachable.
-  const indeg = {}, next = {};
-  g.nodes.forEach(n=>{ indeg[n.id]=0; });
-  g.edges.forEach(e=>{ if(e.to in indeg){ indeg[e.to]++; (next[e.from]=next[e.from]||[]).push(e.to); } });
-  const queue = g.nodes.filter(n=>indeg[n.id]===0).map(n=>n.id), out=[], seen=new Set();
-  while(queue.length){
-    const id=queue.shift(); if(seen.has(id)) continue; seen.add(id); out.push(id);
-    (next[id]||[]).forEach(t=>{ if(--indeg[t]===0) queue.push(t); });
-  }
-  g.nodes.forEach(n=>{ if(!seen.has(n.id)) out.push(n.id); });
-  return out.map(id=>g.nodes.find(n=>n.id===id));
-}
-
-function renderGraph(g){
-  if(!g.nodes.length){ $('#graph').textContent='No executable steps found.'; return; }
-  const nodes = orderedNodes(g);
-  let html='<div class="graph">';
-  nodes.forEach((n,i)=>{
-    const idx = g.nodes.indexOf(n);
-    html += '<div class="node '+(n.layer||'')+'" data-idx="'+idx+'" onclick="selNode('+idx+')">'+
-            '<div class="l">'+esc(n.label)+'</div><div class="k">'+esc(n.kind)+'</div>'+
-            '<div class="k">'+esc(n.note||'')+'</div></div>';
-    if(i<nodes.length-1) html+='<div class="arrow">&rarr;<small>Succeeded</small></div>';
-  });
-  html+='</div>';
-  $('#graph').innerHTML=html;
-}
-
-// Plain-English step card — no JSON, no scripts.
-function selNode(idx){
-  document.querySelectorAll('.node').forEach(n=>n.classList.toggle('sel', n.dataset.idx==idx));
-  const n = GRAPH.nodes[idx];
-  if(!n) return;
-  const verbs = {bronze:'Lands the raw file as-is', silver:'Cleans and standardises the data',
-                 gold:'Aggregates into the business-ready output'};
-  let h = '<div><b>'+esc(n.label)+'</b></div>';
-  h += '<div style="margin-top:4px">'+esc(verbs[n.layer] || n.note || n.kind)+'.</div>';
-  if(n.source_dataset || n.sink_dataset){
-    h += '<div class="muted" style="margin-top:4px">'+esc(n.source_dataset||'?')+
-         ' &rarr; '+esc(n.sink_dataset||'?')+'</div>';
-  }
-  if(n.note && verbs[n.layer]) h += '<div class="pill" style="margin-top:4px">'+esc(n.note)+'</div>';
-  $('#detail').className='card'; $('#detail').innerHTML=h;
-}
-window.selNode = selNode;
 
 // Object counts only — to the point, no JSON dumps.
 function renderSummary(rev){
@@ -574,26 +496,6 @@ async function poll(){
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-const SAMPLE_BRD = `Build a COVID-19 medallion pipeline in Azure Data Factory ONLY (no Databricks, Synapse, or Fabric).
-
-SOURCE: Johns Hopkins CSSE daily reports, anonymous HTTPS files at
-https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_daily_reports/
-with file pattern MM-DD-YYYY.csv, parameterised by report date.
-
-STORAGE: ADLS Gen2 account 'covidlake' with bronze, silver, gold containers, Managed Identity (no keys).
-
-BRONZE: copy the raw daily CSV byte-for-byte into the bronze container. No transformation.
-
-SILVER: cast Confirmed/Deaths/Recovered/Active to integer (null -> 0), cast Last_Update to timestamp,
-add an ingestion_date audit column, drop rows with a null/empty Country_Region, and dedup on
-(Country_Region, Province_State, Last_Update). Write Parquet to silver.
-
-GOLD: sum Confirmed/Deaths/Recovered by Country_Region, compute case_fatality_rate =
-total_deaths / total_confirmed * 100 (0.0 when total_confirmed is 0), sort by total_confirmed desc.
-Write CSV to gold.
-
-ORCHESTRATION: chain Bronze -> Silver -> Gold so a failed Bronze halts downstream work.
-Provide a manual trigger and a daily schedule trigger.`;
 </script>
 </body>
 </html>

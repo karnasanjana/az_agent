@@ -143,7 +143,11 @@ def test_failing_plan_is_not_cached(monkeypatch):
     monkeypatch.setattr(extractor, "refine_plan", fake_refine)
 
     client = TestClient(app_module.app)
-    assert client.post("/plan", data={"brd": _BRD}).status_code == 422
+    r = client.post("/plan", data={"brd": _BRD})
+    # Non-convergence now asks the user (NEEDS_CLARIFICATION) instead of 422 —
+    # either way the broken plan must NOT be cached.
+    assert r.status_code == 200
+    assert r.json()["status"] == "NEEDS_CLARIFICATION"
     assert plancache.get(plancache.key(_BRD, "oneshot")) is None
 
 
@@ -152,13 +156,79 @@ def test_failing_plan_is_not_cached(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_auto_mode_extracts_oneshot_and_refines_with_tools(monkeypatch):
+    """auto: one-shot first (cheap), tool agent as extraction fallback + refine."""
+    import asyncio
+
     monkeypatch.setenv("PLAN_MODE", "auto")
     assert app_module._plan_mode() == "auto"
 
+    calls = []
+
+    async def fake_oneshot(text, message_history=None):
+        calls.append("oneshot")
+        return _good_plan(), []
+
+    async def fake_tools(text, message_history=None):
+        calls.append("tools")
+        return _good_plan(), []
+
     from agent import extractor, plantools
+    monkeypatch.setattr(extractor, "extract_plan", fake_oneshot)
+    monkeypatch.setattr(plantools, "extract_plan", fake_tools)
+
     extract, refine = app_module._plan_fns()
-    assert extract is extractor.extract_plan  # cheap single call for generation
+    asyncio.run(extract("brd"))
+    assert calls == ["oneshot"]  # tools NOT called when one-shot succeeds
     assert refine is not plantools.refine_plan  # wrapped, but backed by the tools agent
+
+
+def test_auto_mode_falls_back_to_tools_on_output_failure(monkeypatch):
+    """A large BRD can defeat the single giant JSON emission ('Exceeded maximum
+    output retries') — auto must retry via the tool agent instead of failing."""
+    import asyncio
+
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    monkeypatch.setenv("PLAN_MODE", "auto")
+    calls = []
+
+    async def failing_oneshot(text, message_history=None):
+        calls.append("oneshot")
+        raise UnexpectedModelBehavior("Exceeded maximum output retries (4)")
+
+    async def fake_tools(text, message_history=None):
+        calls.append("tools")
+        return _good_plan(), []
+
+    from agent import extractor, plantools
+    monkeypatch.setattr(extractor, "extract_plan", failing_oneshot)
+    monkeypatch.setattr(plantools, "extract_plan", fake_tools)
+
+    extract, _ = app_module._plan_fns()
+    plan, _msgs = asyncio.run(extract("huge brd"))
+    assert calls == ["oneshot", "tools"]
+    assert plan.project == "retail"
+
+
+def test_auto_mode_does_not_swallow_config_errors(monkeypatch):
+    """Only model-output failures trigger the fallback; a missing API key must
+    still surface as the original error."""
+    import asyncio
+
+    monkeypatch.setenv("PLAN_MODE", "auto")
+
+    async def config_error(text, message_history=None):
+        raise RuntimeError("Set GEMINI_API_KEY in .env")
+
+    from agent import extractor
+    monkeypatch.setattr(extractor, "extract_plan", config_error)
+
+    extract, _ = app_module._plan_fns()
+    try:
+        asyncio.run(extract("brd"))
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "GEMINI_API_KEY" in str(exc)
 
 
 def test_mode_defaults_to_auto(monkeypatch):

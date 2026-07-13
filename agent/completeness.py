@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Set
 
-from models.logical import LogicalPlan, LogicalSource, OutputPlan
+from models.logical import LogicalPlan, LogicalSource, OutputPlan, SourceFormat
 from models.spec import _OP_ARITH, _norm_op
 
 _NUMERIC = re.compile(r"-?\d+(\.\d+)?")
@@ -66,14 +66,24 @@ def check(plan: LogicalPlan) -> List[str]:
     for t in plan.transforms:
         if t.entity not in src_by_entity:
             problems.append(f"transform references unknown entity '{t.entity}'")
+        elif src_by_entity[t.entity].format == SourceFormat.binary:
+            problems.append(
+                f"transform references binary entity '{t.entity}' — binary sources "
+                "support byte-for-byte Bronze copy only"
+            )
 
     for out in plan.outputs:
         # 4. every from_entities entity exists.
         for e in out.from_entities:
             if e not in src_by_entity:
                 problems.append(f"output '{out.name}': unknown entity '{e}'")
+            elif src_by_entity[e].format == SourceFormat.binary:
+                problems.append(
+                    f"output '{out.name}': binary entity '{e}' cannot feed a data flow output"
+                )
 
-        # 6. join endpoints are within from_entities.
+        # 6. join endpoints are within from_entities. (Key presence/pairing is
+        #    enforced by JoinPlan's own validator at parse time.)
         edges = []
         for j in out.joins:
             for side in (j.left_entity, j.right_entity):
@@ -112,6 +122,13 @@ def check(plan: LogicalPlan) -> List[str]:
             available: Set[str] = set()
             for s in known_srcs:
                 available |= _entity_columns(s)
+                # Gold reads the SILVER output — every column the entity's
+                # transform derives (TenureBand, NetSales, ...) is available.
+                # Omitting these flagged correct plans and sent the repair
+                # loop chasing a problem that didn't exist.
+                xf = next((t for t in plan.transforms if t.entity == s.entity), None)
+                if xf is not None:
+                    available |= {c.new_column or c.column for c in xf.cleaning}
             available |= {d.new_column or d.column for d in out.derived}
             available |= {a.name for a in out.aggregations}
             available |= {d.new_column or d.column for d in out.post_agg_derived}
@@ -198,5 +215,118 @@ def check(plan: LogicalPlan) -> List[str]:
                     f"'{col}' is not a column of '{t.entity}' (has: {sorted(available)})"
                 )
                 available.add(col)
+        for c in t.cleaning:
+            problems.extend(_unreachable_case_branches(f"transform '{t.entity}'", c))
+
+    for out in plan.outputs:
+        for c in list(out.derived) + list(out.post_agg_derived):
+            problems.extend(_unreachable_case_branches(f"output '{out.name}'", c))
 
     return problems
+
+
+def _canon(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def align_plan(plan: LogicalPlan) -> List[str]:
+    """Deterministically repair UNAMBIGUOUS column-name mismatches in outputs:
+    the model derives 'TenureBand' then references 'tenure_band' — same column,
+    different casing — and repair rounds churn on it. When exactly one
+    available column matches after canonicalization (lowercase, separators
+    stripped), rewrite the reference IN PLACE and return one note per fix.
+    Ambiguous or no-match names are left for check() to flag."""
+    notes: List[str] = []
+    src_by_entity = {s.entity: s for s in plan.sources}
+    xf_by_entity = {t.entity: t for t in plan.transforms}
+
+    for out in plan.outputs:
+        available: Set[str] = set()
+        for e in out.from_entities:
+            s = src_by_entity.get(e)
+            if s is None or not _entity_columns(s):
+                available = set()  # ungrounded entity — cannot align safely
+                break
+            available |= _entity_columns(s)
+            xf = xf_by_entity.get(e)
+            if xf is not None:
+                available |= {c.new_column or c.column for c in xf.cleaning}
+        if not available:
+            continue
+        available |= {d.new_column or d.column for d in out.derived}
+        available |= {a.name for a in out.aggregations}
+        available |= {d.new_column or d.column for d in out.post_agg_derived}
+        by_canon: Dict[str, Set[str]] = {}
+        for n in available:
+            by_canon.setdefault(_canon(n), set()).add(n)
+
+        def fix(name: str, where: str) -> str:
+            if not name or name in available:
+                return name
+            match = by_canon.get(_canon(name)) or set()
+            if len(match) == 1:
+                actual = next(iter(match))
+                notes.append(
+                    f"output '{out.name}': aligned column reference "
+                    f"'{name}' -> '{actual}' ({where})"
+                )
+                return actual
+            return name
+
+        for j in out.joins:
+            j.left_keys = [fix(k, "join key") for k in j.left_keys]
+            j.right_keys = [fix(k, "join key") for k in j.right_keys]
+        out.group_by = [fix(g, "group_by") for g in out.group_by]
+        for a in out.aggregations:
+            a.column = fix(a.column, "aggregation")
+        for srt in out.sort:
+            srt.column = fix(srt.column, "sort")
+        for f in out.filters:
+            f.column = fix(f.column, "filter")
+        for d in out.post_agg_derived:
+            d.column = fix(d.column, "post-aggregation derived")
+    return notes
+
+
+def _branch_matches(op: str, threshold: float, x: float) -> bool:
+    key = _norm_op(op)
+    return {
+        "lt": x < threshold, "le": x <= threshold,
+        "gt": x > threshold, "ge": x >= threshold,
+        "eq": x == threshold, "ne": x != threshold,
+    }.get(key, False)
+
+
+def _unreachable_case_branches(where: str, c) -> List[str]:
+    """Detect case branches that can NEVER match because earlier branches
+    already cover every value — e.g. StockStatus [gt 10, le 10, gt 0]: the
+    third branch is dead and quantity 0 lands in the wrong bucket. Numeric
+    thresholds only (sample-point evaluation, first-match-wins semantics);
+    non-numeric branches are skipped."""
+    when = list(getattr(c, "when", None) or [])
+    if len(when) < 2 or _norm_op(c.op or "") != "case":
+        return []
+    try:
+        thresholds = [float(b.value) for b in when]
+    except (TypeError, ValueError):
+        return []
+    points: Set[float] = set()
+    for v in thresholds:
+        points.update({v, v - 0.5, v + 0.5})
+    points.add(min(thresholds) - 1e9)
+    points.add(max(thresholds) + 1e9)
+    out: List[str] = []
+    for i, b in enumerate(when[1:], start=1):
+        reachable = any(
+            _branch_matches(b.op, thresholds[i], p)
+            and not any(_branch_matches(w.op, thresholds[j], p) for j, w in enumerate(when[:i]))
+            for p in points
+        )
+        if not reachable:
+            out.append(
+                f"{where}: case on '{c.column}' branch {i + 1} "
+                f"({b.op} {b.value} -> {b.then}) can never match — earlier "
+                "branches already cover those values; reorder the branches or "
+                "adjust the thresholds"
+            )
+    return out
