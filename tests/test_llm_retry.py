@@ -87,6 +87,45 @@ def test_async_non_transient_not_retried():
     assert agent.calls == 1
 
 
+def test_async_network_error_retried():
+    # BRD1 incident: httpx.ReadError('') (remote dropped mid-read) killed /plan
+    # outright — network transport errors and timeouts must retry like 503s.
+    import httpx
+
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise httpx.ReadError("")
+        return "ok"
+
+    assert asyncio.run(retry_async(flaky)) == "ok"
+    assert len(calls) == 3
+
+
+def test_async_timeout_retried():
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 2:
+            raise TimeoutError()
+        return "ok"
+
+    assert asyncio.run(retry_async(flaky)) == "ok"
+    assert len(calls) == 2
+
+
+def test_async_real_bug_not_retried():
+    # A genuine code bug (KeyError, ValueError...) must NOT be absorbed.
+    async def broken():
+        raise KeyError("real bug")
+
+    with pytest.raises(KeyError):
+        asyncio.run(retry_async(broken))
+
+
 def test_async_fn_rebuilt_each_attempt():
     # The plan-tools path passes a factory that must run from scratch per
     # attempt (fresh PlanSession) — verify the factory is re-invoked.

@@ -207,6 +207,46 @@ _DS_KIND_BY_FORMAT = {
 }
 
 
+# Cosmetic string cleaners: dropping one from a numeric column loses nothing
+# (a number has no whitespace, case, or special characters). Intent-bearing
+# string ops (replace/concat/substring/regex) are NOT here — a type clash on
+# those means a real requirement mismatch that typecheck must surface.
+_COSMETIC_STRING_OPS = {
+    "trim", "upper", "lower", "proper", "propercase", "initcap",
+    "titlecase", "title",
+}
+
+
+def _drop_string_ops_on_non_string(plan: LogicalPlan) -> None:
+    """Remove in-place cosmetic string ops targeting a column whose effective
+    type (source schema + casts, tracked through prior ops) is known non-string.
+    Each drop is recorded in plan.assumptions. Unknown types are left alone —
+    ungrounded plans keep today's behavior."""
+    from agent.typecheck import _op_result_type
+    from models.spec import _norm_op, _OP_BLANK_DEFAULT, _OP_REMOVE_SPECIAL
+
+    cosmetic = _COSMETIC_STRING_OPS | _OP_BLANK_DEFAULT | _OP_REMOVE_SPECIAL
+    src_by_entity = {s.entity: s for s in plan.sources}
+    for xf in plan.transforms:
+        src = src_by_entity.get(xf.entity)
+        types = {c.name: (c.type or "string") for c in (src.columns if src else [])}
+        types.update({c.name: c.type for c in xf.casts})
+        kept = []
+        for op in xf.cleaning:
+            key = _norm_op(op.op)
+            in_place = not op.new_column or op.new_column == op.column
+            ty = types.get(op.column, "").strip().lower()
+            if key in cosmetic and in_place and ty and ty != "string":
+                plan.assumptions.append(
+                    f"'{xf.entity}': skipped {op.op}({op.column}) — column is "
+                    f"{ty}, a cosmetic string cleanup does not apply"
+                )
+                continue
+            types[op.new_column or op.column] = _op_result_type(key, op.column, types)
+            kept.append(op)
+        xf.cleaning = kept
+
+
 # --------------------------------------------------------------------------- #
 # Compiler
 # --------------------------------------------------------------------------- #
@@ -216,6 +256,12 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
     # Delta-safe column names first: every downstream reference sees the safe
     # names; the silver source projection keeps the file's original header.
     plan, _delta_renames, _original_cols = _sanitize_delta_columns(plan)
+
+    # Drop cosmetic string cleaners on known non-string columns BEFORE anything
+    # renders. "Trim all string columns" makes the model trim zip_code (typed
+    # integer by grounding); typecheck then fails preflight and only a lucky
+    # LLM repair round saves the run. Deterministic here = no dice-roll.
+    _drop_string_ops_on_non_string(plan)
 
     project = plan.project
     src_by_entity: Dict[str, LogicalSource] = {s.entity: s for s in plan.sources}
@@ -1031,6 +1077,18 @@ def _gold_transforms(
                 join_type=_JOIN_TYPE.get(j.type, "inner"),
                 condition=cond,
             )
+        )
+
+    if out.joins:
+        # Joins keep BOTH sides' same-named columns (at minimum the join key);
+        # a later plain-name reference — countDistinct(order_id) in
+        # aggregateRows — is ambiguous and the Studio flags "columns which are
+        # not present in current context" even though the pipeline run reports
+        # success (bike-store gold). One dedup select AFTER all joins (never
+        # between them — join conditions use src@col qualifiers, which a
+        # select would strip) keeps the left copy of each duplicate.
+        transforms.append(
+            Transform(kind=TransformKind.select, name="dedupJoinColumns", columns=[])
         )
 
     if out.derived:

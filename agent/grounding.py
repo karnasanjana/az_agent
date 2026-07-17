@@ -323,6 +323,24 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
         if note not in plan.assumptions:
             plan.assumptions.append(note)
         notes.append(note)
+
+    # LOUD when validation is blind: an entity used by transforms/outputs whose
+    # schema could NOT be verified (non-CSV source, missing/unreadable file)
+    # skips every column check — the model's column list is a guess. One note
+    # per entity so the plan review shows exactly what is unverified.
+    used = {t.entity for t in plan.transforms} | {
+        e for o in plan.outputs for e in o.from_entities
+    }
+    for src in plan.sources:
+        if src.entity in used and not src.columns and src.format != SourceFormat.binary:
+            note = (
+                f"schema for '{src.entity}' could not be verified against real "
+                "data — its column references are UNCHECKED until the source "
+                "is readable"
+            )
+            if note not in plan.assumptions:
+                plan.assumptions.append(note)
+            notes.append(note)
     return notes
 
 

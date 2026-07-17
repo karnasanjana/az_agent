@@ -443,6 +443,19 @@ def _transform_dsl(
         return f"{input_stream} sort({keys}) ~> {t.name}"
 
     if t.kind == TransformKind.select:
+        if not t.columns:
+            # Select-all with duplicate-column dedup. A join carries BOTH
+            # sides' same-named columns (the join key itself, e.g. order_id in
+            # orders ⋈ order_items) downstream; any later plain-name reference
+            # — countDistinct(order_id) in aggregateRows — is then ambiguous
+            # and the Studio flags "columns which are not present in current
+            # context" (bike-store gold). The skip flags keep the first
+            # (left-stream) copy and drop the rest.
+            return (
+                f"{input_stream} select(mapColumn(each(match(true()))),\n"
+                f"    skipDuplicateMapInputs: true,\n"
+                f"    skipDuplicateMapOutputs: true) ~> {t.name}"
+            )
         cols = ", ".join(f"{dsl_name(c.name)} = {c.expression}" for c in t.columns)
         return f"{input_stream} select(mapColumn({cols})) ~> {t.name}"
 
@@ -520,9 +533,10 @@ def _effective_transforms(df: DataFlow) -> "List[Transform]":
     for t in df.transforms:
         if t.kind == TransformKind.aggregate and not t.group_by and not t.columns:
             continue
-        if t.kind in (TransformKind.cast, TransformKind.derived, TransformKind.select) \
-                and not t.columns:
+        if t.kind in (TransformKind.cast, TransformKind.derived) and not t.columns:
             continue
+        # NOT select: an empty select renders as a valid select-all dedup
+        # (see _render_transform) — the compiler emits one after joins.
         if t.kind == TransformKind.filter and not (t.condition or "").strip():
             continue
         if t.kind == TransformKind.sort and not t.order_by:

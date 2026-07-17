@@ -19,6 +19,20 @@ _TRIES = 3
 _FIRST_DELAY = 5.0
 
 
+def _is_transient_network(exc: BaseException) -> bool:
+    """Timeouts AND connection-level failures are transient: the per-request
+    LLM_TIMEOUT in config.py turns a stalled connection into an exception, and
+    httpx raises ReadError/ConnectError (subclasses of TransportError) when the
+    remote end drops mid-request — a fresh attempt usually succeeds (observed:
+    ReadError('') killed /plan twice on BRD1). Match by type NAME so no
+    provider-specific import (httpx, google-genai, anthropic) is needed."""
+    for klass in type(exc).__mro__:
+        name = klass.__name__.lower()
+        if "timeout" in name or name == "transporterror":
+            return True
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
 def retry_sync(fn: "Callable[[], Any]", tries: int = _TRIES) -> Any:
     """``fn()`` with exponential backoff on transient provider errors."""
     from pydantic_ai.exceptions import ModelHTTPError
@@ -29,6 +43,11 @@ def retry_sync(fn: "Callable[[], Any]", tries: int = _TRIES) -> Any:
             return fn()
         except ModelHTTPError as exc:
             if exc.status_code not in TRANSIENT_LLM_STATUSES or attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+        except Exception as exc:  # noqa: BLE001 — only transient network errors retry
+            if not _is_transient_network(exc) or attempt == tries - 1:
                 raise
             time.sleep(delay)
             delay *= 2
@@ -47,6 +66,11 @@ async def retry_async(fn: "Callable[[], Awaitable[Any]]", tries: int = _TRIES) -
             return await fn()
         except ModelHTTPError as exc:
             if exc.status_code not in TRANSIENT_LLM_STATUSES or attempt == tries - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+        except Exception as exc:  # noqa: BLE001 — only transient network errors retry
+            if not _is_transient_network(exc) or attempt == tries - 1:
                 raise
             await asyncio.sleep(delay)
             delay *= 2

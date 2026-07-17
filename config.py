@@ -234,6 +234,8 @@ def _gemini_model():
     'no longer available' on 2026-07-09 and bricked the plan/heal loops) and the
     alias always tracks a live one. Pin an explicit id in .env when eval
     stability matters more than availability."""
+    from google.genai import Client
+    from google.genai.types import HttpOptions
     from pydantic_ai.models.google import GoogleModel
     from pydantic_ai.providers.google import GoogleProvider
 
@@ -243,7 +245,12 @@ def _gemini_model():
         raise RuntimeError(
             "Set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env to use LLM_PROVIDER=gemini."
         )
-    return GoogleModel(model_id, provider=GoogleProvider(api_key=api_key))
+    # Hard per-request timeout: without one a stalled HTTP call blocks /plan
+    # forever (observed 300s+ hangs) and retry.py never gets a chance — it only
+    # fires on a returned error. LLM_TIMEOUT is seconds; HttpOptions wants ms.
+    timeout_s = float(os.environ.get("LLM_TIMEOUT", "60"))
+    client = Client(api_key=api_key, http_options=HttpOptions(timeout=int(timeout_s * 1000)))
+    return GoogleModel(model_id, provider=GoogleProvider(client=client))
 
 
 # provider aliases -> builder

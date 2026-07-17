@@ -45,6 +45,106 @@ def _connected(entities: List[str], edges: List[tuple]) -> bool:
     return len(roots) == 1
 
 
+_PRUNE_OUT_RE = re.compile(r"output '([^']+)'")
+
+
+def _prune_transform_ops(plan: LogicalPlan) -> List[str]:
+    """Drop transform pieces that reference columns the (grounded) source data
+    does not have — casts, cleaning ops, filters, dedup keys. One note each.
+    Entities without a known schema are left untouched."""
+    notes: List[str] = []
+    src_by_entity = {s.entity: s for s in plan.sources}
+    for t in plan.transforms:
+        src = src_by_entity.get(t.entity)
+        if src is None or not _entity_columns(src):
+            continue
+        available = set(_entity_columns(src))
+        kept_casts = []
+        for c in t.casts:
+            if c.name in available:
+                kept_casts.append(c)
+            else:
+                notes.append(
+                    f"'{t.entity}': cast of '{c.name}' not built — the source "
+                    "data has no such column"
+                )
+        t.casts = kept_casts
+        kept_ops = []
+        for op in t.cleaning:
+            operands = [op.column] + (
+                list(op.args) if _norm_op(op.op) in _OP_ARITH else []
+            )
+            missing = [
+                o for o in operands
+                if not _NUMERIC.fullmatch(str(o).strip()) and o not in available
+            ]
+            if missing:
+                notes.append(
+                    f"'{t.entity}': {op.op} -> "
+                    f"'{op.new_column or op.column}' not built — column(s) "
+                    f"{missing} are not in the source data"
+                )
+                continue
+            available.add(op.new_column or op.column)
+            kept_ops.append(op)
+        t.cleaning = kept_ops
+        kept_filters = []
+        for f in t.filters:
+            if f.column in available:
+                kept_filters.append(f)
+            else:
+                notes.append(
+                    f"'{t.entity}': filter on '{f.column}' not built — the "
+                    "source data has no such column"
+                )
+        t.filters = kept_filters
+        kept_keys = [k for k in t.dedup_keys if k in available]
+        for k in t.dedup_keys:
+            if k not in available:
+                notes.append(
+                    f"'{t.entity}': dedup key '{k}' not built — the source "
+                    "data has no such column"
+                )
+        t.dedup_keys = kept_keys
+    return notes
+
+
+def prune_unbuildable(plan: LogicalPlan, problems: List[str]) -> List[str]:
+    """LAST RESORT after repair rounds exhaust: drop the pieces the checker
+    can't resolve so the REST of the plan still builds, and record each as a
+    'not built' assumption the user can act on in chat.
+
+    Build-don't-ask, reliability over a wrong guess: a transform op or gold
+    output that references a column not in the data is REMOVED — not shipped
+    with a guessed column and not turned into a question wall that builds
+    nothing (BRD1 live run: 8 outputs, 0 built). Returns one note per drop."""
+    notes = _prune_transform_ops(plan)
+    # Transform pruning may remove derived columns outputs depended on — take a
+    # fresh problem list, then drop every output that still has a problem.
+    bad = {
+        m.group(1)
+        for p in check(plan)
+        for m in [_PRUNE_OUT_RE.search(p)]
+        if m
+    }
+    for o in plan.outputs:
+        if o.name in bad:
+            notes.append(
+                f"gold output '{o.name}' not built: it references a column that "
+                "isn't in the source data — add or correct that column in chat "
+                "and I'll build it"
+            )
+    plan.outputs = [o for o in plan.outputs if o.name not in bad]
+    # A pipeline that still lists a removed output would re-trigger 'gold
+    # output unknown' — drop those references too.
+    for pl in plan.pipelines:
+        pl.gold = [g for g in pl.gold if g not in bad]
+    for n in notes:
+        if n not in plan.assumptions:
+            plan.assumptions.append(n)
+    return notes
+
+
 def check(plan: LogicalPlan) -> List[str]:
     """Problems that make the plan inconsistent; empty list = pass."""
     problems: List[str] = []
@@ -187,12 +287,23 @@ def check(plan: LogicalPlan) -> List[str]:
         if not cols:
             continue
         available = set(cols)
+        # Missing columns are reported ONCE via this set — never added to
+        # `available`, which polluted later error messages with hallucinated
+        # columns in the "has:" list (BRD1 live run showed birth_date as
+        # existing right after flagging it missing).
+        reported: Set[str] = set()
+
+        def _flag(name: str) -> None:
+            if name not in reported:
+                problems.append(
+                    f"'{name}' is not a column of '{t.entity}' (has: {sorted(available)})"
+                )
+                reported.add(name)
+
         for col in (c.name for c in t.casts):
             if col not in available:
-                problems.append(
-                    f"'{col}' is not a column of '{t.entity}' (has: {sorted(available)})"
-                )
-            available.add(col)
+                _flag(col)
+            available.add(col)  # the cast's TARGET is available downstream
         # Cleaning ops in order: arithmetic args are operands (columns or
         # numbers), other ops' args are literals; a new_column becomes available
         # to LATER ops (the compiler splits chained ops into sequential
@@ -203,18 +314,14 @@ def check(plan: LogicalPlan) -> List[str]:
                 if _NUMERIC.fullmatch(str(operand).strip()):
                     continue  # numeric literal, not a column
                 if operand not in available:
-                    problems.append(
-                        f"'{operand}' is not a column of '{t.entity}' "
-                        f"(has: {sorted(available)})"
-                    )
-                    available.add(operand)  # report once
-            available.add(c.new_column or c.column)
+                    _flag(operand)
+            # Only a real derivation introduces a NEW name; an in-place op's
+            # column is either already available or stays (truthfully) missing.
+            if c.new_column:
+                available.add(c.new_column)
         for col in [f.column for f in t.filters] + list(t.dedup_keys):
             if col not in available:
-                problems.append(
-                    f"'{col}' is not a column of '{t.entity}' (has: {sorted(available)})"
-                )
-                available.add(col)
+                _flag(col)
         for c in t.cleaning:
             problems.extend(_unreachable_case_branches(f"transform '{t.entity}'", c))
 

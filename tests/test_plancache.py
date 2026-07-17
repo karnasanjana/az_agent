@@ -126,16 +126,15 @@ def test_second_identical_brd_skips_the_model(monkeypatch):
 
 
 def test_failing_plan_is_not_cached(monkeypatch):
-    """Only a plan that passed every check may be reused."""
+    """Only a plan that passed every check may be reused. An unprunable plan
+    (no sources) stays NEEDS_CLARIFICATION and must NOT enter the cache."""
+    from models.logical import LogicalPlan
+
     async def fake_extract(text, message_history=None):
-        bad = _good_plan()
-        bad.outputs[0].aggregations = []  # group_by w/o aggregations
-        return bad, []
+        return LogicalPlan(project="empty", sources=[]), []
 
     async def fake_refine(instruction, message_history):
-        bad = _good_plan()
-        bad.outputs[0].aggregations = []  # never converges
-        return bad, message_history
+        return LogicalPlan(project="empty", sources=[]), message_history
 
     monkeypatch.setenv("PLAN_MODE", "oneshot")
     from agent import extractor
@@ -144,8 +143,6 @@ def test_failing_plan_is_not_cached(monkeypatch):
 
     client = TestClient(app_module.app)
     r = client.post("/plan", data={"brd": _BRD})
-    # Non-convergence now asks the user (NEEDS_CLARIFICATION) instead of 422 —
-    # either way the broken plan must NOT be cached.
     assert r.status_code == 200
     assert r.json()["status"] == "NEEDS_CLARIFICATION"
     assert plancache.get(plancache.key(_BRD, "oneshot")) is None

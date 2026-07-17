@@ -337,8 +337,10 @@ def test_proper_case_and_arithmetic(monkeypatch):
     assert exprs["first_name"] == (
         "concat(upper(left(first_name, 1)), lower(substring(first_name, 2)))"
     )
-    assert exprs["one_minus_discount"] == "(1 - discount)"
-    assert exprs["line_total"] == "(quantity * list_price * one_minus_discount)"
+    # toDouble: written Delta type must match the projected 'double' (gold
+    # source schemas) — bare int*decimal arithmetic writes decimal(38,x).
+    assert exprs["one_minus_discount"] == "toDouble(1 - discount)"
+    assert exprs["line_total"] == "toDouble(quantity * list_price * one_minus_discount)"
     # chained op referencing one_minus_discount lands in a LATER transform —
     # sibling derived columns can't see each other inside one ADF transform.
     derived = [t for t in df.transforms if t.columns]
@@ -515,3 +517,58 @@ def test_coalesce_default_matches_column_type():
     assert exprs["product_name"] == "coalesce(product_name, '0')"
     assert exprs["weight_g"] == "coalesce(weight_g, 0)"
     assert exprs["mystery"] == "coalesce(mystery, 0)"
+
+
+def test_cosmetic_string_op_on_numeric_dropped():
+    """BRD2/BRD3 live incident: 'trim all string columns' makes the model trim
+    zip_code (grounded integer) -> typecheck fails preflight and only a lucky
+    LLM repair saves the run. The compiler must drop the op deterministically
+    (with an assumption note) and keep trims on real string columns."""
+    plan = LogicalPlan(
+        project="trim_int",
+        sources=[LogicalSource(
+            entity="customers", format="csv", container="landing",
+            file_name="customers.csv",
+            columns=[LogicalColumn(name="customer_id", type="integer"),
+                     LogicalColumn(name="first_name", type="string"),
+                     LogicalColumn(name="zip_code", type="integer")])],
+        transforms=[EntityTransform(
+            entity="customers",
+            cleaning=[
+                CleaningOp(op="trim", column="first_name"),   # keep: string
+                CleaningOp(op="trim", column="zip_code"),     # drop: integer
+                CleaningOp(op="upper", column="zip_code"),    # drop: integer
+            ],
+        )],
+    )
+    spec = compile_plan(plan)
+    df = next(d for d in spec.dataflows if d.name == "df_silver_customers")
+    exprs = {c.name: c.expression for t in df.transforms for c in t.columns}
+    assert exprs["first_name"] == "trim(first_name)"
+    assert "zip_code" not in exprs  # both numeric-target ops dropped
+    dropped_notes = [a for a in spec.assumptions if "zip_code" in a and "skipped" in a]
+    assert len(dropped_notes) == 2
+    # and the spec passes preflight instead of dying on expression_types
+    run_id = "test_trim_int_drop"
+    try:
+        builder.write_artifacts(spec, run_id)
+        assert preflight.validate(run_id)["passed"]
+    finally:
+        shutil.rmtree(builder.artifacts_dir(run_id), ignore_errors=True)
+
+
+def test_join_emits_dedup_select():
+    """After a join both streams carry the join key (order_id twice) — a later
+    bare-name reference (countDistinct(order_id)) is ambiguous and ADF Studio
+    flags the aggregate. One select-all dedup with skipDuplicate flags must sit
+    between the last join and everything downstream."""
+    spec = compile_plan(_plan())
+    datasets = {d.name: d for d in spec.datasets}
+    gold = next(df for df in spec.dataflows if df.name.startswith("df_gold"))
+    script = builder.build_dataflow_script(gold, datasets)
+    assert "dedupJoinColumns" in script
+    assert "skipDuplicateMapInputs: true" in script
+    # dedup comes AFTER the join and BEFORE the aggregate
+    assert script.index("join1") < script.index("dedupJoinColumns") < script.index("aggregateRows")
+    # joins still use qualified src@col conditions (select must not precede them)
+    assert "srcOrders@customer_id == srcCustomers@customer_id" in script

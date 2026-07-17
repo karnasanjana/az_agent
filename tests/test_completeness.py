@@ -130,3 +130,29 @@ def test_unknown_column_in_output():
         ],
     )
     assert _has(check(plan), "'ghost' is not a column of")
+
+
+def test_missing_column_reports_stay_truthful():
+    """BRD1 live run: after flagging birth_date missing, the NEXT error's
+    'has:' list showed birth_date as existing — report-once must not pollute
+    the availability set. Derived names stay usable downstream."""
+    from models.logical import CaseBranch
+
+    plan = LogicalPlan(
+        project="x",
+        sources=[LogicalSource(entity="customers", format="csv", file_name="c.csv",
+                               columns=[LogicalColumn(name="customer_id"),
+                                        LogicalColumn(name="city")])],
+        transforms=[EntityTransform(entity="customers", cleaning=[
+            CleaningOp(op="trim", column="birth_date"),
+            CleaningOp(op="upper", column="birth_date"),  # same col: one report
+            CleaningOp(op="trim", column="is_active"),
+            CleaningOp(op="case", column="birth_date",
+                       when=[CaseBranch(op="lt", value="1980", then="'S'")],
+                       otherwise="'A'", new_column="age_group"),
+            CleaningOp(op="upper", column="age_group"),  # derived name: no flag
+        ])],
+    )
+    probs = check(plan)
+    assert len(probs) == 2  # birth_date once, is_active once, age_group never
+    assert all("birth_date" not in p.split("has:")[1] for p in probs)

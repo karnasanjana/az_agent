@@ -375,7 +375,11 @@ def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
         if len(operands) < 2:
             return None  # arithmetic needs at least two operands
         sym = _OP_ARITH[key]
-        return "(" + f" {sym} ".join(_render_operand(o) for o in operands) + ")"
+        # toDouble: Spark types int*decimal arithmetic as decimal(38,x), but
+        # _op_result_type projects (and gold sources declare) 'double' — the
+        # written Delta schema must match that projection or gold flows hit
+        # column/type mismatches at runtime (DF-EXPR-010 / debug "mismatch").
+        return "toDouble(" + f" {sym} ".join(_render_operand(o) for o in operands) + ")"
     if key == "concat":
         # concat args may be COLUMN NAMES or pre-quoted literals ("' '").
         # Rendering bare identifiers through _render_literal turned the column
@@ -745,16 +749,17 @@ class DataFlow(BaseModel):
 
     @model_validator(mode="after")
     def _drop_noop_transforms(self) -> "DataFlow":
-        """The LLM emits placeholder transforms with no working parts — e.g. a
-        trailing select named 'selectallforsilver' with columns: [], meant as
-        'keep everything'. The builder renders that as `select(mapColumn())`,
-        which maps NOTHING into the sink; an empty derive/filter/sort is equally
-        broken DSL. A contentless transform is a pass-through in intent, so drop
-        it — the chain reconnects around it (transforms are a linear chain; only
-        additional-source stream names can be a join's right_stream)."""
+        """The LLM emits placeholder transforms with no working parts — e.g. an
+        empty derive/filter/sort is broken DSL. A contentless transform is a
+        pass-through in intent, so drop it — the chain reconnects around it
+        (transforms are a linear chain; only additional-source stream names can
+        be a join's right_stream). An empty SELECT is kept: the builder renders
+        it as a select-all with duplicate-column dedup ('keep everything' — the
+        LLM's 'selectallforsilver' intent, and the compiler's dedupJoinColumns
+        fix for ambiguous post-join references)."""
 
         def noop(t: Transform) -> bool:
-            if t.kind in (TransformKind.cast, TransformKind.derived, TransformKind.select):
+            if t.kind in (TransformKind.cast, TransformKind.derived):
                 return not t.columns
             if t.kind == TransformKind.aggregate:
                 return not t.columns and not t.group_by

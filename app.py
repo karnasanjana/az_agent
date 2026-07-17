@@ -559,6 +559,12 @@ async def _run_logical(
             plan, messages = await produce()
         phases.add_usage("extract", _latest_plan_usage())
 
+    # Scope watermark: what the FIRST plan promised. A repair round can
+    # satisfy the checker by DELETING the piece it was asked to fix — any
+    # output that silently vanishes between here and the accepted plan is
+    # flagged below, never dropped quietly.
+    initial_outputs = {o.name for o in plan.outputs}
+
     def _ground(p):
         """Stamp real source schemas over whatever columns the model wrote.
 
@@ -629,7 +635,16 @@ async def _run_logical(
         # when problems genuinely remain.
         problems = check(plan)
         if problems:
-            questions = triage.questions_for(problems)
+            # Last resort BEFORE a question wall: drop the unbuildable pieces
+            # (transform ops / outputs referencing columns the data doesn't
+            # have) and build the rest — each drop rides as a visible note.
+            from agent.completeness import prune_unbuildable
+
+            with phases.phase("prune_unbuildable"):
+                prune_unbuildable(plan, problems)
+            problems = check(plan)
+        if problems:
+            questions = triage.questions_for(problems)[:2]  # match the max-2 contract
             prev = _RUNS.get(run_id, {})
             _RUNS[run_id] = {
                 **prev,
@@ -677,6 +692,19 @@ async def _run_logical(
         _ground(cand)
         if not check(cand):  # accept the triaged plan only if still consistent
             plan, messages = cand, cand_msgs
+
+    # Scope guard: outputs the FIRST plan promised that no longer exist were
+    # deleted by a repair round (deleting the offending piece satisfies the
+    # checker). Never silent — each rides as a visible note the user can act on.
+    for lost in sorted(initial_outputs - {o.name for o in plan.outputs}):
+        if any(f"'{lost}'" in a and "not built" in a for a in plan.assumptions):
+            continue  # prune_unbuildable already noted this drop
+        note = (
+            f"output '{lost}' was dropped during automatic repair — it could "
+            "not be made consistent; ask in chat to restore or adjust it"
+        )
+        if note not in plan.assumptions:
+            plan.assumptions.append(note)
 
     with phases.phase("compile"):
         spec = compile_plan(plan)
@@ -747,7 +775,7 @@ async def _run_logical(
         ]
         resp["clarifications"] = (
             list(resp.get("clarifications") or []) + triage.questions_for(still_failed)
-        )
+        )[:2]  # match the max-2 contract everywhere
         _RUNS[run_id]["clarifications"] = resp["clarifications"]
 
     if _RUNS[run_id].get("preflight", {}).get("passed") and not mock_mode():
