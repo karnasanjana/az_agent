@@ -27,6 +27,7 @@ from typing_extensions import Annotated, Literal
 class AuthKind(str, Enum):
     anonymous = "anonymous"
     managed_identity = "managed_identity"
+    service_principal = "service_principal"  # Entra app registration (client id + secret)
 
 
 class DatasetKind(str, Enum):
@@ -36,6 +37,7 @@ class DatasetKind(str, Enum):
     rest_resource = "RestResource"
     binary = "Binary"                 # byte-for-byte copy of any file type
     azure_sql_table = "AzureSqlTable"  # table in an Azure SQL Database source
+    dataverse_entity = "CommonDataServiceForAppsEntity"  # a Dataverse table (source only)
     delta = "Delta"                    # Delta Lake table — data flows only (inline),
                                        # never a Copy source/sink or an ADF dataset resource
 
@@ -192,6 +194,8 @@ class Dataset(BaseModel):
     # AzureSqlTable only: the source table.
     schema_name: Optional[str] = None  # e.g. dbo
     table_name: Optional[str] = None
+    # CommonDataServiceForAppsEntity only: the Dataverse entity-set name.
+    entity_name: Optional[str] = None
     parameters: List[str] = Field(default_factory=list)
     columns: List[Column] = Field(default_factory=list)
     first_row_as_header: bool = True

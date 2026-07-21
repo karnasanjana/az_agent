@@ -266,22 +266,48 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
     # Sink formats ride on every line — the reviewer and the human must see
     # WHERE each stage lands and AS WHAT (Delta/CSV/Parquet), not infer it.
     ds_kind = {d.name: d.kind.value for d in spec.datasets}
+    ds_by_name = {d.name: d for d in spec.datasets}
+    ls_by_name = {ls.name: ls for ls in spec.linked_services}
 
     def _fmt(ds_name: str) -> str:
         kind = ds_kind.get(ds_name)
         return f" [{kind}]" if kind else ""
 
+    def _origin(ds_name: str) -> str:
+        """Human name of where a source dataset pulls FROM — so the plan says
+        'from Dataverse' / 'from GitHub' / 'from landing', not just a ds_ name."""
+        from models.spec import DatasetKind
+
+        d = ds_by_name.get(ds_name)
+        if d is None:
+            return ""
+        if d.kind == DatasetKind.dataverse_entity:
+            return "Dataverse"
+        if d.kind == DatasetKind.azure_sql_table:
+            return "Azure SQL"
+        if d.relative_url is not None:  # HTTP-hosted file
+            url = (getattr(ls_by_name.get(d.linked_service), "url", "") or "").lower()
+            return "GitHub" if "github" in url else "HTTP"
+        if d.location and d.location.container:
+            return f"{d.location.container} container"
+        return ""
+
+    def _from(ds_name: str) -> str:
+        o = _origin(ds_name)
+        return f" from {o}" if o else ""
+
     _, bronze_act = find_bronze_copy(spec)
     if bronze_act is not None:
         out.append(
-            f"- **Bronze**: copy `{bronze_act.source_dataset}` → "
+            f"- **Bronze**{_from(bronze_act.source_dataset)}: copy "
+            f"`{bronze_act.source_dataset}` → "
             f"`{bronze_act.sink_dataset}`{_fmt(bronze_act.sink_dataset)} (raw, no transform)"
         )
     for pl in spec.pipelines:
         for act in pl.activities:
             if act.type == "Copy" and act is not bronze_act:
                 out.append(
-                    f"- **Copy** `{act.name}`: "
+                    f"- **Copy**{_from(act.source_dataset)} `{act.name}`: "
                     f"`{act.source_dataset}` → `{act.sink_dataset}`{_fmt(act.sink_dataset)}"
                 )
     for df in spec.dataflows:

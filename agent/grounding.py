@@ -286,6 +286,28 @@ def _expr_type(expression: str, cols: Dict[str, str]) -> str:
     return _EXPR_TYPE.get(fn, "string")
 
 
+def _dataverse_columns(env_url: str, entity_set: str) -> "List[LogicalColumn]":
+    """Best-effort REAL schema from Dataverse metadata (typed, works with 0 rows).
+    Returns [] on any failure — grounding must never block planning."""
+    try:
+        import sys
+
+        tools = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"
+        )
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from source_schema import dataverse_schema
+        from agent.compiler import _dv_logical_name
+
+        return [
+            LogicalColumn(name=c["name"], type=c["type"])
+            for c in dataverse_schema(env_url, _dv_logical_name(entity_set))
+        ]
+    except Exception:  # noqa: BLE001 — best-effort; unreachable env leaves the plan
+        return []
+
+
 def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     """Stamp source schemas into a LogicalPlan before completeness.check().
 
@@ -319,6 +341,28 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
             f"{'…' if len(names) > 8 else ''}"
             + (f"; inferred types: {', '.join(typed[:8])}" if typed else "")
             + ")"
+        )
+        if note not in plan.assumptions:
+            plan.assumptions.append(note)
+        notes.append(note)
+
+    # Dataverse sources ground from the environment's METADATA API (schema before
+    # any data lands — no CSV first-run gap). This is what turns a BRD column GUESS
+    # into a CHECKED reference: completeness/typecheck then run against the REAL
+    # schema and reject any column the entity does not have, BEFORE deploy.
+    # ponytail: stamps the FULL entity schema (like a CSV header) so gold columns
+    # not touched in silver stay available; add a projection step if the wide
+    # output ever matters.
+    for src in plan.sources:
+        if src.format != SourceFormat.dataverse or not (src.dataverse_url and src.entity_set):
+            continue
+        cols = _dataverse_columns(src.dataverse_url, src.entity_set)
+        if not cols:
+            continue
+        src.columns = cols
+        note = (
+            f"Grounded source '{src.entity}' from Dataverse metadata "
+            f"({len(cols)} columns) — references now CHECKED against the real schema"
         )
         if note not in plan.assumptions:
             plan.assumptions.append(note)

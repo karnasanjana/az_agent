@@ -151,6 +151,13 @@ def _synthetic_storage_ls() -> LinkedService:
     return LinkedService(name="ls_storage", type=ls_type, auth=AuthKind.managed_identity)
 
 
+def _sp_cred(name: str) -> str:
+    """Service-principal credential from env at build time (source app first, then
+    the deploy SP). Keeps secrets out of the spec — the value lands only in the
+    linked-service JSON ADF encrypts on deploy."""
+    return os.environ.get(f"SOURCE_{name}") or os.environ.get(f"AZURE_{name}") or ""
+
+
 def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
     if ls.type == "HttpServer":
         return {
@@ -181,6 +188,27 @@ def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
                 "server": server,
                 "database": ls.database or "",
                 "authenticationType": "SystemAssignedManagedIdentity",
+            },
+        }
+    if ls.type == "CommonDataServiceForApps":
+        # Dataverse rejects System-Assigned MI (Supported: AADServicePrincipal,
+        # Office365, user-assigned ManagedIdentity). The granted Application User
+        # is the Entra app registration, so use AADServicePrincipal with its
+        # client id + secret, pulled from SOURCE_*/AZURE_* env at build time (never
+        # stored in the spec). Swap to a Key Vault ref for production per
+        # docs/dataverse-source-wiring.md.
+        return {
+            "type": "CommonDataServiceForApps",
+            "typeProperties": {
+                "deploymentType": "Online",
+                "serviceUri": ls.url,
+                "authenticationType": "AADServicePrincipal",
+                "servicePrincipalId": _sp_cred("CLIENT_ID"),
+                "servicePrincipalCredentialType": "ServicePrincipalKey",
+                "servicePrincipalCredential": {
+                    "type": "SecureString",
+                    "value": _sp_cred("CLIENT_SECRET"),
+                },
             },
         }
     if ls.type in _AZURE_STORAGE_TYPES:
@@ -312,6 +340,16 @@ def build_dataset(ds: Dataset) -> Dict[str, Any]:
             "schema": schema,
         }
 
+    # Dataverse entity (source only — sinks are storage CSV)
+    if ds.kind == DatasetKind.dataverse_entity:
+        return {
+            "type": "CommonDataServiceForAppsEntity",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {"entityName": ds.entity_name or ds.name.removeprefix("ds_dataverse_")},
+            "schema": schema,
+        }
+
     # Binary (byte-for-byte copy of any file type; no schema)
     if ds.kind == DatasetKind.binary:
         location = (
@@ -380,6 +418,7 @@ _COPY_SOURCE_TYPE = {
     DatasetKind.rest_resource: "RestSource",
     DatasetKind.binary: "BinarySource",
     DatasetKind.azure_sql_table: "AzureSqlSource",
+    DatasetKind.dataverse_entity: "CommonDataServiceForAppsSource",
 }
 _COPY_SINK_TYPE = {
     DatasetKind.delimited_text: "DelimitedTextSink",
@@ -691,7 +730,8 @@ def _source_read_settings(ds: Dataset) -> "Dict[str, Any] | None":
     are unaffected."""
     if ds.relative_url is not None:  # HTTP file: relativeUrl already names it
         return None
-    if ds.kind in (DatasetKind.rest_resource, DatasetKind.azure_sql_table):
+    if ds.kind in (DatasetKind.rest_resource, DatasetKind.azure_sql_table,
+                   DatasetKind.dataverse_entity):
         return None
     loc = ds.location
     if loc and loc.file_name:  # concrete file name present

@@ -48,6 +48,7 @@ class SourceFormat(str, Enum):
     binary = "binary"
     sql_table = "sql_table"
     http_csv = "http_csv"  # CSV fetched from a public HTTP(S) URL
+    dataverse = "dataverse"  # a table (entity) in Microsoft Dataverse / Dynamics 365
 
 
 class OutputFormat(str, Enum):
@@ -78,6 +79,9 @@ class LogicalSource(BaseModel):
     database: Optional[str] = None
     schema_name: Optional[str] = None
     table_name: Optional[str] = None
+    # dataverse source (format dataverse):
+    dataverse_url: Optional[str] = None  # https://<org>.crm.dynamics.com
+    entity_set: Optional[str] = None     # plural entity-set name, e.g. 'accounts'
     columns: List[LogicalColumn] = Field(default_factory=list)  # optional; grounding overrides
     # BRD asks "verify the source file exists / is non-empty before copying":
     # the compiler emits a Validation activity gating the bronze copy — it waits
@@ -99,6 +103,12 @@ class LogicalSource(BaseModel):
         ):
             raise ValueError(
                 f"source '{self.entity}': sql_table needs server, database, table_name"
+            )
+        if self.format == SourceFormat.dataverse and not (
+            self.dataverse_url and self.entity_set
+        ):
+            raise ValueError(
+                f"source '{self.entity}': dataverse needs dataverse_url and entity_set"
             )
         if self.format in (SourceFormat.csv, SourceFormat.parquet, SourceFormat.json) and not (
             self.file_name or self.folder

@@ -65,8 +65,10 @@ WORKFLOW — follow this order:
 1. add_source for every business entity (file/table) the requirements name.
    Use the EXACT file names / URLs / table names given. entity = short
    snake_case business name (orders, customers). Storage formats: csv, text,
-   parquet, json, binary. Binary is Bronze byte-copy only; do not transform it
-   or use it in outputs.
+   parquet, json, binary. Non-storage: http_csv (public URL), sql_table (Azure
+   SQL), dataverse (a Dynamics 365 / Dataverse table — pass dataverse_url +
+   entity_set). Binary is Bronze byte-copy only; do not transform it or use it
+   in outputs.
 2. add_transform for every entity that needs cleaning.
 3. add_output for every business output asked for. Do NOT invent outputs.
 4. set_pipelines ONLY if the requirements name pipelines or say how work is
@@ -164,20 +166,25 @@ def build_plan_agent():
         database: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
+        dataverse_url: Optional[str] = None,
+        entity_set: Optional[str] = None,
         columns: Optional[List[LogicalColumn]] = None,
         validate_first: bool = False,
     ) -> Dict[str, Any]:
         """Add (or replace) one business entity to ingest. format: csv | text |
-        parquet | json | binary | sql_table | http_csv. Storage sources need file_name (or
-        folder); http_csv needs http_url; sql_table needs server, database,
-        table_name. columns: known schema [{name, type}] when the requirements
+        parquet | json | binary | sql_table | http_csv | dataverse. Storage
+        sources need file_name (or folder); http_csv needs http_url; sql_table
+        needs server, database, table_name; dataverse needs dataverse_url
+        (https://<org>.crm.dynamics.com) and entity_set (plural table name, e.g.
+        'accounts'). columns: known schema [{name, type}] when the requirements
         state it. validate_first: gate the copy on the file existing and being
-        non-empty."""
+        non-empty (storage sources only)."""
         return ctx.deps.upsert_source({
             "entity": entity, "format": format, "container": container,
             "folder": folder, "file_name": file_name, "http_url": http_url,
             "server": server, "database": database, "schema_name": schema_name,
             "table_name": table_name,
+            "dataverse_url": dataverse_url, "entity_set": entity_set,
             "columns": [c.model_dump() for c in (columns or [])],
             "validate_first": validate_first,
         })

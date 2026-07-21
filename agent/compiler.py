@@ -196,6 +196,21 @@ def _cast_expression(col: LogicalColumn) -> str:
     return f"{fn}({name})"
 
 
+def _dv_logical_name(entity_set: str) -> str:
+    """Dataverse entity-set (plural, e.g. 'accounts') -> logical name (singular,
+    'account') for ADF's dataset entityName. Reverses Dataverse's standard
+    pluralization (y->ies, s/x/z/ch/sh->es, else +s). ponytail: rule-based, covers
+    standard + custom tables; a handful of irregular system set-names would need a
+    metadata (EntityDefinitions) lookup — add that if one ever misses."""
+    s = (entity_set or "").strip()
+    if s.endswith("ies"):
+        return s[:-3] + "y"
+    for suf in ("ses", "xes", "zes", "ches", "shes"):
+        if s.endswith(suf):
+            return s[:-2]
+    return s[:-1] if s.endswith("s") else s
+
+
 _DS_KIND_BY_FORMAT = {
     SourceFormat.csv: DatasetKind.delimited_text,
     SourceFormat.text: DatasetKind.delimited_text,
@@ -204,6 +219,7 @@ _DS_KIND_BY_FORMAT = {
     SourceFormat.binary: DatasetKind.binary,
     SourceFormat.http_csv: DatasetKind.delimited_text,
     SourceFormat.sql_table: DatasetKind.azure_sql_table,
+    SourceFormat.dataverse: DatasetKind.dataverse_entity,
 }
 
 
@@ -295,6 +311,7 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
 
     http_ls: Dict[str, str] = {}  # host token -> ls name
     sql_ls: Dict[str, str] = {}  # server token -> ls name
+    dv_ls: Dict[str, str] = {}   # dataverse env token -> ls name
     for s in plan.sources:
         if s.format == SourceFormat.http_csv and s.http_url:
             tok = _host_token(s.http_url)
@@ -320,6 +337,23 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                         database=s.database,
                     )
                 )
+        elif s.format == SourceFormat.dataverse and s.dataverse_url:
+            tok = _host_token(s.dataverse_url)
+            if tok not in dv_ls:
+                name = f"ls_dataverse_{tok}"
+                dv_ls[tok] = name
+                # Dataverse rejects System-Assigned MI; it needs a service
+                # principal (the granted Application User). The builder fills the
+                # client id + secret from SOURCE_*/AZURE_* env at deploy time, so
+                # no secret is stored in the spec.
+                linked_services.append(
+                    LinkedService(
+                        name=name,
+                        type="CommonDataServiceForApps",
+                        auth=AuthKind.service_principal,
+                        url=s.dataverse_url,
+                    )
+                )
 
     # ------------------------------------------------------------------ #
     # Ingest (landing -> bronze Copy) per source
@@ -332,7 +366,12 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
         kind = _DS_KIND_BY_FORMAT[s.format]
         cols = [Column(name=c.name, type=c.type) for c in s.columns]
 
-        landing_name = f"ds_landing_{ent}"
+        # Non-storage origins name their source dataset after the origin so the
+        # plan reads honestly (ds_dataverse_contacts, not a fake "landing" file).
+        landing_name = (
+            f"ds_dataverse_{ent}" if s.format == SourceFormat.dataverse
+            else f"ds_landing_{ent}"
+        )
         bronze_name = f"ds_bronze_{ent}"
         bronze_ds[ent] = bronze_name
 
@@ -369,6 +408,15 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                 kind=DatasetKind.delimited_text,
                 linked_service=http_ls[_host_token(s.http_url)],
                 relative_url=path,
+                columns=cols,
+            )
+            bronze_file = f"{ent}.csv"
+        elif s.format == SourceFormat.dataverse:
+            landing = Dataset(
+                name=landing_name,
+                kind=DatasetKind.dataverse_entity,
+                linked_service=dv_ls[_host_token(s.dataverse_url)],
+                entity_name=_dv_logical_name(s.entity_set),  # ADF wants singular logical name
                 columns=cols,
             )
             bronze_file = f"{ent}.csv"

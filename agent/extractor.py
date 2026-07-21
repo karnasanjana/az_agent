@@ -58,8 +58,10 @@ Rules:
   expressed with the vocabulary, put one plain-English line in `unsupported`
   instead.
 - SOURCE FORMATS: storage files may be csv, text, parquet, json, or binary;
-  http_csv is for public CSV URLs; sql_table is for Azure SQL tables. Binary is
-  Bronze byte-copy only: do not transform it or use it in outputs.
+  http_csv is for public CSV URLs; sql_table is for Azure SQL tables; dataverse
+  is for a Microsoft Dataverse / Dynamics 365 table (needs the environment URL
+  https://<org>.crm.dynamics.com and the plural entity-set name, e.g. accounts).
+  Binary is Bronze byte-copy only: do not transform it or use it in outputs.
 - TYPES FIRST: source files are raw text — every column used in arithmetic,
   a numeric/temporal filter, an aggregation (sum/avg), or a date-part op MUST
   appear in that entity's `casts` with its target type. Casts run before
