@@ -13,6 +13,7 @@ operation is a key of the closed op vocabulary shared with models/spec.py.
 
 from __future__ import annotations
 
+import os
 import re
 from enum import Enum
 from typing import List, Optional
@@ -49,6 +50,10 @@ class SourceFormat(str, Enum):
     sql_table = "sql_table"
     http_csv = "http_csv"  # CSV fetched from a public HTTP(S) URL
     dataverse = "dataverse"  # a table (entity) in Microsoft Dataverse / Dynamics 365
+    postgres = "postgres"    # a table in PostgreSQL (local, GCP Cloud SQL, Azure DB for PG)
+    bigquery = "bigquery"    # a table/view in Google BigQuery
+    gcs = "gcs"              # a CSV object in a Google Cloud Storage bucket
+    sharepoint = "sharepoint"  # a SharePoint Online list (Microsoft Graph, app-only)
 
 
 class OutputFormat(str, Enum):
@@ -74,14 +79,22 @@ class LogicalSource(BaseModel):
     file_name: Optional[str] = None
     # http source (format http_csv):
     http_url: Optional[str] = None  # full URL to the file
-    # sql source (format sql_table):
+    # sql / postgres source (format sql_table, postgres):
     server: Optional[str] = None
     database: Optional[str] = None
     schema_name: Optional[str] = None
     table_name: Optional[str] = None
+    port: Optional[str] = None           # postgres only; defaults to 5432 at build
     # dataverse source (format dataverse):
     dataverse_url: Optional[str] = None  # https://<org>.crm.dynamics.com
     entity_set: Optional[str] = None     # plural entity-set name, e.g. 'accounts'
+    # bigquery source (format bigquery): reuses table_name for the table
+    gcp_project: Optional[str] = None    # bigquery/gcs; falls back to GCP_PROJECT env
+    bq_dataset: Optional[str] = None     # bigquery dataset (schema) holding table_name
+    # gcs source (format gcs) reuses container (=bucket) / folder / file_name
+    # sharepoint source (format sharepoint):
+    sharepoint_site: Optional[str] = None  # full site URL, https://<host>/sites/<name>
+    sharepoint_list: Optional[str] = None  # list display name, e.g. 'DOL Project Team'
     columns: List[LogicalColumn] = Field(default_factory=list)  # optional; grounding overrides
     # BRD asks "verify the source file exists / is non-empty before copying":
     # the compiler emits a Validation activity gating the bronze copy — it waits
@@ -110,11 +123,100 @@ class LogicalSource(BaseModel):
             raise ValueError(
                 f"source '{self.entity}': dataverse needs dataverse_url and entity_set"
             )
+        if self.format == SourceFormat.postgres and not (
+            self.server and self.database and self.table_name
+        ):
+            raise ValueError(
+                f"source '{self.entity}': postgres needs server, database, table_name"
+            )
+        if self.format == SourceFormat.bigquery and not (
+            self.bq_dataset and self.table_name
+        ):
+            raise ValueError(
+                f"source '{self.entity}': bigquery needs bq_dataset and table_name"
+            )
+        if self.format == SourceFormat.gcs and not (
+            self.container and (self.file_name or self.folder)
+        ):
+            raise ValueError(
+                f"source '{self.entity}': gcs needs container (bucket) and file_name (or folder)"
+            )
+        if self.format == SourceFormat.sharepoint and not (
+            self.sharepoint_site and self.sharepoint_list
+        ):
+            raise ValueError(
+                f"source '{self.entity}': sharepoint needs sharepoint_site (site URL) "
+                "and sharepoint_list (list name)"
+            )
         if self.format in (SourceFormat.csv, SourceFormat.parquet, SourceFormat.json) and not (
             self.file_name or self.folder
         ):
             raise ValueError(f"source '{self.entity}': storage source needs file_name (or folder)")
         return self
+
+    def is_local_db(self) -> bool:
+        """True for a DB source ADF's cloud IR can't reach — the app pulls it into
+        bronze itself at deploy time (app._seed_local_sources) instead of emitting
+        an ADF Copy that dies with 'No such host is known' / connection refused.
+
+        Covers everything a cloud datacenter can't route to: loopback, private and
+        link-local IPs, mDNS (*.local), and BARE single-label hostnames (a LAN
+        machine name like 'DESKTOP-AB12' is never publicly resolvable). A public
+        FQDN (shop.postgres.database.azure.com) or public IP stays the ADF path.
+        ponytail: a PRIVATE FQDN (mypg.internal.corp) still reads as remote — wire
+        connectVia/SHIR if on-prem-via-integration-runtime is ever needed."""
+        if self.format != SourceFormat.postgres:
+            return False
+        raw = (self.server or "").strip().lower()
+        if raw.startswith("["):          # [ipv6]:port or [ipv6]
+            host = raw[1:].split("]", 1)[0]
+        elif raw.count(":") == 1:        # host:port (ipv4 / hostname)
+            host = raw.split(":", 1)[0]
+        else:                            # bare ipv6 (many colons) or plain host
+            host = raw
+        if not host:
+            return False
+        if host == "localhost" or host.endswith(".local") or host == "host.docker.internal":
+            return True
+        try:
+            import ipaddress
+
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private or ip.is_link_local
+        except ValueError:
+            pass
+        return "." not in host  # single-label hostname => LAN machine, unroutable from cloud
+
+    def is_app_seeded(self) -> bool:
+        """True when the AGENT pulls this source into bronze itself at deploy
+        time (app._seed_local_sources) instead of ADF doing a cloud Copy, because
+        ADF can't:
+          - local DB ADF's IR can't reach (is_local_db), or
+          - a GCP source with no service-account key for ADF's Copy — BigQuery
+            with no GOOGLE_APPLICATION_CREDENTIALS, GCS with no GCS_ACCESS_KEY_ID.
+        The agent-side pull uses KEYLESS gcloud auth (tools _gcp_credentials); only
+        ADF's own scheduled Copy needs the SA key. Set the key env to move a GCP
+        source back onto the ADF Copy path.
+        ponytail: env presence is the signal — an SA key you have but haven't
+        wired stays 'not ready'; that's the honest default for 'no key yet'."""
+        if self.is_local_db():
+            return True
+        if self.format == SourceFormat.bigquery:
+            return not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if self.format == SourceFormat.gcs:
+            return not os.environ.get("GCS_ACCESS_KEY_ID")
+        if self.format == SourceFormat.sharepoint:
+            return True  # Graph app-only auth is app-side; ADF has no list Copy wired
+        return False
+
+    def sharepoint_host_path(self) -> "tuple[str, str]":
+        """(hostname, site_path) for a sharepoint source, parsed from sharepoint_site
+        — e.g. 'https://x.sharepoint.com/sites/Y' -> ('x.sharepoint.com', '/sites/Y').
+        Feeds the Graph readers (_pull_sharepoint / sharepoint_list_schema)."""
+        from urllib.parse import urlparse
+
+        p = urlparse((self.sharepoint_site or "").strip())
+        return p.netloc, p.path.rstrip("/")
 
 
 _CASE_CMP_OPS = {"lt", "le", "gt", "ge", "eq", "ne"}

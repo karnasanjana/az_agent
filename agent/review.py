@@ -285,6 +285,12 @@ def render_markdown(run_id: str, root: str = "artifacts") -> str:
             return "Dataverse"
         if d.kind == DatasetKind.azure_sql_table:
             return "Azure SQL"
+        if d.kind == DatasetKind.postgres_table:
+            return "PostgreSQL"
+        if d.kind == DatasetKind.bigquery_object:
+            return "BigQuery"
+        if d.kind == DatasetKind.gcs_csv:
+            return "Google Cloud Storage"
         if d.relative_url is not None:  # HTTP-hosted file
             url = (getattr(ls_by_name.get(d.linked_service), "url", "") or "").lower()
             return "GitHub" if "github" in url else "HTTP"

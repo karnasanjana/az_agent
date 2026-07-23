@@ -8,11 +8,17 @@ Discovery tools (what a source-discovery agent would expose, read-only):
     dataverse_schema(env_url, logical_name)   -> [ {name, type} ]     (from metadata)
     github_schema(raw_url)                     -> [ {name, type:string} ] (CSV header)
     sharepoint_list_schema(host, path, list)   -> [ {name, type} ]     (Graph columns)
+    postgres_schema(table)                     -> [ {name, type} ]     (information_schema)
+    bigquery_schema(dataset.table)             -> [ {name, type} ]     (BQ metadata)
+    gcs_schema(bucket/path.csv)                -> [ {name, type:string} ] (CSV header)
 
 CLI:
     python tools/source_schema.py dataverse account
     python tools/source_schema.py github https://raw.githubusercontent.com/.../file.csv
     python tools/source_schema.py sharepoint <host> <site_path> <list>
+    python tools/source_schema.py postgres [schema.]table          # env: PG_* / PG_DSN
+    python tools/source_schema.py bigquery [project.]dataset.table  # env: GCP_PROJECT + ADC
+    python tools/source_schema.py gcs bucket/path/to/file.csv       # ADC
 """
 
 from __future__ import annotations
@@ -83,15 +89,145 @@ def dataverse_tables(env_url: str) -> list[dict]:
 
 # --- GitHub (raw CSV over HTTP) -------------------------------------------- #
 
-def github_schema(raw_url: str) -> list[dict]:
-    """CSV header from a raw GitHub URL. Types are string (grounding refines from
-    sampled rows later, same as any http_csv source)."""
-    with urllib.request.urlopen(raw_url, timeout=30) as resp:
-        head = resp.read(64 * 1024)
-    text = head.decode("utf-8-sig", errors="replace")
+def _csv_header_cols(data: bytes) -> list[dict]:
+    """Columns from a CSV header row. Types are string — grounding refines from
+    sampled rows later, same as any http_csv source."""
+    text = data.decode("utf-8-sig", errors="replace")
     first = text.splitlines()[0] if text else ""
     names = [c.strip() for c in next(csv.reader(io.StringIO(first)))] if first else []
     return [{"name": n, "type": "string"} for n in names if n]
+
+
+def github_schema(raw_url: str) -> list[dict]:
+    """CSV header from a raw GitHub URL."""
+    with urllib.request.urlopen(raw_url, timeout=30) as resp:
+        return _csv_header_cols(resp.read(64 * 1024))
+
+
+# --- Postgres (local or hosted; incl. GCP Cloud SQL) ----------------------- #
+
+# information_schema.columns.data_type -> our grounding type vocabulary.
+_PG_TYPE = {
+    "smallint": "short", "integer": "integer", "bigint": "long",
+    "numeric": "decimal", "decimal": "decimal",
+    "real": "double", "double precision": "double",
+    "boolean": "boolean",
+    "date": "date",
+    "timestamp without time zone": "timestamp",
+    "timestamp with time zone": "timestamp",
+    "character varying": "string", "character": "string", "text": "string",
+    "uuid": "string", "json": "string", "jsonb": "string",
+}
+
+
+def _pg_connect():
+    """Connect to Postgres from env. PG_DSN wins; else PG_HOST/PORT/DATABASE/
+    USER/PASSWORD (defaults target a local server). Shared by inject_to_bronze."""
+    import psycopg  # lazy: pip install "psycopg[binary]" only when Postgres is used
+
+    dsn = os.environ.get("PG_DSN")
+    if dsn:
+        return psycopg.connect(dsn)
+    return psycopg.connect(
+        host=os.environ.get("PG_HOST", "localhost"),
+        port=os.environ.get("PG_PORT", "5432"),
+        dbname=os.environ.get("PG_DATABASE", "postgres"),
+        user=os.environ.get("PG_USER", "postgres"),
+        password=os.environ.get("PG_PASSWORD", ""),
+    )
+
+
+def postgres_schema(table: str) -> list[dict]:
+    """Real column list + types from information_schema — works with 0 rows.
+    `table` is 'schema.table' or bare 'table' (defaults to schema 'public')."""
+    schema, _, tbl = table.rpartition(".")
+    schema = schema or "public"
+    with _pg_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (schema, tbl),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        raise RuntimeError(f"postgres_schema {table}: no columns (schema '{schema}', wrong name?)")
+    return [{"name": n, "type": _PG_TYPE.get(t, "string")} for n, t in rows]
+
+
+# --- Google BigQuery ------------------------------------------------------- #
+
+# BigQuery field_type -> our grounding type vocabulary.
+_BQ_TYPE = {
+    "STRING": "string", "BYTES": "string",
+    "INTEGER": "long", "INT64": "long",
+    "FLOAT": "double", "FLOAT64": "double",
+    "NUMERIC": "decimal", "BIGNUMERIC": "decimal",
+    "BOOLEAN": "boolean", "BOOL": "boolean",
+    "TIMESTAMP": "timestamp", "DATETIME": "timestamp",
+    "DATE": "date", "TIME": "string",
+}
+
+
+def _gcp_credentials():
+    """Keyless GCP auth from the user's gcloud login — mirrors ER-Diagram's
+    approach (`gcloud auth print-access-token`). Works with a plain `gcloud auth
+    login` (no ADC login, no downloaded service-account key). Returns None to let
+    the client fall back to Application Default Credentials (a key file or
+    `gcloud auth application-default login`) when gcloud isn't on PATH."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("gcloud")  # resolves gcloud.CMD on Windows
+    if not exe:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "auth", "print-access-token"],
+            capture_output=True, text=True, timeout=20,
+        )
+        token = out.stdout.strip()
+        if token:
+            from google.oauth2.credentials import Credentials
+
+            return Credentials(token=token)
+    except Exception:  # noqa: BLE001 — fall back to ADC / key
+        pass
+    return None
+
+
+def bigquery_schema(ref: str) -> list[dict]:
+    """Column list + types from BigQuery table metadata. `ref` is
+    'dataset.table' or 'project.dataset.table'. Keyless auth via the user's
+    gcloud login (_gcp_credentials), falling back to ADC / a service-account key."""
+    from google.cloud import bigquery  # lazy import
+
+    client = bigquery.Client(
+        project=os.environ.get("GCP_PROJECT") or None, credentials=_gcp_credentials()
+    )
+    table = client.get_table(ref)
+    return [{"name": f.name, "type": _BQ_TYPE.get(f.field_type, "string")} for f in table.schema]
+
+
+# --- Google Cloud Storage (CSV object) ------------------------------------- #
+
+def _gcs_blob(path: str):
+    """A GCS blob handle for 'bucket/path/to/file' (a leading gs:// is fine)."""
+    from google.cloud import storage  # lazy import
+
+    p = path[5:] if path.startswith("gs://") else path
+    bucket, _, name = p.partition("/")
+    if not name:
+        raise ValueError(f"gcs path must be 'bucket/path/to/file', got: {path}")
+    client = storage.Client(
+        project=os.environ.get("GCP_PROJECT") or None, credentials=_gcp_credentials()
+    )
+    return client.bucket(bucket).blob(name)
+
+
+def gcs_schema(path: str) -> list[dict]:
+    """CSV header from a GCS object 'bucket/path/to/file.csv'. Auth via ADC."""
+    head = _gcs_blob(path).download_as_bytes(start=0, end=64 * 1024 - 1)
+    return _csv_header_cols(head)
 
 
 # --- SharePoint list (Graph) ----------------------------------------------- #
@@ -137,6 +273,15 @@ if __name__ == "__main__":
     elif kind == "sharepoint":
         host, path, lst = sys.argv[2], sys.argv[3], sys.argv[4]
         for c in sharepoint_list_schema(host, path, lst):
+            print(f"  {c['name']:<40} {c['type']}")
+    elif kind == "postgres":
+        for c in postgres_schema(arg):
+            print(f"  {c['name']:<40} {c['type']}")
+    elif kind == "bigquery":
+        for c in bigquery_schema(arg):
+            print(f"  {c['name']:<40} {c['type']}")
+    elif kind == "gcs":
+        for c in gcs_schema(arg):
             print(f"  {c['name']:<40} {c['type']}")
     else:
         sys.exit(f"unknown source '{kind}'")

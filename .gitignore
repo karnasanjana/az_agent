@@ -5,6 +5,9 @@
 artifacts/
 mock_tenant/
 
+# Nested external repo — not part of this project
+ER-Diagram/
+
 # Python
 __pycache__/
 *.pyc

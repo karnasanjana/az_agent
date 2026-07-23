@@ -38,6 +38,9 @@ class DatasetKind(str, Enum):
     binary = "Binary"                 # byte-for-byte copy of any file type
     azure_sql_table = "AzureSqlTable"  # table in an Azure SQL Database source
     dataverse_entity = "CommonDataServiceForAppsEntity"  # a Dataverse table (source only)
+    postgres_table = "PostgreSqlV2Table"  # a PostgreSQL table (source only)
+    bigquery_object = "GoogleBigQueryV2Object"  # a BigQuery table/view (source only)
+    gcs_csv = "GcsDelimitedText"  # CSV in a GCS bucket — renders as DelimitedText (source only)
     delta = "Delta"                    # Delta Lake table — data flows only (inline),
                                        # never a Copy source/sink or an ADF dataset resource
 
@@ -136,10 +139,12 @@ class LinkedService(BaseModel):
     name: str
     type: str  # HttpServer | AzureBlobFS | RestService | AzureSqlDatabase
     auth: AuthKind
-    url: Optional[str] = None          # HttpServer / RestService
+    url: Optional[str] = None          # HttpServer / RestService / CommonDataServiceForApps
     account_url: Optional[str] = None  # AzureBlobFS
-    server: Optional[str] = None       # AzureSqlDatabase
-    database: Optional[str] = None     # AzureSqlDatabase
+    server: Optional[str] = None       # AzureSqlDatabase / PostgreSqlV2
+    database: Optional[str] = None     # AzureSqlDatabase / PostgreSqlV2
+    port: Optional[str] = None         # PostgreSqlV2 (default 5432 at build)
+    project_id: Optional[str] = None   # GoogleBigQueryV2
 
 
 # LLM-emitted type -> valid ADF data-flow type. Bare 'decimal' is the killer:
@@ -191,14 +196,20 @@ class Dataset(BaseModel):
     location: Optional[DatasetLocation] = None
     # CSV/JSON/REST over HTTP uses a relative URL instead of a store location.
     relative_url: Optional[str] = None
-    # AzureSqlTable only: the source table.
-    schema_name: Optional[str] = None  # e.g. dbo
+    # AzureSqlTable / PostgreSqlV2Table only: the source table.
+    schema_name: Optional[str] = None  # e.g. dbo (SQL) / public (postgres)
     table_name: Optional[str] = None
     # CommonDataServiceForAppsEntity only: the Dataverse entity-set name.
     entity_name: Optional[str] = None
+    # GoogleBigQueryV2Object only: the BigQuery dataset holding table_name.
+    bq_dataset: Optional[str] = None
     parameters: List[str] = Field(default_factory=list)
     columns: List[Column] = Field(default_factory=list)
     first_row_as_header: bool = True
+    # True for a bronze CSV the APP seeds at deploy time (app-seeded source). Its
+    # schema is authoritative from the source's info_schema/metadata — grounding
+    # must NOT re-read the (possibly stale/leftover) bronze file to override it.
+    seeded: bool = False
 
 
 # --------------------------------------------------------------------------- #

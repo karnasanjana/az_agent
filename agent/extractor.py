@@ -60,8 +60,13 @@ Rules:
 - SOURCE FORMATS: storage files may be csv, text, parquet, json, or binary;
   http_csv is for public CSV URLs; sql_table is for Azure SQL tables; dataverse
   is for a Microsoft Dataverse / Dynamics 365 table (needs the environment URL
-  https://<org>.crm.dynamics.com and the plural entity-set name, e.g. accounts).
-  Binary is Bronze byte-copy only: do not transform it or use it in outputs.
+  https://<org>.crm.dynamics.com and the plural entity-set name, e.g. accounts);
+  postgres is for a PostgreSQL table (needs server, database, table_name);
+  bigquery is for a Google BigQuery table (needs bq_dataset and table_name);
+  gcs is for a CSV object in a Google Cloud Storage bucket (needs container=bucket
+  and file_name); sharepoint is for a SharePoint Online list (needs sharepoint_site,
+  the full site URL https://<host>/sites/<name>, and sharepoint_list, the list's
+  display name). Binary is Bronze byte-copy only: do not transform it or use it in outputs.
 - TYPES FIRST: source files are raw text — every column used in arithmetic,
   a numeric/temporal filter, an aggregation (sum/avg), or a date-part op MUST
   appear in that entity's `casts` with its target type. Casts run before

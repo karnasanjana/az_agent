@@ -67,7 +67,10 @@ WORKFLOW — follow this order:
    snake_case business name (orders, customers). Storage formats: csv, text,
    parquet, json, binary. Non-storage: http_csv (public URL), sql_table (Azure
    SQL), dataverse (a Dynamics 365 / Dataverse table — pass dataverse_url +
-   entity_set). Binary is Bronze byte-copy only; do not transform it or use it
+   entity_set), postgres (a PostgreSQL table — server + database + table_name),
+   bigquery (a BigQuery table — bq_dataset + table_name), gcs (a CSV in a Google
+   Cloud Storage bucket — container=bucket + file_name), sharepoint (a SharePoint
+   Online list — sharepoint_site + sharepoint_list). Binary is Bronze byte-copy only; do not transform it or use it
    in outputs.
 2. add_transform for every entity that needs cleaning.
 3. add_output for every business output asked for. Do NOT invent outputs.
@@ -168,23 +171,34 @@ def build_plan_agent():
         table_name: Optional[str] = None,
         dataverse_url: Optional[str] = None,
         entity_set: Optional[str] = None,
+        port: Optional[str] = None,
+        gcp_project: Optional[str] = None,
+        bq_dataset: Optional[str] = None,
+        sharepoint_site: Optional[str] = None,
+        sharepoint_list: Optional[str] = None,
         columns: Optional[List[LogicalColumn]] = None,
         validate_first: bool = False,
     ) -> Dict[str, Any]:
         """Add (or replace) one business entity to ingest. format: csv | text |
-        parquet | json | binary | sql_table | http_csv | dataverse. Storage
-        sources need file_name (or folder); http_csv needs http_url; sql_table
-        needs server, database, table_name; dataverse needs dataverse_url
-        (https://<org>.crm.dynamics.com) and entity_set (plural table name, e.g.
-        'accounts'). columns: known schema [{name, type}] when the requirements
-        state it. validate_first: gate the copy on the file existing and being
-        non-empty (storage sources only)."""
+        parquet | json | binary | sql_table | http_csv | dataverse | postgres |
+        bigquery | gcs | sharepoint. Storage sources need file_name (or folder); http_csv needs
+        http_url; sql_table needs server, database, table_name; dataverse needs
+        dataverse_url (https://<org>.crm.dynamics.com) and entity_set (plural table
+        name, e.g. 'accounts'); postgres needs server, database, table_name (schema_name
+        defaults 'public', optional port); bigquery needs bq_dataset + table_name
+        (optional gcp_project); gcs needs container (bucket) + file_name (or folder);
+        sharepoint needs sharepoint_site (full site URL) + sharepoint_list (list name).
+        columns: known schema [{name, type}] when the requirements state it.
+        validate_first: gate the copy on the file existing and being non-empty
+        (storage sources only)."""
         return ctx.deps.upsert_source({
             "entity": entity, "format": format, "container": container,
             "folder": folder, "file_name": file_name, "http_url": http_url,
             "server": server, "database": database, "schema_name": schema_name,
             "table_name": table_name,
             "dataverse_url": dataverse_url, "entity_set": entity_set,
+            "port": port, "gcp_project": gcp_project, "bq_dataset": bq_dataset,
+            "sharepoint_site": sharepoint_site, "sharepoint_list": sharepoint_list,
             "columns": [c.model_dump() for c in (columns or [])],
             "validate_first": validate_first,
         })

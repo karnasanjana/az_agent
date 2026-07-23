@@ -24,3 +24,9 @@ pypdf>=4.0                        # extract BRD text from uploaded PDFs
 azure-identity>=1.16
 azure-mgmt-datafactory>=9.0
 azure-storage-file-datalake>=12.14
+
+# External-source bootstrap movers (tools/source_schema.py, tools/inject_to_bronze.py).
+# Lazily imported — only needed when landing that source to bronze.
+psycopg[binary]>=3.1              # Postgres (local, or GCP Cloud SQL)
+google-cloud-bigquery>=3.0        # BigQuery source
+google-cloud-storage>=2.10        # Google Cloud Storage (GCS) objects

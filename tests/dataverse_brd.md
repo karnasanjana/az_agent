@@ -4,19 +4,14 @@ Source of truth: the Dynamics 365 environment `zcscmdemodev.crm.dynamics.com`.
 Every column below was verified to hold real data (contacts 43 rows, accounts 4,
 incidents/cases 3). Use this to test the Dataverse → bronze → silver → gold flow.
 
-> **How to test manually today:** the production Dataverse Copy activity is not
-> wired into the compiler yet (see docs/dataverse-source-wiring.md), so the
-> planner treats these tables as **landing** files (`ds_landing_contacts →
-> ds_bronze_contacts`). Seed the `landing` container with the bootstrap injector,
-> then the generated plan runs the whole way (landing → bronze → silver → gold):
+> **How this runs:** the native Dataverse source IS wired into the compiler now,
+> so the planner emits a real `ls_dataverse_*` linked service + `ds_dataverse_<ent>`
+> Copy → bronze, and grounds each entity against the live Dataverse metadata at plan
+> time (contacts 340 cols, accounts 243, incidents 166). No manual seeding needed —
+> ADF's Copy pulls the rows via the AAD service principal in `SOURCE_*` env.
 >
->     python tools/inject_to_bronze.py dataverse contacts   --container landing --real
->     python tools/inject_to_bronze.py dataverse accounts   --container landing --real
->     python tools/inject_to_bronze.py dataverse incidents  --container landing --real
->
-> (drop `--real` to write to mock_tenant/ instead of the live lake). The injector
-> writes `landing/<entity>/<entity>.csv` — if the plan's landing dataset expects a
-> different path, match it to what preflight shows.
+> (Do NOT add a "treat these as landing files" note here — it steers the planner
+> away from the native connector and back to unchecked landing CSVs.)
 
 ---
 

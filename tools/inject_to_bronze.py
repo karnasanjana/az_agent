@@ -9,6 +9,9 @@ and seed bronze; use the pipeline for real scheduled loads.
     python tools/inject_to_bronze.py dataverse account         # -> mock bronze (safe)
     python tools/inject_to_bronze.py github <raw_csv_url> [entity]
     python tools/inject_to_bronze.py sharepoint <host> <path> <list>
+    python tools/inject_to_bronze.py postgres [schema.]table [entity]   # env: PG_* / PG_DSN
+    python tools/inject_to_bronze.py bigquery [project.]dataset.table [entity]  # GCP_PROJECT + ADC
+    python tools/inject_to_bronze.py gcs bucket/path/to/file.csv [entity]       # ADC
     ... add  --real  to write to the real ADLS/Blob bronze container instead.
 
 Default target is mock_tenant/storage/bronze/<entity>/<entity>.csv (local, no
@@ -64,6 +67,38 @@ def _pull_github(raw_url: str) -> bytes:
         return resp.read()
 
 
+def _pull_postgres(table: str) -> tuple[list[str], list[dict]]:
+    from source_schema import _pg_connect  # shared connection helper
+
+    schema, _, tbl = table.rpartition(".")
+    ref = f'"{schema}"."{tbl}"' if schema else f'"{tbl}"'  # quote identifiers
+    with _pg_connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT * FROM {ref} LIMIT {_MAX_ROWS}")  # ref is operator input, not web-facing
+        cols = [d.name for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return cols, rows
+
+
+def _pull_bigquery(ref: str) -> tuple[list[str], list[dict]]:
+    from google.cloud import bigquery  # lazy import
+
+    from source_schema import _gcp_credentials  # keyless gcloud-login auth
+
+    client = bigquery.Client(
+        project=os.environ.get("GCP_PROJECT") or None, credentials=_gcp_credentials()
+    )
+    table = client.get_table(ref)
+    cols = [f.name for f in table.schema]
+    rows = [dict(r.items()) for r in client.list_rows(table, max_results=_MAX_ROWS)]
+    return cols, rows
+
+
+def _pull_gcs(path: str) -> bytes:
+    from source_schema import _gcs_blob  # byte-for-byte, like _pull_github
+
+    return _gcs_blob(path).download_as_bytes()  # ponytail: whole object; assumes CSV bronze target
+
+
 def _pull_sharepoint(host: str, path: str, lst: str) -> tuple[list[str], list[dict]]:
     tok = _token("https://graph.microsoft.com/.default")
     g = "https://graph.microsoft.com/v1.0"
@@ -116,11 +151,16 @@ def _write_real(entity: str, data: bytes, container: str) -> str:
     path = f"{entity}/{entity}.csv"
     if storage_kind() == "blob":
         svc = get_blob_service_client(cfg)
-        svc.get_blob_client(container, path).upload_blob(data, overwrite=True)
+        cc = svc.get_container_client(container)
+        if not cc.exists():
+            cc.create_container()
+        cc.get_blob_client(path).upload_blob(data, overwrite=True)
     else:
         svc = get_datalake_client(cfg)
-        fc = svc.get_file_system_client(container).get_file_client(path)
-        fc.upload_data(data, overwrite=True)
+        fs = svc.get_file_system_client(container)
+        if not fs.exists():
+            fs.create_file_system()
+        fs.get_file_client(path).upload_data(data, overwrite=True)
     return f"{container}/{path} on {cfg.adls_account_name}"
 
 
@@ -142,6 +182,23 @@ def inject(kind: str, args: list[str], real: bool, container: str) -> None:
         cols, rows = _pull_sharepoint(host, path, lst)
         data = _to_csv(cols, rows)
         print(f"sharepoint {lst}: {len(rows)} rows, {len(cols)} columns")
+    elif kind == "postgres":
+        table = args[0]
+        entity = args[1] if len(args) > 1 else table.rpartition(".")[2]
+        cols, rows = _pull_postgres(table)
+        data = _to_csv(cols, rows)
+        print(f"postgres {table}: {len(rows)} rows, {len(cols)} columns")
+    elif kind == "bigquery":
+        ref = args[0]
+        entity = args[1] if len(args) > 1 else ref.rpartition(".")[2]
+        cols, rows = _pull_bigquery(ref)
+        data = _to_csv(cols, rows)
+        print(f"bigquery {ref}: {len(rows)} rows, {len(cols)} columns")
+    elif kind == "gcs":
+        path = args[0]
+        entity = args[1] if len(args) > 1 else path.rstrip("/").split("/")[-1].rsplit(".", 1)[0]
+        data = _pull_gcs(path)
+        print(f"gcs {path}: {len(data)} bytes")
     else:
         sys.exit(f"unknown source '{kind}'")
 

@@ -220,6 +220,12 @@ _DS_KIND_BY_FORMAT = {
     SourceFormat.http_csv: DatasetKind.delimited_text,
     SourceFormat.sql_table: DatasetKind.azure_sql_table,
     SourceFormat.dataverse: DatasetKind.dataverse_entity,
+    SourceFormat.postgres: DatasetKind.postgres_table,
+    SourceFormat.bigquery: DatasetKind.bigquery_object,
+    SourceFormat.gcs: DatasetKind.gcs_csv,
+    # sharepoint is always app-seeded (bronze CSV via Graph) — never an ADF Copy
+    # source, so this kind is only a placeholder for the map lookup.
+    SourceFormat.sharepoint: DatasetKind.delimited_text,
 }
 
 
@@ -312,6 +318,9 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
     http_ls: Dict[str, str] = {}  # host token -> ls name
     sql_ls: Dict[str, str] = {}  # server token -> ls name
     dv_ls: Dict[str, str] = {}   # dataverse env token -> ls name
+    pg_ls: Dict[str, str] = {}   # postgres server token -> ls name
+    bq_ls: Dict[str, str] = {}   # bigquery project token -> ls name
+    gcs_ls: Dict[str, str] = {}  # gcs (single account) -> ls name
     for s in plan.sources:
         if s.format == SourceFormat.http_csv and s.http_url:
             tok = _host_token(s.http_url)
@@ -354,6 +363,58 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                         url=s.dataverse_url,
                     )
                 )
+        elif s.format == SourceFormat.postgres and s.server:
+            if s.is_local_db():
+                continue  # app seeds bronze directly — no ADF linked service/Copy
+            tok = _server_token(s.server)
+            if tok not in pg_ls:
+                name = f"ls_postgres_{tok}"
+                pg_ls[tok] = name
+                # Basic (user/password) auth; the builder fills user + password
+                # from PG_USER/PG_PASSWORD env at deploy time (never in the spec).
+                linked_services.append(
+                    LinkedService(
+                        name=name,
+                        type="PostgreSqlV2",
+                        auth=AuthKind.service_principal,
+                        server=s.server,
+                        database=s.database,
+                        port=s.port,
+                    )
+                )
+        elif s.format == SourceFormat.bigquery:
+            if s.is_app_seeded():
+                continue  # app seeds bronze via keyless gcloud — no ADF linked service/Copy
+            proj = s.gcp_project or ""
+            tok = _server_token(proj) if proj else "default"
+            if tok not in bq_ls:
+                name = f"ls_bigquery_{tok}"
+                bq_ls[tok] = name
+                # ServiceAuthentication; the builder fills the service-account key
+                # JSON from GOOGLE_APPLICATION_CREDENTIALS env at deploy time.
+                linked_services.append(
+                    LinkedService(
+                        name=name,
+                        type="GoogleBigQueryV2",
+                        auth=AuthKind.service_principal,
+                        project_id=proj or None,
+                    )
+                )
+        elif s.format == SourceFormat.gcs:
+            if s.is_app_seeded():
+                continue  # app seeds bronze via keyless gcloud — no ADF linked service/Copy
+            if "gcs" not in gcs_ls:
+                name = "ls_gcs"
+                gcs_ls["gcs"] = name
+                # S3-interop: HMAC access key + secret from GCS_ACCESS_KEY_ID /
+                # GCS_SECRET_ACCESS_KEY env at deploy time.
+                linked_services.append(
+                    LinkedService(
+                        name=name,
+                        type="GoogleCloudStorage",
+                        auth=AuthKind.service_principal,
+                    )
+                )
 
     # ------------------------------------------------------------------ #
     # Ingest (landing -> bronze Copy) per source
@@ -368,12 +429,53 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
 
         # Non-storage origins name their source dataset after the origin so the
         # plan reads honestly (ds_dataverse_contacts, not a fake "landing" file).
-        landing_name = (
-            f"ds_dataverse_{ent}" if s.format == SourceFormat.dataverse
-            else f"ds_landing_{ent}"
-        )
+        _origin_prefix = {
+            SourceFormat.dataverse: "ds_dataverse_",
+            SourceFormat.postgres: "ds_postgres_",
+            SourceFormat.bigquery: "ds_bigquery_",
+            SourceFormat.gcs: "ds_gcs_",
+        }
+        landing_name = _origin_prefix.get(s.format, "ds_landing_") + ent
         bronze_name = f"ds_bronze_{ent}"
         bronze_ds[ent] = bronze_name
+
+        if s.is_app_seeded():
+            # The app pulls rows into bronze/<ent>/<ent>.csv at deploy time
+            # (app._seed_local_sources) because ADF's cloud Copy can't: a local DB
+            # it can't reach, or a GCP source with no service-account key. Emit
+            # ONLY the bronze dataset the silver/gold flows read — no landing/Copy.
+            datasets.append(Dataset(
+                name=bronze_name,
+                kind=DatasetKind.delimited_text,
+                linked_service=STORAGE_LS,
+                location=DatasetLocation(container=c_bronze, folder=ent, file_name=f"{ent}.csv"),
+                columns=cols,
+                # Schema is authoritative from the source (info_schema/metadata); the
+                # bronze CSV is written LATER by the seed, so grounding must not read
+                # a leftover file here and stamp the wrong (prior-run) schema.
+                seeded=True,
+            ))
+            if s.is_local_db():
+                assumptions.append(
+                    f"source '{ent}' is a local database — the app loads it into "
+                    f"{c_bronze}/{ent}/{ent}.csv at deploy time (ADF cloud can't reach "
+                    f"localhost); the pipeline reads that bronze file"
+                )
+            elif s.format == SourceFormat.sharepoint:
+                assumptions.append(
+                    f"source '{ent}' (SharePoint list) is loaded into "
+                    f"{c_bronze}/{ent}/{ent}.csv at deploy time via Microsoft Graph "
+                    f"(app-only auth); ADF has no SharePoint-list Copy connector, so the "
+                    f"pipeline reads that bronze file"
+                )
+            else:
+                assumptions.append(
+                    f"source '{ent}' ({s.format.value}) is loaded into "
+                    f"{c_bronze}/{ent}/{ent}.csv at deploy time via keyless gcloud auth "
+                    f"(no service-account key wired for ADF's cloud Copy); the pipeline "
+                    f"reads that bronze file"
+                )
+            continue
 
         if s.format in (
             SourceFormat.csv,
@@ -420,6 +522,40 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
                 columns=cols,
             )
             bronze_file = f"{ent}.csv"
+        elif s.format == SourceFormat.postgres:
+            landing = Dataset(
+                name=landing_name,
+                kind=DatasetKind.postgres_table,
+                linked_service=pg_ls[_server_token(s.server)],
+                schema_name=s.schema_name or "public",
+                table_name=s.table_name,
+                columns=cols,
+            )
+            bronze_file = f"{ent}.csv"
+        elif s.format == SourceFormat.bigquery:
+            landing = Dataset(
+                name=landing_name,
+                kind=DatasetKind.bigquery_object,
+                linked_service=bq_ls[_server_token(s.gcp_project) if s.gcp_project else "default"],
+                bq_dataset=s.bq_dataset,
+                table_name=s.table_name,
+                columns=cols,
+            )
+            bronze_file = f"{ent}.csv"
+        elif s.format == SourceFormat.gcs:
+            # A CSV object in a bucket — DelimitedText over a GoogleCloudStorage
+            # location (container = bucket). Byte-for-byte to bronze CSV.
+            folder = (s.folder or "").strip().strip("/")
+            landing = Dataset(
+                name=landing_name,
+                kind=DatasetKind.gcs_csv,
+                linked_service=gcs_ls["gcs"],
+                location=DatasetLocation(
+                    container=s.container, folder=folder or None, file_name=s.file_name
+                ),
+                columns=cols,
+            )
+            bronze_file = s.file_name or f"{ent}.csv"
         else:  # sql_table
             landing = Dataset(
                 name=landing_name,
@@ -790,7 +926,44 @@ def compile_plan(plan: LogicalPlan) -> PipelineSpec:
         )
         trigger_target = pipeline_name
 
-    if plan.schedule:
+    # Local-DB sources are app-seeded (app._seed_local_sources), so an ingest
+    # stage can compile to ZERO activities. ADF rejects an empty pipeline and a
+    # dangling ExecutePipeline, so drop empty stages and any master ExecutePipeline
+    # that invokes them, re-chaining the linear master chain across the gaps.
+    # Fixpoint: a master that loses all its children becomes empty and is dropped
+    # in the next pass too.
+    dropped_pipelines: set = set()
+    while True:
+        empty = {pl.name for pl in pipelines if not pl.activities}
+        if not empty:
+            break
+        dropped_pipelines |= empty
+        rebuilt: List[PipelineDef] = []
+        for pl in pipelines:
+            if not pl.activities:
+                continue
+            keep = [
+                a for a in pl.activities
+                if not (a.type == "ExecutePipeline" and a.invoked_pipeline in empty)
+            ]
+            prev: Optional[str] = None
+            chained: List[Activity] = []
+            for a in keep:
+                if a.type == "ExecutePipeline":  # master chain is linear — re-link survivors
+                    a = a.model_copy(update={"depends_on": [prev] if prev else []})
+                    prev = a.name
+                chained.append(a)
+            rebuilt.append(pl.model_copy(update={"activities": chained}))
+        pipelines[:] = rebuilt
+    if dropped_pipelines:
+        if trigger_target not in {pl.name for pl in pipelines}:
+            trigger_target = pipelines[-1].name if pipelines else None
+        assumptions.append(
+            f"dropped empty ingest stage(s) {sorted(dropped_pipelines)} — their "
+            f"sources are local databases the app seeds into bronze directly"
+        )
+
+    if plan.schedule and trigger_target:
         triggers.append(
             Trigger(
                 name=f"tr_schedule_{project}",

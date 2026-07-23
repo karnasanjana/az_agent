@@ -158,6 +158,26 @@ def _sp_cred(name: str) -> str:
     return os.environ.get(f"SOURCE_{name}") or os.environ.get(f"AZURE_{name}") or ""
 
 
+# Postgres sslMode names -> ADF PostgreSqlV2 integer enum. Local servers usually
+# want 'disable'; hosted (Cloud SQL / Azure DB for PG) want 'require'.
+_PG_SSL_MODE = {"disable": 0, "allow": 1, "prefer": 2, "require": 3,
+                "verify-ca": 4, "verify-full": 5}
+
+
+def _pg_ssl_mode() -> int:
+    return _PG_SSL_MODE.get(os.environ.get("PG_SSLMODE", "prefer").lower(), 2)
+
+
+def _gcp_key_content() -> str:
+    """Service-account key JSON for BigQuery, read from the file named by
+    GOOGLE_APPLICATION_CREDENTIALS at build time (never stored in the spec)."""
+    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    return ""
+
+
 def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
     if ls.type == "HttpServer":
         return {
@@ -208,6 +228,48 @@ def build_linked_service(ls: LinkedService) -> Dict[str, Any]:
                 "servicePrincipalCredential": {
                     "type": "SecureString",
                     "value": _sp_cred("CLIENT_SECRET"),
+                },
+            },
+        }
+    if ls.type == "PostgreSqlV2":
+        # Basic (username/password) auth. User + password come from PG_USER /
+        # PG_PASSWORD env at build time (never stored in the spec; ADF encrypts
+        # the SecureString on deploy). A LOCAL server needs a Self-Hosted IR to be
+        # reachable from ADF cloud — set connectVia on the LS in that case.
+        return {
+            "type": "PostgreSqlV2",
+            "typeProperties": {
+                "server": ls.server or "",
+                "port": int(ls.port) if ls.port else 5432,
+                "database": ls.database or "",
+                "username": os.environ.get("PG_USER", "postgres"),
+                "authenticationType": "Basic",
+                "sslMode": _pg_ssl_mode(),
+                "password": {"type": "SecureString", "value": os.environ.get("PG_PASSWORD", "")},
+            },
+        }
+    if ls.type == "GoogleBigQueryV2":
+        # ServiceAuthentication with a service-account key JSON, read from
+        # GOOGLE_APPLICATION_CREDENTIALS at build time (never stored in the spec).
+        return {
+            "type": "GoogleBigQueryV2",
+            "typeProperties": {
+                "projectId": ls.project_id or os.environ.get("GCP_PROJECT", ""),
+                "authenticationType": "ServiceAuthentication",
+                "keyFileContent": {"type": "SecureString", "value": _gcp_key_content()},
+            },
+        }
+    if ls.type == "GoogleCloudStorage":
+        # S3-interoperability: HMAC access key + secret from GCS_ACCESS_KEY_ID /
+        # GCS_SECRET_ACCESS_KEY env at build time (never stored in the spec).
+        return {
+            "type": "GoogleCloudStorage",
+            "typeProperties": {
+                "serviceUrl": os.environ.get("GCS_SERVICE_URL", "https://storage.googleapis.com"),
+                "accessKeyId": os.environ.get("GCS_ACCESS_KEY_ID", ""),
+                "secretAccessKey": {
+                    "type": "SecureString",
+                    "value": os.environ.get("GCS_SECRET_ACCESS_KEY", ""),
                 },
             },
         }
@@ -313,6 +375,21 @@ def _adls_location(ds: Dataset) -> Dict[str, Any]:
     return store
 
 
+def _gcs_location(ds: Dataset) -> Dict[str, Any]:
+    """GoogleCloudStorageLocation for a CSV object: bucket = location.container."""
+    loc = ds.location
+    params = set(ds.parameters)
+    store: Dict[str, Any] = {
+        "type": "GoogleCloudStorageLocation",
+        "bucketName": loc.container if loc else None,
+    }
+    if loc and loc.folder:
+        store["folderPath"] = _path_value(loc.folder, params)
+    if loc and loc.file_name:
+        store["fileName"] = _path_value(loc.file_name, params)
+    return store
+
+
 def build_dataset(ds: Dataset) -> Dict[str, Any]:
     ls_ref = {"referenceName": ds.linked_service, "type": "LinkedServiceReference"}
     schema = [{"name": c.name, "type": c.type} for c in ds.columns]
@@ -347,6 +424,48 @@ def build_dataset(ds: Dataset) -> Dict[str, Any]:
             "linkedServiceName": ls_ref,
             "parameters": _dataset_parameters(ds),
             "typeProperties": {"entityName": ds.entity_name or ds.name.removeprefix("ds_dataverse_")},
+            "schema": schema,
+        }
+
+    # PostgreSQL table (source only — sinks are storage CSV)
+    if ds.kind == DatasetKind.postgres_table:
+        return {
+            "type": "PostgreSqlV2Table",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {
+                "schema": ds.schema_name or "public",
+                "table": ds.table_name or ds.name.removeprefix("ds_postgres_"),
+            },
+            "schema": schema,
+        }
+
+    # BigQuery table/view (source only — sinks are storage CSV)
+    if ds.kind == DatasetKind.bigquery_object:
+        return {
+            "type": "GoogleBigQueryV2Object",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {
+                "dataset": ds.bq_dataset or "",
+                "table": ds.table_name or ds.name.removeprefix("ds_bigquery_"),
+            },
+            "schema": schema,
+        }
+
+    # CSV object in a GCS bucket (source only) — DelimitedText over a GCS location.
+    if ds.kind == DatasetKind.gcs_csv:
+        return {
+            "type": "DelimitedText",
+            "linkedServiceName": ls_ref,
+            "parameters": _dataset_parameters(ds),
+            "typeProperties": {
+                "location": _gcs_location(ds),
+                "columnDelimiter": ",",
+                "firstRowAsHeader": ds.first_row_as_header,
+                "quoteChar": '"',
+                "escapeChar": "\\",
+            },
             "schema": schema,
         }
 
@@ -419,6 +538,9 @@ _COPY_SOURCE_TYPE = {
     DatasetKind.binary: "BinarySource",
     DatasetKind.azure_sql_table: "AzureSqlSource",
     DatasetKind.dataverse_entity: "CommonDataServiceForAppsSource",
+    DatasetKind.postgres_table: "PostgreSqlV2Source",
+    DatasetKind.bigquery_object: "GoogleBigQueryV2Source",
+    DatasetKind.gcs_csv: "DelimitedTextSource",
 }
 _COPY_SINK_TYPE = {
     DatasetKind.delimited_text: "DelimitedTextSink",
@@ -730,12 +852,25 @@ def _source_read_settings(ds: Dataset) -> "Dict[str, Any] | None":
     are unaffected."""
     if ds.relative_url is not None:  # HTTP file: relativeUrl already names it
         return None
+    # Query/table sources carry NO storeSettings (a file store's settings would
+    # mislead ADF into treating them as files and mis-reading the auth).
     if ds.kind in (DatasetKind.rest_resource, DatasetKind.azure_sql_table,
-                   DatasetKind.dataverse_entity):
+                   DatasetKind.dataverse_entity, DatasetKind.postgres_table,
+                   DatasetKind.bigquery_object):
         return None
     loc = ds.location
     if loc and loc.file_name:  # concrete file name present
         return None
+    # GCS is a file store, but needs GoogleCloudStorageReadSettings (not blob).
+    if ds.kind == DatasetKind.gcs_csv:
+        gcs: Dict[str, Any] = {
+            "type": "GoogleCloudStorageReadSettings", "recursive": True, "wildcardFileName": "*",
+        }
+        if loc and loc.folder:
+            gcs["wildcardFolderPath"] = _PATH_PARAM.sub(
+                lambda m: "*" if m.group(1) in set(ds.parameters) else m.group(0), loc.folder
+            )
+        return gcs
     settings: Dict[str, Any] = {
         "type": "AzureBlobStorageReadSettings" if _blob_mode() else "AzureBlobFSReadSettings",
         "recursive": True,

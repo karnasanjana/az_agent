@@ -1135,6 +1135,58 @@ def _source_schema_checks(spec: PipelineSpec) -> list:
     return checks
 
 
+def _seed_local_sources(plan, bronze_container: str) -> list:
+    """The agent does what ADF's cloud Copy can't: pull each app-seeded source's
+    rows into bronze CSV, from the machine that can reach/authenticate it — a
+    local DB ADF can't route to, or a GCP source with no SA key (keyless gcloud
+    auth). Reuses the bootstrap mover's readers/writers so the file lands exactly
+    at ds_bronze_<entity>'s path (<bronze>/<entity>/<entity>.csv). Best-effort per
+    source — a failure surfaces on the run, it does not silently skip."""
+    import sys
+
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    seeded = []
+    for s in plan.sources:
+        if not s.is_app_seeded():
+            continue
+        from inject_to_bronze import _to_csv, _write_real  # local mover
+
+        if s.is_local_db():
+            from inject_to_bronze import _pull_postgres
+
+            ref = f"{s.schema_name or 'public'}.{s.table_name}"
+            cols, rows = _pull_postgres(ref)
+            _write_real(s.entity, _to_csv(cols, rows), bronze_container)
+        elif s.format == "bigquery":
+            from inject_to_bronze import _pull_bigquery
+
+            proj = s.gcp_project or os.environ.get("GCP_PROJECT") or ""
+            ref = ".".join(p for p in (proj, s.bq_dataset, s.table_name) if p)
+            cols, rows = _pull_bigquery(ref)
+            _write_real(s.entity, _to_csv(cols, rows), bronze_container)
+        elif s.format == "gcs":
+            from inject_to_bronze import _pull_gcs
+
+            ref = "/".join(p.strip("/") for p in (s.container, s.folder, s.file_name) if p)
+            data = _pull_gcs(ref)  # raw bytes, already CSV
+            _write_real(s.entity, data, bronze_container)
+            seeded.append({"entity": s.entity, "table": ref, "bytes": len(data)})
+            continue
+        elif s.format == "sharepoint":
+            from inject_to_bronze import _pull_sharepoint
+
+            host, path = s.sharepoint_host_path()
+            cols, rows = _pull_sharepoint(host, path, s.sharepoint_list)
+            _write_real(s.entity, _to_csv(cols, rows), bronze_container)
+            ref = s.sharepoint_list
+        else:
+            continue
+        seeded.append({"entity": s.entity, "table": ref, "rows": len(rows)})
+    return seeded
+
+
 def _deploy_and_run(run_id: str) -> None:
     from agent.deployer import deploy_artifacts, provision_containers
     from agent.validator import execute
@@ -1175,6 +1227,25 @@ def _deploy_and_run(run_id: str) -> None:
         run["status"] = "PROVISIONING"
         _persist_run(run_id)
         run["containers_created"] = provision_containers(containers)
+
+        # Local-DB sources: the agent pulls them into bronze here (ADF's cloud IR
+        # can't reach localhost). The deployed pipeline reads those bronze CSVs.
+        plan = run.get("logical_plan")
+        if plan is None and run.get("run_dir"):
+            try:
+                from models.logical import LogicalPlan
+
+                with open(os.path.join(run["run_dir"], "logical_plan.json"), encoding="utf-8") as fh:
+                    plan = LogicalPlan.model_validate_json(fh.read())
+            except Exception:  # noqa: BLE001 — no plan file (e.g. legacy run) → nothing to seed
+                plan = None
+        if plan is not None:
+            # plan.containers.bronze is exactly the c_bronze the compiler wrote
+            # ds_bronze_<ent> to — NOT containers[0], which can be "landing".
+            seeded = _seed_local_sources(plan, plan.containers.bronze)
+            if seeded:
+                run["seeded_local"] = seeded
+                _persist_run(run_id)
 
         run["status"] = "DEPLOYING"
         _persist_run(run_id)

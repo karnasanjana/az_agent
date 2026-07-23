@@ -308,6 +308,48 @@ def _dataverse_columns(env_url: str, entity_set: str) -> "List[LogicalColumn]":
         return []
 
 
+def _external_columns(src) -> "List[LogicalColumn]":
+    """Best-effort REAL schema for a postgres/bigquery/gcs/sharepoint source, read from the
+    live source at plan time (same readers the bootstrap mover uses). Returns []
+    on any failure — grounding must never block planning."""
+    try:
+        import sys
+
+        tools = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"
+        )
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+
+        if src.format == SourceFormat.postgres:
+            from source_schema import postgres_schema
+
+            table = f"{src.schema_name or 'public'}.{src.table_name}"
+            cols = postgres_schema(table)
+        elif src.format == SourceFormat.bigquery:
+            from source_schema import bigquery_schema
+
+            ref = ".".join(p for p in (src.gcp_project, src.bq_dataset, src.table_name) if p)
+            cols = bigquery_schema(ref)
+        elif src.format == SourceFormat.gcs:
+            if not src.file_name:  # a folder-only GCS source has no single header to read
+                return []
+            from source_schema import gcs_schema
+
+            path = "/".join(p.strip("/") for p in (src.container, src.folder, src.file_name) if p)
+            cols = gcs_schema(path)
+        elif src.format == SourceFormat.sharepoint:
+            from source_schema import sharepoint_list_schema
+
+            host, site_path = src.sharepoint_host_path()
+            cols = sharepoint_list_schema(host, site_path, src.sharepoint_list)
+        else:
+            return []
+        return [LogicalColumn(name=c["name"], type=c["type"]) for c in cols]
+    except Exception:  # noqa: BLE001 — best-effort; unreachable source leaves the plan
+        return []
+
+
 def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     """Stamp source schemas into a LogicalPlan before completeness.check().
 
@@ -362,6 +404,30 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
         src.columns = cols
         note = (
             f"Grounded source '{src.entity}' from Dataverse metadata "
+            f"({len(cols)} columns) — references now CHECKED against the real schema"
+        )
+        if note not in plan.assumptions:
+            plan.assumptions.append(note)
+        notes.append(note)
+
+    # Postgres / BigQuery / GCS ground from the live source at plan time (catalog
+    # for DB/warehouse, CSV header for GCS) — same "read schema first" step, so
+    # completeness/typecheck run against real columns BEFORE deploy.
+    _EXTERNAL = {SourceFormat.postgres, SourceFormat.bigquery, SourceFormat.gcs,
+                 SourceFormat.sharepoint}
+    _ORIGIN_LABEL = {
+        SourceFormat.postgres: "PostgreSQL", SourceFormat.bigquery: "BigQuery",
+        SourceFormat.gcs: "Google Cloud Storage", SourceFormat.sharepoint: "SharePoint",
+    }
+    for src in plan.sources:
+        if src.format not in _EXTERNAL:
+            continue
+        cols = _external_columns(src)
+        if not cols:
+            continue
+        src.columns = cols
+        note = (
+            f"Grounded source '{src.entity}' from {_ORIGIN_LABEL[src.format]} "
             f"({len(cols)} columns) — references now CHECKED against the real schema"
         )
         if note not in plan.assumptions:
@@ -489,6 +555,12 @@ def ground_spec(spec: PipelineSpec) -> List[str]:
     # 1) Datasets whose file exists NOW (typically landing).
     for ds in spec.datasets:
         if ds.kind != DatasetKind.delimited_text or not ds.first_row_as_header:
+            continue
+        # App-seeded bronze: the file at this path is written LATER by the seed (and
+        # may currently hold a stale leftover from a prior BRD reusing the entity
+        # name). Its real schema is already stamped from the source's info_schema/
+        # metadata — reading the file here would clobber it. See DF-EXPR-010 e2e bug.
+        if getattr(ds, "seeded", False):
             continue
         loc = ds.location
         if loc is None or not loc.file_name:
