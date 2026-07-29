@@ -251,9 +251,17 @@ def _real_resource(category: str, properties: Dict[str, Any]):
 
 
 def _real_deploy_object(adf, cfg: AzureConfig, category: str, name: str, properties: Dict[str, Any]):
+    from agent.retry import retry_sync
+
     resource = _real_resource(category, properties)
     op = getattr(adf, _RESOURCE_CALL[category])
-    return op.create_or_update(cfg.resource_group, cfg.factory_name, name, resource)
+    # create_or_update is idempotent, so a transient Azure transport reset
+    # (Connection aborted / forcibly closed) is safe to retry — otherwise a blip
+    # after the object was already created surfaces as a hard ERROR for a
+    # pipeline that is actually live (external-suite BRD 9).
+    return retry_sync(
+        lambda: op.create_or_update(cfg.resource_group, cfg.factory_name, name, resource)
+    )
 
 
 # Delete in the REVERSE of DEPLOY_ORDER: a dataset can't be removed while a pipeline

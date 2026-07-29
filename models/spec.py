@@ -378,8 +378,12 @@ def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
     if key in _OP_REMOVE_SPECIAL:
         if not col:
             return None
-        replacement = args[0] if args else ""
-        return f"regexReplace({col}, '[^A-Za-z0-9 ]', {_render_literal(replacement)})"
+        # "remove" always replaces with '' — never a caller-supplied value. An
+        # optional args[0] "replacement" let a hallucinated prose value
+        # ('alphanumeric_space') render straight through and silently corrupt
+        # data (Cote d'Ivoire -> Cote dalphanumeric_spaceIvoire), passing every
+        # gate. Custom replacements belong to the explicit regex_replace op.
+        return f"regexReplace({col}, '[^A-Za-z0-9 ]', '')"
     if key in _OP_BLANK_DEFAULT:
         if not col or not args:
             return None
@@ -441,6 +445,12 @@ class Predicate(BaseModel):
     op: str  # not_null | null | eq | ne | gt | ge | lt | le
     column: str
     value: Optional[str] = None  # comparison operand (unused for null tests)
+    # When the comparison is column-vs-column ("resolveby earlier than
+    # createdon"), the RHS is another COLUMN, not a literal. Rendering it through
+    # _render_literal quoted the column name ("resolveby < 'createdon'") — a
+    # timestamp-vs-string mismatch that failed at runtime (DF-FLO-005). Set by
+    # the compiler when `value` names a real column.
+    value_column: Optional[str] = None
 
     def render(self) -> "str | None":
         key = _norm_op(self.op)
@@ -450,6 +460,8 @@ class Predicate(BaseModel):
         if key in _PRED_NULL:
             return f"isNull({col})"
         cmp = _PRED_CMP.get(key)
+        if cmp is not None and self.value_column is not None:
+            return f"{col} {cmp} {dsl_name(self.value_column)}"
         if cmp is not None and self.value is not None:
             return f"{col} {cmp} {_render_literal(self.value)}"
         if key in _PRED_LIKE and self.value is not None:

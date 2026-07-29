@@ -88,6 +88,14 @@ Rules:
     {op: multiply, column: quantity, args: [list_price, one_minus_discount],
      new_column: line_total}].
   Fully supported — do NOT mark arithmetic derived columns as unsupported.
+  ONE OPERATOR PER OP: every operand in `args` uses the op's single operator.
+  A MIXED expression like `a * 100 / b` is TWO chained ops — multiply THEN
+  divide — NOT `{op: multiply, args: [100, b]}` (that computes `a * 100 * b`
+  and silently turns the `/` into a `*`). A percentage/rate/ratio/average ALWAYS
+  ends in a `divide`:
+  "cfr = deaths * 100 / confirmed" = [
+    {op: multiply, column: deaths, args: ["100"], new_column: deaths_x100},
+    {op: divide, column: deaths_x100, args: [confirmed], new_column: cfr}].
 - CONDITIONAL VALUES: op `case` computes a column from ordered WHEN branches
   tested against `column` (first match wins) plus `otherwise` (the default).
   Each branch is {op: lt|le|gt|ge|eq|ne, value, then}; `then`/`otherwise` are
@@ -127,6 +135,16 @@ Rules:
   the key columns on both sides. Aggregations use sum/avg/min/max/count/
   count_distinct/first. "top N" = sort + top_n. Do NOT invent outputs the
   requirements never asked for.
+  TOP-N PER GROUP ("the single best-selling product IN EACH category", "top 3
+  per region") needs a window/rank function and is UNSUPPORTED. Declare it in
+  `unsupported` and do NOT also ship a plain group_by output for it — a
+  group_by(category, product) returns EVERY product per category, not the top
+  one, so shipping it under a name like `top_product_per_category` is a false
+  promise. Either omit the output or, only if the user wants it, name it for
+  what it is ("revenue_by_category_and_product").
+  BUILD what the BRD lists: a silver derived column the requirements explicitly
+  ask for is built even if no gold output references it (e.g. a `daysBetween`
+  duration) — don't drop it as "unused".
 - DATE PARTS: to group by or output Year / Quarter / Month / Day / Hour / week
   from a timestamp or date column, add a `derived` column on the output with op
   `year`, `quarter` (1-4), `month`, `dayofmonth`, `dayofweek`, `dayofyear`,
@@ -169,18 +187,30 @@ Rules:
   * stage ordering / failure handling — "Silver runs only after Bronze
     succeeds", "a failed activity fails the master": the compiler chains every
     activity and pipeline with Succeeded dependency conditions automatically.
-  * dataset/pipeline parameterization, naming conventions, linked services —
-    ADF implementation details the compiler owns. If the BRD asks for them,
-    record one line in `assumptions` (e.g. "datasets use compiler naming
-    convention instead of runtime parameters").
+  * dataset/pipeline parameterization vs literal values, linked-service wiring
+    — ADF implementation details the compiler owns. If the BRD asks for a
+    specific approach here, record one line in `assumptions` (e.g. "datasets
+    use compiler naming convention instead of runtime parameters").
+- CUSTOM naming the compiler CANNOT apply is NOT compiler-owned: a required
+  prefix on every object ("prefix everything with rt"), or a specific ADF
+  folder to group objects in. The compiler emits its own fixed ds_/df_/pl_
+  names and no folders. Put these in `unsupported` — NEVER in `assumptions`,
+  and NEVER claim the compiler will apply them.
 - unsupported: every requirement you recognized but cannot express (alerting,
-  archive/delete steps, SCD2, incremental merge, ForEach patterns). One short
-  line each. NEVER silently drop a requirement.
+  archive/delete steps, SCD2, incremental merge, ForEach patterns, custom
+  object prefixes/folders). One short line each. NEVER silently drop a
+  requirement. If you declare something unsupported, do NOT also emit a
+  partial/degraded version of it in the plan (e.g. an iif/case with an invented
+  sentinel value standing in for a comparison you can't express) — refusing a
+  requirement and shipping a broken version of it are mutually exclusive.
 - suggestions: for each unsupported item, one line proposing the closest
   SUPPORTED alternative (e.g. "SCD2 not supported -> keep latest row via
   dedup_keys instead?"). The user can accept it in chat.
 - assumptions: every decision you made that the requirements left open
-  (dedup keys chosen, date formats, join types). Short lines.
+  (dedup keys chosen, date formats, join types). Short lines. Only record
+  decisions about things ACTUALLY in the plan. Never describe a column as
+  "ingested as-is" unless it is in a source's `columns` — a column absent from
+  the source schema is dropped and belongs in `unsupported`, not here.
 - clarifications: AT MOST 2, ONLY when a core fact is missing (e.g. no source
   location at all). Otherwise assume and record in assumptions.
 - This is a conversation: on follow-up messages, return the FULL updated plan

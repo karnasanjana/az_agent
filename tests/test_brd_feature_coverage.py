@@ -173,3 +173,42 @@ def test_regex_remove_special_and_empty_string_cleaning(monkeypatch):
     assert "nickname = regexReplace(nickname, '[^A-Za-z0-9 ]', '')" in script
     assert "iif(isNull(nickname) || trim(nickname) == '', 'Unknown', nickname)" in script
     assert lint_dataflow_script(df.name, script) == []
+
+
+def test_column_vs_column_filter_renders_as_column_ref():
+    # BRD 02 backlog: "cases where resolveby is earlier than createdon". The RHS
+    # names a COLUMN, not a literal — must render `resolveby < createdon`, not
+    # `resolveby < 'createdon'` (a timestamp-vs-string mismatch that FAILED live).
+    from agent.compiler import _predicate
+    from models.logical import FilterRule
+    cols = {"resolveby", "createdon", "prioritycodename"}
+    p = _predicate(FilterRule(op="lt", column="resolveby", value="createdon"), cols)
+    assert p.render() == "resolveby < createdon"
+    # a genuine literal that isn't a column stays quoted
+    lit = _predicate(FilterRule(op="eq", column="prioritycodename", value="High"), cols)
+    assert lit.render() == "prioritycodename == 'High'"
+
+
+def test_rendered_expressions_surfaces_dsl_for_review(monkeypatch):
+    # The reviewer must see the RENDERED expression (where a folded divide is
+    # visible), not just the plan op names — and no source()/sink() boilerplate.
+    monkeypatch.setenv("MOCK", "true")
+    from agent.compiler import compile_plan
+    from agent.reviewer import rendered_expressions
+    plan = LogicalPlan(
+        project="cov",
+        sources=[LogicalSource(entity="c", format="csv", file_name="c.csv",
+                               columns=[LogicalColumn(name="country"),
+                                        LogicalColumn(name="deaths", type="long"),
+                                        LogicalColumn(name="confirmed", type="long")])],
+        outputs=[OutputPlan(
+            name="focus", from_entities=["c"], group_by=["country"],
+            aggregations=[AggregationPlan(name="peak", op="max", column="confirmed"),
+                          AggregationPlan(name="pk_d", op="max", column="deaths")],
+            post_agg_derived=[CleaningOp(op="multiply", column="pk_d", args=["100", "peak"],
+                                         new_column="cfr_pct")])],
+    )
+    exprs = rendered_expressions(compile_plan(plan))
+    assert "cfr_pct" in exprs and "* peak" in exprs      # the folded divide is visible
+    assert "aggregate(" in exprs
+    assert "source(" not in exprs and "sink(" not in exprs

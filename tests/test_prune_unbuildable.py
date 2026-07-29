@@ -81,6 +81,47 @@ def test_prune_builds_the_rest():
         shutil.rmtree(builder.artifacts_dir(run_id), ignore_errors=True)
 
 
+def test_salvage_drops_only_the_bad_group_by_key():
+    # customer_value shape: a fabricated `loyalty_tier` group_by must not take
+    # down the whole mart — the other keys + aggregations still build.
+    plan = LogicalPlan(
+        project="retail",
+        sources=[LogicalSource(entity="orders", format="csv", container="landing",
+                               file_name="orders.csv",
+                               columns=[LogicalColumn(name="order_id", type="integer"),
+                                        LogicalColumn(name="email"),
+                                        LogicalColumn(name="amount", type="double")])],
+        outputs=[OutputPlan(
+            name="customer_value", from_entities=["orders"],
+            group_by=["email", "loyalty_tier"],  # loyalty_tier does not exist
+            aggregations=[AggregationPlan(name="revenue", op="sum", column="amount")])],
+    )
+    assert check(plan)  # loyalty_tier is flagged
+    notes = prune_unbuildable(plan, check(plan))
+    assert check(plan) == []
+    assert [o.name for o in plan.outputs] == ["customer_value"]  # survived
+    assert plan.outputs[0].group_by == ["email"]  # only the bad key dropped
+    assert any("loyalty_tier" in n for n in notes)
+
+
+def test_identical_aggregations_flagged():
+    # pct_of_total = a/a*100 faked via a duplicate count -> always 100. check()
+    # must catch it so it can never silently ship as a real metric.
+    plan = LogicalPlan(
+        project="sla",
+        sources=[LogicalSource(entity="cases", format="csv", container="landing",
+                               file_name="cases.csv",
+                               columns=[LogicalColumn(name="case_id", type="integer"),
+                                        LogicalColumn(name="priority")])],
+        outputs=[OutputPlan(
+            name="priority_share", from_entities=["cases"], group_by=["priority"],
+            aggregations=[AggregationPlan(name="n", op="count", column="case_id"),
+                          AggregationPlan(name="total", op="count", column="case_id")])],
+    )
+    probs = check(plan)
+    assert any("identical" in p and "priority_share" in p for p in probs)
+
+
 def test_prune_leaves_ungrounded_entities_alone():
     plan = _plan()
     plan.sources[0].columns = []  # customers schema unknown -> nothing provable
@@ -102,3 +143,28 @@ def test_prune_clears_pipeline_gold_refs():
     assert check(plan) == []
     gold_pl = next(p for p in plan.pipelines if p.name == "PL_Gold")
     assert gold_pl.gold == ["sales_by_city"]
+
+
+def test_ratio_named_column_without_division_flagged():
+    # BRD 04: cfr_pct = deaths * 100 / confirmed folded into a single multiply
+    # (deaths * 100 * confirmed) -> silent corruption. check() must flag it.
+    from models.logical import CleaningOp
+    plan = LogicalPlan(
+        project="covid",
+        sources=[LogicalSource(entity="c", format="csv", container="landing",
+                               file_name="c.csv",
+                               columns=[LogicalColumn(name="country"),
+                                        LogicalColumn(name="deaths", type="long"),
+                                        LogicalColumn(name="confirmed", type="long")])],
+        outputs=[OutputPlan(
+            name="focus", from_entities=["c"], group_by=["country"],
+            aggregations=[AggregationPlan(name="peak", op="max", column="confirmed"),
+                          AggregationPlan(name="pk_d", op="max", column="deaths")],
+            post_agg_derived=[CleaningOp(op="multiply", column="pk_d", args=["100", "peak"],
+                                         new_column="cfr_pct")])],
+    )
+    assert any("ratio/percentage" in p and "cfr_pct" in p for p in check(plan))
+    # a correct percentage that DOES divide is not flagged
+    plan.outputs[0].post_agg_derived = [
+        CleaningOp(op="divide", column="pk_d", args=["peak"], new_column="cfr_ratio")]
+    assert not any("ratio/percentage" in p for p in check(plan))

@@ -110,6 +110,10 @@ RULES:
     {op: subtract, column: "1", args: ["discount"], new_column: "one_minus_discount"}
     {op: multiply, column: "quantity", args: ["list_price", "one_minus_discount"],
      new_column: "line_total"}
+  ONE OPERATOR PER OP: a mixed `a * 100 / b` is multiply THEN divide (two ops),
+  NOT {op: multiply, args: ["100", "b"]} — that computes `a * 100 * b` and
+  silently turns the `/` into `*`. A percentage/rate/ratio/average ALWAYS ends
+  in a `divide`.
 - DATE PARTS: to group by Year/Month/... derive them on the output first:
   derived=[{op: year, column: order_ts, new_column: order_year}] then
   group_by=["order_year"].
@@ -132,10 +136,21 @@ RULES:
 - SOURCE VALIDATION: "verify the file exists / is non-empty before ingesting"
   = validate_first=true on that source. Fully supported.
 - top N = sort + top_n. PROPER CASE = op `proper`. All fully supported.
+- CUSTOM object naming the compiler cannot apply — a required prefix on every
+  object ("prefix everything with rt"), a specific ADF folder to group objects
+  in — is note('unsupported', ...), NEVER note('assumption', ...). The compiler
+  emits its own fixed ds_/df_/pl_ names and no folders; never claim it will
+  apply a custom prefix or folder.
 - unsupported: every requirement you cannot express as a tool call — one short
   note('unsupported', ...) line each, plus one note('suggestion', ...) with
-  the closest supported alternative. NEVER silently drop a requirement.
-- assumptions: every decision the requirements left open — note('assumption', ...).
+  the closest supported alternative. NEVER silently drop a requirement. If you
+  declare something unsupported, do NOT also build a partial/degraded version
+  of it (e.g. an iif/case with an invented sentinel value) — refusing and
+  shipping a broken version are mutually exclusive.
+- assumptions: every decision the requirements left open — note('assumption',
+  ...). Only about things ACTUALLY built; never call a column "ingested as-is"
+  unless it is in the source's columns (a column absent from the source schema
+  is dropped and is note('unsupported', ...), not an assumption).
 - clarifications: AT MOST 2, ONLY when a core fact is missing (e.g. no source
   location at all). Otherwise assume and record an assumption.
 - On follow-up messages, EDIT the existing draft with tool calls (state shows

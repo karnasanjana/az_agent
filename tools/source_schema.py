@@ -243,17 +243,36 @@ def sharepoint_list_schema(host: str, site_path: str, list_name: str) -> list[di
     code, site = _get(f"{g}/sites/{host}:{site_path}", tok)
     if code != 200:
         raise RuntimeError(f"sharepoint site: HTTP {code} {json.dumps(site)[:200]}")
-    sid = site["id"]
-    code, cols = _get(f"{g}/sites/{sid}/lists/{urllib.parse.quote(list_name)}/columns", tok)
+    lst = f"{g}/sites/{site['id']}/lists/{urllib.parse.quote(list_name)}"
+    code, cols = _get(f"{lst}/columns", tok)
     if code != 200:
         raise RuntimeError(f"sharepoint columns: HTTP {code} {json.dumps(cols)[:200]}")
-    out = []
+    type_of = {}
     for c in cols.get("value", []):
-        if c.get("hidden") or c.get("readOnly"):
-            continue
         kind = next((k for k in _SP_TYPE if k in c), "text")
-        out.append({"name": c.get("name"), "type": _SP_TYPE.get(kind, "string")})
-    return out
+        type_of[c.get("name")] = _SP_TYPE.get(kind, "string")
+    code, items = _get(f"{lst}/items?$expand=fields&$top=1", tok)
+    if code != 200:
+        raise RuntimeError(f"sharepoint items: HTTP {code} {json.dumps(items)[:200]}")
+    fields = ((items.get("value") or [{}])[0].get("fields") or {})
+    # Membership = /columns (the STABLE full set — includes columns null in the
+    # sampled row) UNIONed with the item's `fields` (adds the readOnly `id` KEY
+    # the mover writes). Exclude OData annotations (@) and SharePoint's
+    # compliance/version internals (_UIVersionString, _ComplianceFlags, …):
+    # they appear in item fields but are leading-underscore identifiers the
+    # Data Flow DSL rejects (DF-DSL-001), and the mover skips them too.
+    def _ok(n: str) -> bool:
+        return bool(n) and not n.startswith("@") and not n.startswith("_")
+
+    names: list[str] = []
+    for c in cols.get("value", []):
+        n = c.get("name")
+        if _ok(n) and not c.get("hidden") and n not in names:
+            names.append(n)
+    for k in fields:
+        if _ok(k) and k not in names:
+            names.append(k)
+    return [{"name": n, "type": type_of.get(n, "string")} for n in names]
 
 
 if __name__ == "__main__":

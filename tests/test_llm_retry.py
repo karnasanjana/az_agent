@@ -117,6 +117,28 @@ def test_async_timeout_retried():
     assert len(calls) == 2
 
 
+def test_azure_transport_reset_retried():
+    # external-suite BRD 9: a ServiceResponseError ('Connection aborted' /
+    # forcibly-closed reset) after a successful create_or_update flagged a live
+    # factory as ERROR. It is NOT a ConnectionError subclass, so retry_sync must
+    # recognize it by name and re-issue the idempotent deploy call.
+    from agent.retry import retry_sync
+
+    class ServiceResponseError(Exception):  # mirrors azure.core.exceptions
+        pass
+
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 2:
+            raise ServiceResponseError("('Connection aborted.', ConnectionResetError(10054))")
+        return "deployed"
+
+    assert retry_sync(flaky) == "deployed"
+    assert len(calls) == 2
+
+
 def test_async_real_bug_not_retried():
     # A genuine code bug (KeyError, ValueError...) must NOT be absorbed.
     async def broken():

@@ -41,6 +41,7 @@ _USER_ANSWERABLE = (
     "unsupported",
     "ambiguous",
     "can never match",  # case-branch thresholds are a business decision
+    "could not be verified",  # a guessed table/list not in the real source
 )
 
 
@@ -56,6 +57,11 @@ def question_for(problem: str) -> str:
         return (
             f"I couldn't resolve this after several attempts: {p} — which existing "
             "column should be used here, or how should it be derived?"
+        )
+    if "could not be verified" in p:
+        return (
+            f"I couldn't find that source in the real system: {p} — what is the "
+            "exact table/list name (and columns) I should use?"
         )
     if "unsupported" in p.lower():
         return (

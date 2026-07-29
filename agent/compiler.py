@@ -1198,7 +1198,15 @@ def _derived_transforms(
     ]
 
 
-def _predicate(f: FilterRule) -> Predicate:
+_CMP_OPS = {"eq", "ne", "gt", "ge", "lt", "le"}
+
+
+def _predicate(f: FilterRule, columns: "Optional[set]" = None) -> Predicate:
+    # A comparison whose value NAMES another column is column-vs-column
+    # ("resolveby earlier than createdon") — render it as a column ref, not a
+    # quoted string literal that fails at runtime as a type mismatch.
+    if (columns and f.value in columns and _norm_op_local(f.op) in _CMP_OPS):
+        return Predicate(op=f.op, column=f.column, value=None, value_column=f.value)
     return Predicate(op=f.op, column=f.column, value=f.value)
 
 
@@ -1223,11 +1231,12 @@ def _silver_transforms(
     if xf.cleaning:
         transforms.extend(_derived_transforms(xf.cleaning, "cleanColumns", col_types))
     if xf.filters:
+        avail = set(col_types) | {c.new_column or c.column for c in xf.cleaning}
         transforms.append(
             Transform(
                 kind=TransformKind.filter,
                 name="filterRows",
-                predicates=[_predicate(f) for f in xf.filters],
+                predicates=[_predicate(f, avail) for f in xf.filters],
             )
         )
     if xf.dedup_keys:
@@ -1315,11 +1324,12 @@ def _gold_transforms(
     if out.derived:
         transforms.extend(_derived_transforms(out.derived, "deriveColumns", col_types))
     if pre_filters:
+        avail = set(col_types or {}) | {d.new_column or d.column for d in out.derived}
         transforms.append(
             Transform(
                 kind=TransformKind.filter,
                 name="filterRows",
-                predicates=[_predicate(f) for f in pre_filters],
+                predicates=[_predicate(f, avail) for f in pre_filters],
             )
         )
     if out.group_by or out.aggregations:
@@ -1341,11 +1351,12 @@ def _gold_transforms(
             )
         )
     if post_agg_filters:
+        avail_agg = set(out.group_by) | agg_names
         transforms.append(
             Transform(
                 kind=TransformKind.filter,
                 name="filterAfterAgg",
-                predicates=[_predicate(f) for f in post_agg_filters],
+                predicates=[_predicate(f, avail_agg) for f in post_agg_filters],
             )
         )
     if out.post_agg_derived:
@@ -1361,11 +1372,12 @@ def _gold_transforms(
             _derived_transforms(out.post_agg_derived, "deriveAfterAgg", post_agg_types)
         )
     if post_derived_filters:
+        avail_pd = set(out.group_by) | agg_names | post_agg_names
         transforms.append(
             Transform(
                 kind=TransformKind.filter,
                 name="filterAfterDerived",
-                predicates=[_predicate(f) for f in post_derived_filters],
+                predicates=[_predicate(f, avail_pd) for f in post_derived_filters],
             )
         )
     if out.sort:

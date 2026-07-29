@@ -65,3 +65,21 @@ def test_cast_then_coalesce_survives_flow_simulation():
     types = {c.name: c.type for c in out}
     assert types["category_id"] == "integer"
     assert types["product_name"] == "string"
+
+
+def test_note_fabricated_discloses_dropped_columns():
+    # bug 6: a requested column absent from the real schema must not vanish
+    # silently. _note_fabricated flags exactly the model columns not in the
+    # real schema and records each as a plan assumption.
+    from agent.grounding import _note_fabricated
+    from models.logical import LogicalPlan, LogicalSource, LogicalColumn
+
+    src = LogicalSource(entity="cases", format="dataverse",
+                        dataverse_url="https://x", entity_set="incidents",
+                        columns=[LogicalColumn(name="incidentid"),
+                                 LogicalColumn(name="sla_hours_target")])
+    plan = LogicalPlan(project="p", sources=[src])
+    notes = _note_fabricated(src, ["incidentid", "title"], plan)
+    assert any("sla_hours_target" in n for n in notes)
+    assert not any("incidentid" in n for n in notes)  # real column, no note
+    assert all(n in plan.assumptions for n in notes)

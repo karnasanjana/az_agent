@@ -33,6 +33,25 @@ def test_ok_plan_passes():
     assert check(plan) == []
 
 
+def test_unverified_verifiable_source_flagged():
+    # A postgres source USED by an output but with no schema (grounding cleared
+    # the guessed columns after a table-not-found) must be flagged, not deployed.
+    src = LogicalSource(entity="orders", format="postgres", server="db", database="retail",
+                        table_name="sales_orders", columns=[])
+    plan = LogicalPlan(
+        sources=[src],
+        outputs=[OutputPlan(name="o", from_entities=["orders"])],
+    )
+    assert _has(check(plan), "could not be verified")
+
+
+def test_unused_verifiable_source_without_schema_ok():
+    # Copy-only (not used by any transform/output): no schema needed, no flag.
+    src = LogicalSource(entity="orders", format="postgres", server="db", database="retail",
+                        table_name="orders", columns=[])
+    assert not _has(check(LogicalPlan(sources=[src])), "could not be verified")
+
+
 def test_no_sources():
     plan = LogicalPlan.model_construct(sources=[], transforms=[], outputs=[])
     assert _has(check(plan), "no sources")

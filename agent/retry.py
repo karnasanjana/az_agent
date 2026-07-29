@@ -19,16 +19,23 @@ _TRIES = 3
 _FIRST_DELAY = 5.0
 
 
+# Azure SDK transport faults (azure.core.exceptions). NOT ConnectionError
+# subclasses — they wrap the underlying reset — so they need matching by name.
+# ServiceResponseError is exactly the "Connection aborted / forcibly closed"
+# reset that flagged a fully-deployed factory as ERROR (external-suite BRD 9).
+_AZURE_TRANSIENT = {"serviceresponseerror", "servicerequesterror"}
+
+
 def _is_transient_network(exc: BaseException) -> bool:
     """Timeouts AND connection-level failures are transient: the per-request
     LLM_TIMEOUT in config.py turns a stalled connection into an exception, and
     httpx raises ReadError/ConnectError (subclasses of TransportError) when the
     remote end drops mid-request — a fresh attempt usually succeeds (observed:
     ReadError('') killed /plan twice on BRD1). Match by type NAME so no
-    provider-specific import (httpx, google-genai, anthropic) is needed."""
+    provider-specific import (httpx, google-genai, anthropic, azure) is needed."""
     for klass in type(exc).__mro__:
         name = klass.__name__.lower()
-        if "timeout" in name or name == "transporterror":
+        if "timeout" in name or name == "transporterror" or name in _AZURE_TRANSIENT:
             return True
     return isinstance(exc, (TimeoutError, ConnectionError))
 

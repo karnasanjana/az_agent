@@ -47,6 +47,36 @@ def _connected(entities: List[str], edges: List[tuple]) -> bool:
 
 _PRUNE_OUT_RE = re.compile(r"output '([^']+)'")
 
+# Column names that imply a division (percentage / rate / ratio / average / per).
+_RATIO_RE = re.compile(r"(?:^|_)(pct|percent|rate|ratio|share|avg|average|mean|per)(?:$|_|\d)", re.I)
+
+
+def _ratio_without_division(ops: List) -> List[str]:
+    """Names of ratio/percentage-looking derived columns whose derivation chain
+    contains NO division. The arithmetic vocabulary carries one operator per op,
+    so a mixed `a * 100 / b` gets folded into a single multiply
+    (`a * 100 * b`) — the `/` silently becomes `*`, corrupting gold and passing
+    every gate (BRD 04 `cfr_pct`, live). A real ratio must contain a `divide`
+    somewhere in its chain."""
+    by_col = {(o.new_column or o.column): o for o in ops if (o.new_column or o.column)}
+
+    def has_divide(col: str, seen: Set[str]) -> bool:
+        op = by_col.get(col)
+        if op is None or col in seen:
+            return False
+        seen.add(col)
+        if _norm_op(op.op or "") == "divide":
+            return True
+        operands = [op.column] + list(getattr(op, "args", None) or [])
+        return any(has_divide(str(o), seen) for o in operands if o)
+
+    bad: List[str] = []
+    for o in ops:
+        name = o.new_column or o.column or ""
+        if _RATIO_RE.search(name) and not has_divide(name, set()):
+            bad.append(name)
+    return bad
+
 
 def _prune_transform_ops(plan: LogicalPlan) -> List[str]:
     """Drop transform pieces that reference columns the (grounded) source data
@@ -109,6 +139,39 @@ def _prune_transform_ops(plan: LogicalPlan) -> List[str]:
     return notes
 
 
+def _salvage_group_by(plan: LogicalPlan) -> List[str]:
+    """Drop only the group_by columns an output can't build, keeping the output
+    when OTHER group_by columns remain — instead of discarding a whole mart for
+    one fabricated key (customer_value lost revenue/order_count over a bogus
+    `loyalty_tier`). Outputs whose ENTIRE grouping is unbuildable fall through
+    to the whole-output drop, unchanged."""
+    notes: List[str] = []
+    src_by_entity = {s.entity: s for s in plan.sources}
+    xf_by_entity = {t.entity: t for t in plan.transforms}
+    for out in plan.outputs:
+        known = [src_by_entity[e] for e in out.from_entities if e in src_by_entity]
+        if not known or not all(_entity_columns(s) for s in known):
+            continue  # ungrounded — cannot prove anything, leave alone
+        available: Set[str] = set()
+        for s in known:
+            available |= _entity_columns(s)
+            xf = xf_by_entity.get(s.entity)
+            if xf is not None:
+                available |= {c.new_column or c.column for c in xf.cleaning}
+        available |= {d.new_column or d.column for d in out.derived}
+        available |= {a.name for a in out.aggregations}
+        available |= {d.new_column or d.column for d in out.post_agg_derived}
+        missing = [g for g in out.group_by if g not in available]
+        if missing and len(missing) < len(out.group_by):
+            out.group_by = [g for g in out.group_by if g in available]
+            for g in missing:
+                notes.append(
+                    f"gold output '{out.name}': group_by column '{g}' not built — "
+                    "it isn't in the source data; grouped by the remaining columns"
+                )
+    return notes
+
+
 def prune_unbuildable(plan: LogicalPlan, problems: List[str]) -> List[str]:
     """LAST RESORT after repair rounds exhaust: drop the pieces the checker
     can't resolve so the REST of the plan still builds, and record each as a
@@ -119,6 +182,7 @@ def prune_unbuildable(plan: LogicalPlan, problems: List[str]) -> List[str]:
     with a guessed column and not turned into a question wall that builds
     nothing (BRD1 live run: 8 outputs, 0 built). Returns one note per drop."""
     notes = _prune_transform_ops(plan)
+    notes += _salvage_group_by(plan)
     # Transform pruning may remove derived columns outputs depended on — take a
     # fresh problem list, then drop every output that still has a problem.
     bad = {
@@ -161,6 +225,25 @@ def check(plan: LogicalPlan) -> List[str]:
             problems.append(f"duplicate source entity '{s.entity}'")
         seen.add(s.entity)
         src_by_entity[s.entity] = s
+
+    # 2b. a source USED by transforms/outputs whose schema could not be verified
+    #     against its live catalog (grounding cleared the guessed columns after a
+    #     table/list-not-found) — building on invented columns deploys a pipeline
+    #     that fails at runtime. Ask for the real coordinates instead of shipping
+    #     a fabricated schema. Only for catalog-verifiable formats; a not-yet-
+    #     uploaded CSV legitimately has no schema at plan time.
+    _VERIFIABLE = {SourceFormat.postgres, SourceFormat.dataverse,
+                   SourceFormat.bigquery, SourceFormat.sharepoint}
+    used_entities = {t.entity for t in plan.transforms} | {
+        e for o in plan.outputs for e in o.from_entities
+    }
+    for s in plan.sources:
+        if s.entity in used_entities and s.format in _VERIFIABLE and not _entity_columns(s):
+            problems.append(
+                f"source '{s.entity}': its schema could not be verified against the "
+                f"real {s.format.value} source — the named table/list was not found; "
+                "confirm the exact source name and columns"
+            )
 
     # 3. every transform entity exists.
     for t in plan.transforms:
@@ -211,6 +294,35 @@ def check(plan: LogicalPlan) -> List[str]:
                 problems.append(
                     f"output '{out.name}': aggregation '{a.name}' duplicates a group_by column"
                 )
+
+        # 8b. two aggregations with the same op+column are IDENTICAL for every
+        # row. The model creates the second to fake a "total across all groups"
+        # for a percent-of-total; dividing by it yields a constant (always
+        # 100%) that passes every gate. A real cross-group total needs a
+        # window/global aggregate this system can't express.
+        agg_seen: Dict[tuple, str] = {}
+        for a in out.aggregations:
+            key = (_norm_op(a.op), a.column)
+            if key in agg_seen:
+                problems.append(
+                    f"output '{out.name}': aggregations '{agg_seen[key]}' and "
+                    f"'{a.name}' are identical ({a.op} of '{a.column}') — a "
+                    "per-group count cannot stand in for a total across all "
+                    "groups (that needs a window/global aggregate, which is "
+                    "unsupported); drop one and mark the percent-of-total unsupported"
+                )
+            else:
+                agg_seen[key] = a.name
+
+        # 8c. a ratio/percentage-named derived column with no division in its
+        # chain — a '/' folded into a multiply (silent gold corruption).
+        for name in _ratio_without_division(list(out.derived) + list(out.post_agg_derived)):
+            problems.append(
+                f"output '{out.name}': '{name}' looks like a ratio/percentage but "
+                "its derivation contains no division — a '/' was likely folded into "
+                "a multiply (e.g. `a * 100 * b` instead of `a * 100 / b`); use the "
+                "`divide` op (chained through new_column) for the division"
+            )
 
         # 10. top_n without sort.
         if out.top_n is not None and not out.sort:

@@ -232,9 +232,12 @@ def test_azure_config() -> Dict[str, Any]:
     except RuntimeError as exc:
         return {"ok": False, "checks": [{"name": "config_present", "passed": False,
                                          "detail": str(exc)}]}
+    from agent.retry import retry_sync
     try:
         adf = get_datafactory_client(cfg)
-        adf.factories.get(cfg.resource_group, cfg.factory_name)
+        # Idempotent read — retry transient transport blips (a DNS getaddrinfo
+        # failure rejected a fully-deployable plan before this was wrapped).
+        retry_sync(lambda: adf.factories.get(cfg.resource_group, cfg.factory_name))
         checks.append({"name": "data_factory_reachable", "passed": True,
                        "detail": cfg.factory_name})
     except Exception as exc:  # noqa: BLE001
@@ -244,7 +247,7 @@ def test_azure_config() -> Dict[str, Any]:
     try:
         from config import get_blob_service_client
 
-        get_blob_service_client(cfg).get_account_information()
+        retry_sync(lambda: get_blob_service_client(cfg).get_account_information())
         checks.append({"name": "storage_reachable", "passed": True,
                        "detail": cfg.adls_account_name})
     except Exception as exc:  # noqa: BLE001
@@ -792,7 +795,7 @@ async def _run_logical(
 
         if reviewer.enabled() and requirements_text and cached is None:
             with phases.phase("plan_review", llm=True):
-                findings = await reviewer.review_plan(requirements_text, plan)
+                findings = await reviewer.review_plan(requirements_text, plan, spec)
             if findings:
                 resp["review_findings"] = findings
                 _RUNS[run_id]["review_findings"] = findings

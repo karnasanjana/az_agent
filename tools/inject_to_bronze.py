@@ -114,7 +114,11 @@ def _pull_sharepoint(host: str, path: str, lst: str) -> tuple[list[str], list[di
         if code != 200:
             raise RuntimeError(f"sharepoint items: HTTP {code}")
         for it in data.get("value", []):
-            rows.append({k: v for k, v in (it.get("fields") or {}).items() if not k.startswith("@")})
+            # Skip OData annotations (@) and SharePoint compliance/version
+            # internals (_UIVersionString, …): leading-underscore names break
+            # the Data Flow DSL, and the schema reader excludes them too.
+            rows.append({k: v for k, v in (it.get("fields") or {}).items()
+                         if not (k.startswith("@") or k.startswith("_"))})
         url = data.get("@odata.nextLink")
     cols: list[str] = []
     for r in rows:

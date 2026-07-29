@@ -350,6 +350,25 @@ def _external_columns(src) -> "List[LogicalColumn]":
         return []
 
 
+def _note_fabricated(src, real_names, plan) -> List[str]:
+    """A column the model listed that the real schema lacks is about to be
+    silently dropped when we overwrite src.columns — disclose each one so a
+    fabricated 'keep' never vanishes without a trace (bug 6: sla_hours_target
+    was requested, absent from Dataverse, and left no note anywhere)."""
+    real = set(real_names)
+    out: List[str] = []
+    for c in src.columns:
+        if c.name not in real:
+            note = (
+                f"requested column '{c.name}' on '{src.entity}' does not exist "
+                "in the real source schema — dropped, not ingested"
+            )
+            if note not in plan.assumptions:
+                plan.assumptions.append(note)
+            out.append(note)
+    return out
+
+
 def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     """Stamp source schemas into a LogicalPlan before completeness.check().
 
@@ -372,6 +391,7 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
         if not names:
             continue
         inferred = _infer_column_types(head, names)
+        notes += _note_fabricated(src, names, plan)
         src.columns = [
             LogicalColumn(name=n, type=inferred.get(n, "string")) for n in names
         ]
@@ -400,7 +420,9 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
             continue
         cols = _dataverse_columns(src.dataverse_url, src.entity_set)
         if not cols:
+            src.columns = []  # metadata read hit nothing — drop guesses so it's flagged unverified
             continue
+        notes += _note_fabricated(src, [c.name for c in cols], plan)
         src.columns = cols
         note = (
             f"Grounded source '{src.entity}' from Dataverse metadata "
@@ -424,7 +446,15 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
             continue
         cols = _external_columns(src)
         if not cols:
+            # A live catalog read (DB/warehouse/SharePoint) that returns nothing
+            # means the named table/list is not there — drop the model's GUESSED
+            # columns so this source is flagged unverified (below) instead of
+            # deploying a fabricated schema that fails at runtime. GCS folder-only
+            # sources legitimately have no header, so leave those untouched.
+            if src.format != SourceFormat.gcs:
+                src.columns = []
             continue
+        notes += _note_fabricated(src, [c.name for c in cols], plan)
         src.columns = cols
         note = (
             f"Grounded source '{src.entity}' from {_ORIGIN_LABEL[src.format]} "
