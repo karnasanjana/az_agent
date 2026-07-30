@@ -1,0 +1,24 @@
+{
+  "name": "zionai-video",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ZionAi product demo video",
+  "scripts": {
+    "dev": "npx remotion studio",
+    "build": "npx remotion render ProductDemo",
+    "generate-voiceover": "node --strip-types generate-voiceover.ts"
+  },
+  "dependencies": {
+    "@remotion/cli": "latest",
+    "@remotion/google-fonts": "latest",
+    "@remotion/media": "4.0.444",
+    "@remotion/transitions": "latest",
+    "react": "^19",
+    "react-dom": "^19",
+    "remotion": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "typescript": "^5"
+  }
+}

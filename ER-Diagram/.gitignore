@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TLS certificates (contain private keys)
+*.pem
+# Keep certs directory structure (ignore .pem files but allow .gitkeep and README)
+!backend/certs/
+backend/certs/*
+!backend/certs/.gitkeep
+!backend/certs/README.md
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Data files
+data/
+data2/
+
+# Planning docs
+.planning/
+
+# Misc
+image.png
+test_db_connection.py
+
+# Keep example files
+!.env.example

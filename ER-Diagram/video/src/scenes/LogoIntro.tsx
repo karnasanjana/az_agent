@@ -1,0 +1,144 @@
+import {
+  AbsoluteFill,
+  useCurrentFrame,
+  useVideoConfig,
+  spring,
+  interpolate,
+} from "remotion";
+import { theme } from "../theme";
+import { fontFamily } from "../fonts";
+
+export const LogoIntro: React.FC = () => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  // Logo scale entrance
+  const logoScale = spring({ frame, fps, config: { damping: 12 } });
+
+  // Logo glow pulse
+  const glowOpacity = interpolate(
+    frame,
+    [0, fps * 0.5, fps * 1.5],
+    [0, 0.8, 0.4],
+    { extrapolateRight: "clamp" }
+  );
+
+  // Product name fade in
+  const productOpacity = interpolate(
+    frame,
+    [fps * 0.6, fps * 1.2],
+    [0, 1],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
+  const productY = interpolate(
+    frame,
+    [fps * 0.6, fps * 1.2],
+    [20, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
+
+  // Tagline fade in
+  const taglineOpacity = interpolate(
+    frame,
+    [fps * 1.2, fps * 2],
+    [0, 1],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
+  const taglineY = interpolate(
+    frame,
+    [fps * 1.2, fps * 2],
+    [15, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
+
+  return (
+    <AbsoluteFill
+      style={{
+        background: theme.bg,
+        justifyContent: "center",
+        alignItems: "center",
+        fontFamily,
+      }}
+    >
+      {/* Background gradient orb */}
+      <div
+        style={{
+          position: "absolute",
+          width: 600,
+          height: 600,
+          borderRadius: "50%",
+          background: `radial-gradient(circle, ${theme.indigo[500]}15, transparent 70%)`,
+          filter: "blur(80px)",
+          opacity: glowOpacity,
+        }}
+      />
+
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 20,
+          transform: `scale(${logoScale})`,
+        }}
+      >
+        {/* ZionAi Logo */}
+        <svg
+          width="400"
+          height="90"
+          viewBox="0 0 111 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            d="M23.595 15.727C23.7747 15.6093 23.9848 15.5466 24.1996 15.5466H26.0508V12.9732H23.4649V14.5436C23.4649 14.9157 23.2774 15.2627 22.9661 15.4666L21.4948 16.4305C21.3151 16.5482 21.1049 16.6109 20.8901 16.6109H20.2491C19.7696 16.6109 19.345 16.3013 19.1985 15.8447L16.8806 8.62189C16.8456 8.51292 16.8278 8.39918 16.8278 8.28474V6.29079H14.2419V8.86417H15.6176C16.0971 8.86417 16.5217 9.17384 16.6683 9.63041L18.9861 16.8532C19.0211 16.9622 19.0389 17.0759 19.0389 17.1904V18.144C19.0389 18.5384 18.8284 18.9028 18.4868 19.0998L14.8459 21.1996C14.6782 21.2963 14.4881 21.3472 14.2946 21.3472H12.4095V23.9167H14.9955V22.3875C14.9955 21.9931 15.206 21.6287 15.5476 21.4317L19.1885 19.3319C19.3562 19.2352 19.5463 19.1843 19.7398 19.1843H21.6249V17.6139C21.6249 17.2418 21.8124 16.8948 22.1236 16.6909L23.595 15.727ZM8.03711 21.3358L11.4974 19.1109C11.8132 18.9079 12.004 18.5583 12.004 18.1828V17.4794C12.004 17.1862 11.8874 16.9051 11.6797 16.6981L10.1389 15.1616C9.93206 14.9554 9.65189 14.8396 9.3598 14.8396H7.63544V12.2662H10.2214V13.9749C10.2214 14.2681 10.3381 14.5492 10.5457 14.7562L12.0865 16.2927C12.2934 16.4989 12.5736 16.6147 12.8656 16.6147H14.59V19.1843H12.7342C12.5223 19.1843 12.3148 19.2454 12.1366 19.3602L8.4273 21.7501V23.9167C6.18563 23.9167 4.05872 23.0311 2.47501 21.4574C0.891302 19.8837 0 17.7703 0 15.5428C0 13.3153 0.891302 11.2019 2.47501 9.6282C3.76034 8.35101 5.42055 7.51476 7.21848 7.25628C7.47861 5.46973 8.32019 3.82003 9.60551 2.54284C11.1892 0.969166 13.3161 0.0834961 15.5578 0.0834961C17.7995 0.0834961 19.9264 0.969166 21.5101 2.54284C22.7954 3.82003 23.637 5.46973 23.8971 7.25628C25.6951 7.51476 27.3553 8.35101 28.6406 9.6282C30.2243 11.2019 31.1156 13.3153 31.1156 15.5428C31.1156 17.7703 30.2243 19.8837 28.6406 21.4574C27.0569 23.0311 24.93 23.9167 22.6883 23.9167H18.6717V21.3472H22.6883C24.2414 21.3472 25.7142 20.7314 26.8121 19.6404C27.91 18.5495 28.5258 17.0861 28.5258 15.5466C28.5258 14.0071 27.9061 12.5399 26.8121 11.449C26.0049 10.6469 24.9836 10.0957 23.8704 9.86387C23.484 9.78405 23.0862 9.74224 22.6921 9.74224H21.3992V8.45745C21.3992 8.06593 21.3571 7.6706 21.2768 7.28669C21.0434 6.17675 20.4887 5.16184 19.6816 4.3636C18.5837 3.27267 17.1109 2.65688 15.5578 2.65688C14.0047 2.65688 12.5319 3.27267 11.4341 4.3636C10.6269 5.16564 10.0722 6.18055 9.83887 7.28669C9.75853 7.6706 9.71646 8.06593 9.71646 8.45745V9.74224H8.42348C8.02946 9.74224 7.63163 9.78025 7.24527 9.86387C6.12825 10.0957 5.10688 10.6469 4.30355 11.449C3.20567 12.5399 2.58594 14.0033 2.58594 15.5466C2.58594 17.0899 3.20567 18.5533 4.30355 19.6404C5.3058 20.6363 6.62556 21.2369 8.0333 21.332L8.03711 21.3358Z"
+            fill="url(#paint0_linear)"
+          />
+          <path d="M38.6172 20.5431V18.2949L47.6164 6.98295H38.7834V4.28512H51.653V6.53331L42.6775 17.8453H51.7717V20.5431H38.6172Z" fill={theme.foreground} />
+          <path d="M55.9821 6.46232C55.0561 6.46232 54.32 5.68137 54.32 4.80575C54.32 3.93014 55.0561 3.17285 55.9821 3.17285C56.8844 3.17285 57.6205 3.93014 57.6205 4.80575C57.6205 5.68137 56.8844 6.46232 55.9821 6.46232ZM54.51 20.5431V8.30821H57.4068V20.5431H54.51Z" fill={theme.foreground} />
+          <path d="M66.5446 20.8271C62.9829 20.8271 59.9674 17.8926 59.9674 14.4138C59.9674 10.935 62.9829 8.02422 66.5446 8.02422C70.1063 8.02422 73.1219 10.935 73.1219 14.4138C73.1219 17.8926 70.1063 20.8271 66.5446 20.8271ZM66.5446 18.3659C68.5629 18.3659 70.2725 16.5674 70.2725 14.4138C70.2725 12.284 68.5629 10.4854 66.5446 10.4854C64.5026 10.4854 62.793 12.284 62.793 14.4138C62.793 16.5674 64.5026 18.3659 66.5446 18.3659Z" fill={theme.foreground} />
+          <path d="M82.3304 8.02422C85.0135 8.02422 86.8893 9.98844 86.8893 12.7573V20.5431H84.0875V13.3252C84.0875 11.6687 83.019 10.4854 81.4993 10.4854C79.9796 10.4854 78.7212 11.503 78.5312 12.8046V20.5431H75.6344V8.30821H78.5312V9.94111C79.2911 8.80518 80.7157 8.02422 82.3304 8.02422Z" fill={theme.foreground} />
+          <path d="M102.548 20.5431L101.313 17.6086H93.4297L92.195 20.5431H88.8945L95.7092 4.28512H99.0097L105.824 20.5431H102.548ZM94.4982 15.0528H100.244L97.3713 8.21354L94.4982 15.0528Z" fill={theme.foreground} />
+          <path d="M109.361 6.46232C108.435 6.46232 107.699 5.68137 107.699 4.80575C107.699 3.93014 108.435 3.17285 109.361 3.17285C110.264 3.17285 111 3.93014 111 4.80575C111 5.68137 110.264 6.46232 109.361 6.46232ZM107.889 20.5431V8.30821H110.786V20.5431H107.889Z" fill={theme.foreground} />
+          <defs>
+            <linearGradient id="paint0_linear" x1="-14.4234" y1="-11.5916" x2="26.5547" y2="24.1443" gradientUnits="userSpaceOnUse">
+              <stop stopColor="#002AEB" />
+              <stop offset="0.505" stopColor="#114FEE" />
+              <stop offset="1" stopColor="#95FFA7" />
+            </linearGradient>
+          </defs>
+        </svg>
+
+        {/* Product name */}
+        <div
+          style={{
+            opacity: productOpacity,
+            transform: `translateY(${productY}px)`,
+            fontSize: 36,
+            fontWeight: 800,
+            background: `linear-gradient(135deg, ${theme.indigo[400]}, ${theme.accent})`,
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+            letterSpacing: 1,
+          }}
+        >
+          DataLake Orchestrator
+        </div>
+
+        {/* Tagline */}
+        <div
+          style={{
+            opacity: taglineOpacity,
+            transform: `translateY(${taglineY}px)`,
+            fontSize: 24,
+            fontWeight: 400,
+            color: theme.muted,
+            letterSpacing: 2,
+          }}
+        >
+          Understand any database in 30 seconds
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};

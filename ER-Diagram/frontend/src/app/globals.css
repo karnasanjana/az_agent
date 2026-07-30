@@ -1,0 +1,252 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root {
+  --background: #0e0e10;
+  --foreground: #e8e7ea;
+  --primary: #7cd0ff;
+  --primary-light: #a7e0ff;
+  --accent: #a855f7; /* purple-500 */
+  --surface: rgba(31, 31, 33, 0.78);
+  --surface-raised: #242426;
+  --border: rgba(144, 144, 151, 0.18);
+  --text-muted: #a3a3ad;
+  --nav-height: 64px;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: 'Inter', var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  /* Matte Luminous Blue (Soft Zion Accent) */
+  --color-indigo-50:  #eef2ff;
+  --color-indigo-100: #e0e7ff;
+  --color-indigo-200: #c7d2fe;
+  --color-indigo-300: #a5b4fc;
+  --color-indigo-400: #818cf8; /* Soft glowing accent */
+  --color-indigo-500: #6366f1; /* Main button color */
+  --color-indigo-600: #4f46e5;
+  --color-indigo-700: #4338ca;
+  --color-indigo-800: #3730a3;
+  --color-indigo-900: #312e81;
+
+  /* Matte Premium Dark Slate (Linear-style Dark Mode) */
+  --color-slate-50:  #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #9ba3af; /* Softened text */
+  --color-slate-500: #6b7280;
+  --color-slate-600: #4b5563;
+  --color-slate-700: #303236; /* Soft borders */
+  --color-slate-800: #212225; /* Panel backgrounds */
+  --color-slate-900: #18191b; /* Matte canvas */
+  --color-slate-950: #111214; /* Deepest shadows */
+}
+
+body {
+  background: #0e0e10;
+  color: var(--color-slate-100);
+  font-family: 'Inter', 'Geist', system-ui, -apple-system, sans-serif;
+  background-attachment: fixed;
+}
+
+.unified-content {
+  min-height: calc(100vh - var(--nav-height));
+  background:
+    radial-gradient(circle at 85% -15%, rgba(168,85,247,.08), transparent 32%),
+    radial-gradient(circle at 12% 0%, rgba(124,208,255,.06), transparent 28%),
+    #0e0e10;
+}
+
+.unified-content > .h-screen,
+.unified-content > main.h-screen { height: calc(100vh - var(--nav-height)) !important; }
+
+.unified-nav {
+  height: var(--nav-height);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 0 22px;
+  color: #e8e7ea;
+  background: rgba(19,19,21,.9);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 10px 35px rgba(0,0,0,.18);
+}
+
+.unified-brand { display:flex; align-items:center; gap:10px; min-width:215px; text-decoration:none; color:inherit; }
+.unified-brand-mark { width:36px; height:36px; display:grid; place-items:center; border-radius:10px; color:#7cd0ff; background:rgba(124,208,255,.08); border:1px solid rgba(124,208,255,.28); }
+.unified-brand-mark svg { width:20px; height:20px; }
+.unified-brand strong { display:block; font-size:14px; line-height:1.2; letter-spacing:-.01em; }
+.unified-brand small { display:block; color:#878791; font:9px var(--font-geist-mono),monospace; letter-spacing:.08em; text-transform:uppercase; margin-top:2px; }
+.unified-nav nav { align-self:stretch; display:flex; align-items:center; gap:3px; }
+.unified-nav nav a { height:100%; min-width:92px; padding:0 13px; display:flex; align-items:center; justify-content:center; gap:7px; color:#92929c; text-decoration:none; font-size:12px; position:relative; }
+.unified-nav nav a svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.7; }
+.unified-nav nav a:hover { color:#e8e7ea; background:rgba(255,255,255,.025); }
+.unified-nav nav a.active { color:#7cd0ff; background:linear-gradient(to bottom,rgba(124,208,255,.06),transparent); }
+.unified-nav nav a.active:after { content:""; position:absolute; height:2px; left:13px; right:13px; bottom:0; background:#7cd0ff; box-shadow:0 0 10px rgba(124,208,255,.7); }
+.unified-status { margin-left:auto; color:#75d8b1; font:9px var(--font-geist-mono),monospace; letter-spacing:.08em; text-transform:uppercase; display:flex; align-items:center; gap:7px; white-space:nowrap; }
+.unified-status i { width:6px; height:6px; border-radius:50%; background:#4fd19b; box-shadow:0 0 9px #4fd19b; }
+.pipeline-embed { position:fixed; inset:var(--nav-height) 0 0; background:#0e0e10; }
+
+@media (max-width: 800px) {
+  .unified-nav { padding:0 12px; gap:8px; }
+  .unified-brand { min-width:auto; } .unified-brand > span:last-child, .unified-status { display:none; }
+  .unified-nav nav { flex:1; justify-content:space-around; } .unified-nav nav a { min-width:0; padding:0 8px; flex-direction:column; gap:2px; font-size:9px; }
+}
+
+input, select, textarea {
+  color: #f8fafc !important;
+  background-color: rgba(15, 23, 42, 0.6) !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--text-muted) !important;
+}
+
+html {
+  color-scheme: dark;
+}
+
+/* Smooth transitions globally */
+* {
+  transition-property: color, background-color, border-color, box-shadow;
+  transition-duration: 200ms;
+  transition-timing-function: ease;
+}
+
+/* Override for animations that need different timing */
+.animate-spin, .animate-bounce, .animate-pulse, [class*="transition-"] {
+  transition-property: all;
+}
+
+/* Custom scrollbar for chat */
+.chat-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 3px;
+}
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.2);
+}
+
+/* Relationships panel slide-in animation */
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Gradient backgrounds */
+.bg-gradient-brand {
+  /* Sleek dark gradient for headers */
+  background: linear-gradient(135deg, rgba(15,23,42,0.8) 0%, rgba(11,14,20,0.9) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.bg-gradient-surface {
+  background-color: transparent;
+  background-image: radial-gradient(rgba(144,144,151,.08) 1px,transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Glassmorphism panel */
+.glass-panel {
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.2);
+}
+
+.glass-panel:hover {
+  border-color: rgba(124,208,255,.25);
+  background: rgba(36,36,38,.88);
+}
+
+/* Shared ZionAi component language across legacy page markup. */
+.text-indigo-400, .text-indigo-300 { color:#7cd0ff !important; }
+.bg-indigo-600 { background-color:#168fb8 !important; }
+.hover\:bg-indigo-500:hover { background-color:#25a8d1 !important; }
+.border-indigo-500\/50 { border-color:rgba(124,208,255,.45) !important; }
+.ring-indigo-500\/30 { --tw-ring-color:rgba(124,208,255,.24) !important; }
+.bg-indigo-900\/20 { background-color:rgba(124,208,255,.08) !important; }
+.bg-indigo-900\/40 { background-color:rgba(18,89,119,.28) !important; }
+button, a { border-radius:8px; }
+input, select, textarea { border-radius:9px !important; background:rgba(19,19,21,.86) !important; }
+
+/* Agent workflow step animation */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeIn {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+/* React Flow Dark Mode Overrides */
+.react-flow__controls {
+  background-color: rgba(15, 23, 42, 0.8) !important; /* bg-slate-900/80 */
+  backdrop-filter: blur(8px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 0.5rem !important;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5) !important;
+  overflow: hidden !important;
+}
+
+.react-flow__controls-button {
+  background-color: transparent !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+  color: #cbd5e1 !important;
+  fill: #cbd5e1 !important;
+  transition: background-color 0.2s !important;
+}
+
+.react-flow__controls-button:hover {
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+.react-flow__controls-button:last-child {
+  border-bottom: none !important;
+}
+
+.react-flow__controls-button svg {
+  fill: #cbd5e1 !important;
+}
+
+/* React Flow MiniMap Overrides */
+.react-flow__minimap {
+  background-color: rgba(30, 41, 59, 0.95) !important; /* bg-slate-800 */
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6) !important;
+  backdrop-filter: blur(8px) !important;
+  bottom: 80px !important; /* Push ABOVE Schema Advisor */
+  right: 15px !important;
+}
+
+.react-flow__minimap-mask {
+  fill: rgba(0, 0, 0, 0.6) !important;
+}
+
+.react-flow__minimap-node {
+  fill: #6366f1 !important; /* indigo-500 */
+  stroke: none !important;
+}

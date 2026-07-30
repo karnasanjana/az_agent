@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><title>Authenticating...</title></head>
+<body>
+<p style="font-family:sans-serif;color:#666;text-align:center;margin-top:40vh">Completing sign-in...</p>
+<script>
+// For MSAL popup flow: the parent window reads the hash from this page.
+// We just need this page to exist at the redirect URI.
+// MSAL in the parent window will detect the response via polling the popup's URL.
+// If this page opened as a tab (not popup), redirect back to the app.
+if (!window.opener) {
+  // Not a popup — redirect to home with the hash so MSAL can process it
+  window.location.replace('/' + window.location.hash);
+}
+</script>
+</body>
+</html>
