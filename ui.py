@@ -13,62 +13,123 @@ INDEX_HTML = r"""<!doctype html>
 <title>BRD &rarr; ADF Medallion Agent</title>
 <style>
   :root {
-    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
-    --ink:#e6e8ec; --mut:#9aa3b2; --accent:#4f9cff;
-    --bronze:#c8803c; --silver:#9aa7b4; --gold:#d8b13a;
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2229;
+    --line:#262c36; --line-strong:#333b47; --ink:#e6edf3; --mut:#8b949e;
+    --accent:#4493f8; --accent-soft:rgba(68,147,248,.12);
+    --bronze:#cd8a4f; --silver:#a7b4c2; --gold:#d8b13a;
     --ok:#3fb950; --bad:#f85149; --warn:#d29922;
   }
   * { box-sizing:border-box; }
+  html { color-scheme:dark; }
   body { margin:0; background:var(--bg); color:var(--ink);
-         font:14px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
-  header { padding:14px 20px; border-bottom:1px solid var(--line);
-           display:flex; align-items:center; gap:12px; }
-  header h1 { font-size:16px; margin:0; font-weight:650; }
-  .tag { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--mut); }
-  .tag.mock { color:#000; background:var(--warn); border-color:var(--warn); font-weight:700; }
-  .tag.live { color:var(--ok); border-color:var(--ok); }
-  main { display:grid; grid-template-columns:380px 1fr; gap:0; height:calc(100vh - 51px); }
-  .left { border-right:1px solid var(--line); padding:16px; overflow:auto; }
-  .right { padding:16px; overflow:auto; }
-  textarea { width:100%; height:230px; resize:vertical; background:var(--panel); color:var(--ink);
-             border:1px solid var(--line); border-radius:8px; padding:10px; font-family:ui-monospace,Consolas,monospace; }
+         font:14px/1.55 Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; -webkit-font-smoothing:antialiased; }
+  header { height:56px; padding:0 20px; border-bottom:1px solid var(--line);
+           background:var(--panel); display:flex; align-items:center; gap:16px; }
+  .brand { display:flex; align-items:center; gap:10px; margin-right:auto; }
+  .brand-mark { width:30px; height:30px; border:1px solid var(--line-strong); border-radius:7px;
+    display:grid; place-items:center; color:var(--accent); background:var(--accent-soft); }
+  .brand-mark svg { width:18px; height:18px; }
+  header h1 { font-size:14px; line-height:1.2; margin:0; font-weight:600; letter-spacing:-.01em; }
+  .subtitle { color:var(--mut); font-size:11px; margin-top:1px; }
+  .tag { font-size:11px; line-height:1; padding:5px 9px; border-radius:6px; border:1px solid var(--line-strong); color:var(--mut); background:var(--panel2); }
+  .tag.mock { color:#1c1402; background:var(--warn); border-color:var(--warn); font-weight:700; }
+  .tag.live { color:var(--ok); border-color:rgba(63,185,80,.4); background:rgba(63,185,80,.1); }
+  .workspace { display:flex; height:calc(100vh - 56px); }
+  main { flex:1; min-width:0; display:grid; grid-template-columns:minmax(360px, 42%) minmax(0,1fr); height:100%; }
+  .left { border-right:1px solid var(--line); overflow:auto; background:var(--bg); }
+  .left-inner { padding:22px; }
+  .right { overflow:auto; background:var(--panel); }
+  .canvas-head { padding:14px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; background:var(--panel); position:sticky; top:0; z-index:3; }
+  .canvas-title { font-weight:600; font-size:14px; } .canvas-sub { font-size:11px; color:var(--mut); margin-top:2px; }
+  .right-inner { padding:22px clamp(22px,3vw,36px) 48px; }
+  textarea { width:100%; height:200px; resize:vertical; background:var(--panel); color:var(--ink);
+             border:1px solid var(--line-strong); border-radius:8px; padding:12px 13px; font-family:ui-monospace,Consolas,monospace;
+             font-size:13px; outline:none; transition:border-color .15s,box-shadow .15s; }
+  textarea:focus, input:focus { border-color:var(--accent)!important; box-shadow:0 0 0 3px var(--accent-soft); outline:none; }
+  textarea::placeholder, input::placeholder { color:#586069; }
   .row { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
-  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px;
-           font-weight:600; cursor:pointer; }
-  button.sec { background:var(--panel2); color:var(--ink); border:1px solid var(--line); }
-  button.ok { background:var(--ok); }
-  button.bad { background:var(--bad); }
-  button:disabled { opacity:.45; cursor:not-allowed; }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:18px 0 8px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
-  pre { background:#0b0d12; border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto;
+  button { background:var(--accent); color:#fff; border:1px solid var(--accent); border-radius:7px; padding:9px 15px;
+           font-weight:600; font-size:13px; cursor:pointer; transition:filter .15s; }
+  button:hover:not(:disabled) { filter:brightness(1.08); }
+  button.sec { background:var(--panel2); color:var(--ink); border:1px solid var(--line-strong); }
+  button.sec:hover:not(:disabled) { border-color:var(--mut); filter:none; }
+  button.ok { background:var(--ok); border-color:var(--ok); color:#04140a; }
+  button.bad { background:transparent; color:#ff9298; border:1px solid rgba(248,81,73,.45); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  h2 { font:600 11px ui-sans-serif,system-ui; text-transform:uppercase; letter-spacing:.07em; color:var(--mut); margin:22px 0 9px; }
+  h3 { color:var(--ink); font-size:15px; margin:20px 0 7px; }
+  .card { background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:14px; margin-bottom:12px; }
+  pre { background:#0b0e14; border:1px solid var(--line); border-radius:8px; padding:11px; overflow:auto;
         font-family:ui-monospace,Consolas,monospace; font-size:12px; margin:6px 0; }
   .check { display:flex; gap:8px; align-items:flex-start; padding:3px 0; }
-  .dot { width:9px; height:9px; border-radius:50%; margin-top:6px; flex:0 0 auto; }
+  .dot { width:9px; height:9px; border-radius:50%; margin-top:6px; flex:0 0 auto; background:var(--mut); }
   .dot.ok { background:var(--ok);} .dot.bad{ background:var(--bad);} .dot.warn{ background:var(--warn);}
   .muted { color:var(--mut); }
-  details { border:1px solid var(--line); border-radius:8px; margin:6px 0; background:var(--panel); }
-  summary { cursor:pointer; padding:8px 10px; font-weight:600; }
+  details { border:1px solid var(--line); border-radius:8px; margin:6px 0; background:var(--panel2); }
+  summary { cursor:pointer; padding:9px 12px; font-weight:500; }
   .status-grid { display:flex; gap:10px; margin:8px 0; flex-wrap:wrap; }
-  .layerbox { flex:1; min-width:150px; border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel2); }
-  .layerbox .s { font-weight:700; } .badge{ font-size:11px; padding:1px 7px; border-radius:9px; border:1px solid var(--line);}
+  .layerbox { flex:1; min-width:150px; border:1px solid var(--line); border-radius:9px; padding:12px; background:var(--panel2); position:relative; overflow:hidden; }
+  .layerbox:before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:var(--mut); }
+  .layerbox:nth-child(1):before { background:var(--bronze); } .layerbox:nth-child(2):before { background:var(--silver); } .layerbox:nth-child(3):before { background:var(--gold); }
+  .layerbox .s { font-weight:600; } .badge{ font-size:11px; padding:1px 7px; border-radius:6px; border:1px solid var(--line);}
   .s-Succeeded{color:var(--ok);} .s-Failed{color:var(--bad);} .s-InProgress{color:var(--accent);} .s-Pending{color:var(--mut);}
   .err { color:var(--bad); white-space:pre-wrap; }
   .pill { font-size:11px; color:var(--mut); }
-  label.file { font-size:12px; color:var(--mut); cursor:pointer; }
+  label.file { font-size:12px; color:var(--accent); cursor:pointer; border:1px dashed var(--line-strong); border-radius:7px; padding:7px 11px; transition:background .15s,border-color .15s; }
+  label.file:hover { background:var(--accent-soft); border-color:var(--accent); }
   .warn { color:var(--warn); white-space:pre-wrap; }
+  code { color:#79c0ff; background:rgba(68,147,248,.1); border:1px solid rgba(68,147,248,.15); border-radius:5px; padding:1px 4px; }
+  a { color:var(--accent); text-underline-offset:3px; }
+  ::selection { background:rgba(68,147,248,.28); }
+  ::-webkit-scrollbar { width:10px; height:10px; } ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:#30363d; border:3px solid transparent; background-clip:padding-box; border-radius:10px; }
+  .journey { display:flex; align-items:center; gap:8px; color:var(--mut); font-size:11px; font-weight:500; }
+  .journey span { display:flex; align-items:center; gap:6px; } .journey i { width:7px; height:7px; border-radius:50%; background:#3a424e; } .journey span.is-active { color:var(--ink); } .journey span.is-active i { background:var(--accent); }
+  .journey b { width:18px; height:1px; background:var(--line-strong); }
+  .pipeline-canvas { margin-bottom:24px; }
+  .pipeline-track { display:grid; grid-template-columns:minmax(0,1fr) 34px minmax(0,1fr) 34px minmax(0,1fr); align-items:stretch; }
+  .flow-node { padding:14px; background:var(--panel2); border:1px solid var(--line); border-top:2px solid var(--mut); border-radius:9px; transition:border-color .2s,opacity .2s; }
+  .flow-node.bronze { border-top-color:var(--bronze); } .flow-node.silver { border-top-color:var(--silver); } .flow-node.gold { border-top-color:var(--gold); }
+  .flow-node.dim { opacity:.5; }
+  .flow-node.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .node-kicker { font-size:10px; color:var(--mut); text-transform:uppercase; letter-spacing:.08em; display:flex; align-items:center; gap:7px; }
+  .node-dot { width:7px; height:7px; border-radius:50%; background:var(--mut); }
+  .bronze .node-dot { background:var(--bronze); } .silver .node-dot { background:var(--silver); } .gold .node-dot { background:var(--gold); }
+  .flow-node strong { display:block; margin:12px 0 3px; font-size:14px; } .flow-node p { margin:0; color:var(--mut); font-size:11px; }
+  .node-status { margin-top:9px; font-size:11px; font-weight:600; }
+  .flow-link { align-self:center; height:1px; background:var(--line-strong); position:relative; }
+  .flow-link:after { content:""; position:absolute; right:-1px; top:-3px; width:6px; height:6px; border-top:1px solid var(--line-strong); border-right:1px solid var(--line-strong); transform:rotate(45deg); }
+  .composer-note { color:var(--mut); font-size:12px; margin:-2px 0 12px; }
+  @media (max-width:820px) {
+    header { padding:10px 16px; height:auto; flex-wrap:wrap; } .brand { width:100%; }
+    .workspace { height:auto; } main { display:block; height:auto; }
+    .left { border-right:0; border-bottom:1px solid var(--line); } .right { min-height:55vh; }
+    textarea { height:180px; } .journey { display:none; } .pipeline-track { grid-template-columns:1fr; gap:8px; } .flow-link { height:20px; width:1px; margin:auto; } .flow-link:after { right:-3px; top:auto; bottom:0; transform:rotate(135deg); }
+  }
+  body.embedded > header { display:none; }
+  body.embedded .workspace { height:100vh; }
 </style>
 </head>
 <body>
+<script>if(new URLSearchParams(location.search).get('embedded')==='1')document.body.classList.add('embedded');</script>
 <header>
-  <h1>BRD &rarr; ADF Agent</h1>
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="5" cy="6" r="2.25"/><circle cx="19" cy="6" r="2.25"/><circle cx="12" cy="18" r="2.25"/><path d="M7.2 6h9.6M6.5 8l4.3 7.8M17.5 8l-4.3 7.8"/></svg>
+    </div>
+    <div><h1>ADF Pipeline Builder</h1><div class="subtitle">Business requirements to governed Azure data pipelines</div></div>
+  </div>
+  <div class="journey" aria-label="Build workflow"><span id="journeyDefine" class="is-active"><i></i>Define</span><b></b><span id="journeyReview"><i></i>Review</span><b></b><span id="journeyDeploy"><i></i>Deploy</span></div>
   <span id="modeTag" class="tag">checking&hellip;</span>
   <span id="healTag" class="tag" style="display:none">self-heal ON</span>
   <span id="runTag" class="pill"></span>
 </header>
+<div class="workspace">
 <main>
   <section class="left">
-    <h2>1. What do you want to build?</h2>
+    <div class="left-inner">
+    <h2>Describe your pipeline</h2>
+    <div class="composer-note">Paste a BRD or explain the source, transformations, and destination in plain English.</div>
     <textarea id="brd" placeholder="Describe it in plain English or paste a full BRD &mdash; e.g. &quot;copy the daily sales CSVs from https://... into the lake and aggregate revenue by region&quot;. Or upload a .txt/.md/.pdf."></textarea>
     <div class="row">
       <label class="file">Upload BRD (.txt/.md/.pdf)<input id="file" type="file" accept=".txt,.md,.text,.pdf" style="display:none"/></label>
@@ -114,15 +175,29 @@ INDEX_HTML = r"""<!doctype html>
       <div id="heals"></div>
       <div id="runErr" class="err"></div>
     </div>
+    </div>
   </section>
 
   <section class="right">
-    <h2>Plan &mdash; what I'll build</h2>
+    <div class="canvas-head"><div><div class="canvas-title">Medallion pipeline</div><div class="canvas-sub">Bronze &rarr; Silver &rarr; Gold</div></div><span class="tag">Azure Data Factory</span></div>
+    <div class="right-inner">
+    <div class="pipeline-canvas" aria-label="Bronze to Silver to Gold medallion flow">
+      <div class="pipeline-track">
+        <div class="flow-node bronze" id="node-bronze"><div class="node-kicker"><span class="node-dot"></span>Raw ingestion</div><strong>Bronze</strong><p>Copy source data without transformation</p><div class="node-status muted" id="status-bronze">Not started</div></div>
+        <div class="flow-link"></div>
+        <div class="flow-node silver" id="node-silver"><div class="node-kicker"><span class="node-dot"></span>Standardize</div><strong>Silver</strong><p>Clean, validate, deduplicate and enrich</p><div class="node-status muted" id="status-silver">Not started</div></div>
+        <div class="flow-link"></div>
+        <div class="flow-node gold" id="node-gold"><div class="node-kicker"><span class="node-dot"></span>Serve</div><strong>Gold</strong><p>Aggregate business-ready outputs</p><div class="node-status muted" id="status-gold">Not started</div></div>
+      </div>
+    </div>
+    <h2>Generated implementation plan</h2>
     <div id="summary"></div>
     <div id="planReadable" class="card muted">Generate a plan to see it in plain English.</div>
     <div id="planNotes"></div>
+    </div>
   </section>
 </main>
+</div>
 
 <script>
 const $ = (s)=>document.querySelector(s);
@@ -140,6 +215,7 @@ async function jpost(u, body){
   if(!r.ok){ const d=(await r.json()).detail; throw new Error(typeof d==='string'?d:JSON.stringify(d)||r.status); }
   return r.json(); }
 
+setCanvasState('idle');
 (async()=>{ try{ const h=await jget('/health');
   const t=$('#modeTag'); if(h.mock){t.textContent='MOCK tenant (no Azure writes)';t.className='tag mock';}
   else{t.textContent='LIVE Azure';t.className='tag live';}
@@ -176,6 +252,10 @@ $('#genBtn').onclick = async ()=>{
   try{
     const fd = new FormData();
     if(UPLOAD){ fd.append('file', UPLOAD); } else { fd.append('brd', brd); }
+    // Embedded in the ER app's Pipelines tab: the diagram's share token arrives
+    // as ?catalog_source_id=... — pass it so grounding uses the reviewed catalog.
+    const csid = new URLSearchParams(location.search).get('catalog_source_id');
+    if(csid){ fd.append('catalog_source_id', csid); }
     let r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd});
     if(r.status===401){
       const t = prompt('This server requires an API token (API_TOKEN):');
@@ -194,6 +274,7 @@ $('#genBtn').onclick = async ()=>{
 
 // Render a /plan or /chat response into the page.
 function applyPlan(data){
+  setJourney('review');
   if(data.status==='NEEDS_CLARIFICATION'){
     renderClar(data.clarifications);
     renderPlan(data);  // show any assumptions the agent already made
@@ -327,6 +408,7 @@ $('#chatBtn').onclick = sendChat;
 $('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat(); });
 
 function reset(){
+  setJourney('define'); setCanvasState('idle');
   REVIEW=null; if(POLL){clearInterval(POLL);POLL=null;}
   ['preflight','clar','summary','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
   $('#planReadable').innerHTML='Generate a plan to see it in plain English.'; $('#planReadable').className='card muted';
@@ -364,6 +446,7 @@ function renderSummary(rev){
 
 function renderGate(data){
   $('#approveBox').style.display='block';
+  setCanvasState(data.preflight.passed ? 'ready' : 'idle');
   const ok = data.preflight.passed;
   $('#approveBtn').disabled = !ok;
   $('#gateNote').innerHTML = ok
@@ -397,6 +480,7 @@ $('#approveBtn').onclick = async ()=>{
   $('#approveBtn').disabled=true;
   try{
     await approveRun(false);
+    setJourney('deploy');
     $('#liveBox').style.display='block';
     $('#stopBtn').style.display=''; $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run';
     POLL = setInterval(poll, 1500); poll();
@@ -466,6 +550,7 @@ async function poll(){
     '<div class="badge s-'+(d.status||'Pending')+'">'+(d.status||'Pending')+'</div>'+
     (d.run_id?'<div class="pill">run '+esc(d.run_id)+'</div>':'')+
     (d.error?'<div class="err">'+esc(d.error)+'</div>':'')+'</div>').join('');
+  paintCanvas(steps);
   // Past self-heal attempts stay visible while the retry runs (and at the end,
   // sourced from the final report), so errors never vanish into the loop.
   let hist = (s.run && s.run.attempt_history) || null;
@@ -495,6 +580,36 @@ async function poll(){
 }
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function setJourney(step){
+  const map={define:'journeyDefine',review:'journeyReview',deploy:'journeyDeploy'};
+  Object.values(map).forEach(id=>$('#'+id).classList.remove('is-active'));
+  $('#'+map[step]).classList.add('is-active');
+}
+
+// Reflect real state on the medallion canvas instead of a static diagram.
+// mode 'idle' (nothing built) / 'ready' (plan built, awaiting deploy); a live
+// run overrides both with per-layer status from paintCanvas.
+const LAYERS = ['bronze','silver','gold'];
+function setCanvasState(mode){
+  LAYERS.forEach(k=>{
+    const node=$('#node-'+k), st=$('#status-'+k); if(!node||!st) return;
+    node.classList.remove('active');
+    node.classList.toggle('dim', mode==='idle');
+    st.className='node-status muted';
+    st.textContent = mode==='ready' ? 'Ready to deploy' : 'Not started';
+  });
+}
+function paintCanvas(steps){
+  const byLayer={};
+  (steps||[]).forEach(d=>{ const n=(d.name||'').toLowerCase();
+    LAYERS.forEach(k=>{ if(n.includes(k)) byLayer[k]=d.status||'Pending'; }); });
+  LAYERS.forEach(k=>{
+    const node=$('#node-'+k), st=$('#status-'+k); if(!node||!st) return;
+    const s=byLayer[k]; node.classList.remove('dim'); node.classList.toggle('active', s==='InProgress');
+    st.textContent = s || 'Pending'; st.className = 'node-status s-'+(s||'Pending');
+  });
+}
 
 </script>
 </body>

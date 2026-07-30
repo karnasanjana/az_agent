@@ -836,8 +836,16 @@ async def _run_logical(
 async def plan(
     brd: Optional[str] = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
+    catalog_source_id: Optional[str] = Form(default=None),
 ) -> Dict[str, Any]:
     from agent.ingest import extract_brd_text
+
+    # ER "Pipelines" embed passes the diagram's share token here so grounding uses
+    # the reviewed catalog — no env var, no restart. Falls back to env when absent.
+    if catalog_source_id:
+        from agent.grounding import set_catalog_source_id
+
+        set_catalog_source_id(catalog_source_id.strip())
 
     text = (brd or "").strip()
     if file is not None:

@@ -31,6 +31,10 @@ from typing import Dict, List, Optional
 
 from config import MOCK_TENANT_DIR, mock_mode
 from models.logical import LogicalColumn, LogicalPlan, SourceFormat
+# Per-request catalog source id (an ER diagram share token) lives in models.logical
+# so the LogicalSource validator can read it too; re-exported here for callers
+# (app.py imports set_catalog_source_id from agent.grounding).
+from models.logical import _CATALOG_SOURCE_ID, set_catalog_source_id  # noqa: F401
 from models.spec import Column, DataFlow, DatasetKind, PipelineSpec, TransformKind
 
 # How much of the file to fetch — plenty for any header row.
@@ -308,10 +312,106 @@ def _dataverse_columns(env_url: str, entity_set: str) -> "List[LogicalColumn]":
         return []
 
 
-def _external_columns(src) -> "List[LogicalColumn]":
-    """Best-effort REAL schema for a postgres/bigquery/gcs/sharepoint source, read from the
-    live source at plan time (same readers the bootstrap mover uses). Returns []
-    on any failure — grounding must never block planning."""
+# Live-source label per format, for the grounding note when no catalog is used.
+_ORIGIN_LABEL = {
+    SourceFormat.postgres: "PostgreSQL", SourceFormat.bigquery: "BigQuery",
+    SourceFormat.gcs: "Google Cloud Storage", SourceFormat.sharepoint: "SharePoint",
+}
+
+
+def _catalog_columns_for(src) -> "tuple[List[LogicalColumn], object]":
+    """Columns from the ER catalog for this source, plus the catalog version.
+    ([], None) when no catalog is configured or the table isn't in it — the
+    caller then falls back to the live probe. Source id comes from the current
+    request (set_catalog_source_id, e.g. the ER 'Pipelines' embed) or the
+    CATALOG_SOURCE_ID env fallback — one connected source per run for now."""
+    source_id = _CATALOG_SOURCE_ID.get() or os.environ.get("CATALOG_SOURCE_ID")
+    table = getattr(src, "table_name", None)
+    if not source_id or not table:
+        return [], None
+    schema_name = getattr(src, "schema_name", None)
+    if schema_name:
+        table = f"{schema_name}.{table}"
+    try:
+        import sys
+
+        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from catalog import fetch, columns
+
+        schema = fetch(source_id)
+        if not schema:
+            return [], None
+        cols = [LogicalColumn(name=c["name"], type=c["type"]) for c in columns(schema, table)]
+        return cols, schema.get("schema_version")
+    except Exception:  # noqa: BLE001 — never block; fall back to live probe
+        return [], None
+
+
+def _seed_catalog_connection(plan) -> "List[str]":
+    """Fill each catalog-backed DB source's connection identity (server/database/
+    port for postgres) from the ER catalog. Only fills fields the BRD left blank —
+    an explicit BRD value always wins. No-op when no catalog is attached. Never
+    blocks planning: any failure just leaves the source as the BRD described it.
+    ponytail: one catalog fetch per plan (all sources share the diagram)."""
+    source_id = _CATALOG_SOURCE_ID.get() or os.environ.get("CATALOG_SOURCE_ID")
+    if not source_id:
+        return []
+    notes: List[str] = []
+    try:
+        import sys
+
+        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from catalog import connection, fetch
+
+        schema = fetch(source_id)
+        if not schema:
+            return []
+        for src in plan.sources:
+            fields = connection(schema, src.format.value)
+            if not fields:
+                continue
+            # The catalog is AUTHORITATIVE for the connection — the engineer set it
+            # in the diagram, not the BRD. OVERRIDE whatever the planner guessed:
+            # a refine round returns a fresh plan that re-invents placeholder servers
+            # ('your_postgres_server'), so filling only blanks let the hallucination
+            # survive and made compilation non-deterministic (crash / clarify / ok).
+            changed = [k for k, v in fields.items() if v and getattr(src, k, None) != v]
+            for k in changed:
+                setattr(src, k, fields[k])
+            # Catalog is the source of truth, so strip the planner's OWN connection
+            # guesses for this source ("Assuming PostgreSQL server is ...", "PostgreSQL
+            # database name is 'sales'") — noise that usually contradicts the catalog.
+            # Keep my own note below (says 'catalog') and the 'local database' note.
+            def _planner_guess(a: str, ent: str = src.entity) -> bool:
+                al = a.lower()
+                if "catalog" in al:
+                    return False
+                mentions = "postgres" in al or ent in a
+                attr = any(w in al for w in ("server", "hostname", "host name",
+                           "database name", "table name", "schema name"))
+                return mentions and (attr or "assum" in al)
+            plan.assumptions[:] = [a for a in plan.assumptions if not _planner_guess(a)]
+            if changed:
+                note = (
+                    f"Connection for source '{src.entity}' taken from the ER catalog "
+                    f"({', '.join(f'{k}={fields[k]}' for k in changed)}) — the diagram "
+                    "is authoritative, not the BRD"
+                )
+                if note not in plan.assumptions:
+                    plan.assumptions.append(note)
+                notes.append(note)
+    except Exception:  # noqa: BLE001 — never block; leave sources as the BRD described
+        return notes
+    return notes
+
+
+def _live_external_columns(src) -> "List[LogicalColumn]":
+    """Live schema read straight from a postgres/bigquery/gcs/sharepoint source
+    (same readers the bootstrap mover uses). [] on any failure — best-effort."""
     try:
         import sys
 
@@ -350,6 +450,39 @@ def _external_columns(src) -> "List[LogicalColumn]":
         return []
 
 
+def _external_columns(src) -> "tuple[List[LogicalColumn], object]":
+    """REAL schema + an origin label for the plan note. Catalog first (the schema
+    the engineer reviewed in the ER app), live probe as fallback. ([], None) on
+    total miss — grounding must never block planning."""
+    cat, ver = _catalog_columns_for(src)
+    if cat:
+        return cat, f"catalog v{ver}" if ver is not None else "catalog"
+    cols = _live_external_columns(src)
+    if cols:
+        return cols, _ORIGIN_LABEL.get(src.format, "the live source")
+    return [], None
+
+
+def _schema_drift(catalog_cols, live_cols) -> str:
+    """Human summary of how the LIVE source differs from the catalog schema, or
+    '' if they match (or the live source couldn't be read — no read is not drift)."""
+    if not live_cols:
+        return ""
+    cat = {c.name: c.type for c in catalog_cols}
+    live = {c.name: c.type for c in live_cols}
+    added = sorted(set(live) - set(cat))
+    removed = sorted(set(cat) - set(live))
+    changed = sorted(f"{n} {cat[n]}→{live[n]}" for n in set(cat) & set(live) if cat[n] != live[n])
+    parts = []
+    if added:
+        parts.append("added " + ", ".join(added))
+    if removed:
+        parts.append("removed " + ", ".join(removed))
+    if changed:
+        parts.append("type changed " + ", ".join(changed))
+    return "; ".join(parts)
+
+
 def _note_fabricated(src, real_names, plan) -> List[str]:
     """A column the model listed that the real schema lacks is about to be
     silently dropped when we overwrite src.columns — disclose each one so a
@@ -378,6 +511,10 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     unreadable files leave the plan unchanged.
     """
     notes: List[str] = []
+    # Fill a catalog-backed DB source's connection identity (server/database/port)
+    # from the ER diagram BEFORE column grounding, so the BRD names only the
+    # engine + tables and everything connection-y comes from the reviewed diagram.
+    notes += _seed_catalog_connection(plan)
     for src in plan.sources:
         if src.format != SourceFormat.csv:
             continue
@@ -437,14 +574,10 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     # completeness/typecheck run against real columns BEFORE deploy.
     _EXTERNAL = {SourceFormat.postgres, SourceFormat.bigquery, SourceFormat.gcs,
                  SourceFormat.sharepoint}
-    _ORIGIN_LABEL = {
-        SourceFormat.postgres: "PostgreSQL", SourceFormat.bigquery: "BigQuery",
-        SourceFormat.gcs: "Google Cloud Storage", SourceFormat.sharepoint: "SharePoint",
-    }
     for src in plan.sources:
         if src.format not in _EXTERNAL:
             continue
-        cols = _external_columns(src)
+        cols, origin = _external_columns(src)
         if not cols:
             # A live catalog read (DB/warehouse/SharePoint) that returns nothing
             # means the named table/list is not there — drop the model's GUESSED
@@ -457,12 +590,28 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
         notes += _note_fabricated(src, [c.name for c in cols], plan)
         src.columns = cols
         note = (
-            f"Grounded source '{src.entity}' from {_ORIGIN_LABEL[src.format]} "
+            f"Grounded source '{src.entity}' from {origin} "
             f"({len(cols)} columns) — references now CHECKED against the real schema"
         )
         if note not in plan.assumptions:
             plan.assumptions.append(note)
         notes.append(note)
+
+        # Drift gate (opt-in, CATALOG_DRIFT_CHECK): when grounded from a catalog,
+        # also read the live source and flag any material difference. Advisory —
+        # a loud note in the plan review, NOT a hard block (build-don't-block).
+        # The plan stays grounded on the REVIEWED catalog schema.
+        if str(origin).startswith("catalog") and os.environ.get("CATALOG_DRIFT_CHECK"):
+            drift = _schema_drift(cols, _live_external_columns(src))
+            if drift:
+                dnote = (
+                    f"⚠️ SCHEMA DRIFT for '{src.entity}': the live source differs "
+                    f"from {origin} ({drift}). Grounded on the REVIEWED catalog "
+                    "schema — re-extract in the ER app if the source changed."
+                )
+                if dnote not in plan.assumptions:
+                    plan.assumptions.append(dnote)
+                notes.append(dnote)
 
     # LOUD when validation is blind: an entity used by transforms/outputs whose
     # schema could NOT be verified (non-CSV source, missing/unreadable file)

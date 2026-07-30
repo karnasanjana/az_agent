@@ -34,3 +34,5 @@ transformations and writing data-flow expressions.
 - To prevent DF-DSL-001 parsing and token recognition errors, ensure all column names and aliases in Data Flow expressions start with an alphanumeric character. Never use leading underscores.
 - Before writing to sinks that process column names case-insensitively (e.g., Delta), ensure all projected column names are unique when compared without regard to case. Remap or drop case-variant duplicate columns to prevent DFExecutorUserError from duplicate metadata.
 - When defining a source, always verify that the specified entity name (e.g., table, file, list) exactly corresponds to an existing resource in the external data system. Do not assume source entity names; confirm their precise spelling and availability.
+- A data flow plan must always explicitly define at least one source operation to ingest data.
+- A generated pipeline plan must always include at least one executable activity, such as a Copy activity or an ExecuteDataFlow activity, to perform the required data operations.

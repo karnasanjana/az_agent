@@ -13,12 +13,33 @@ operation is a key of the closed op vocabulary shared with models/spec.py.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Bound per-request when the plan is grounded against an ER-Diagram catalog
+# (the ER "Pipelines" embed passes the diagram's share token). When set, a DB
+# source may omit its connection identity (server/database/port) — grounding
+# fills those from the catalog — so the BRD need only name the engine + tables.
+# Lives here (not in agent.grounding) so this validator can read it without a
+# circular import; grounding re-exports the setter for callers.
+_CATALOG_SOURCE_ID: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "catalog_source_id", default=None
+)
+
+
+def set_catalog_source_id(source_id: Optional[str]) -> None:
+    """Bind the ER catalog source_id (share token) for the current request."""
+    _CATALOG_SOURCE_ID.set(source_id or None)
+
+
+def catalog_attached() -> bool:
+    """True when a catalog is bound for this request (contextvar or env)."""
+    return bool(_CATALOG_SOURCE_ID.get() or os.environ.get("CATALOG_SOURCE_ID"))
 
 from models.spec import (
     _OP_ARITH,
@@ -124,10 +145,11 @@ class LogicalSource(BaseModel):
                 f"source '{self.entity}': dataverse needs dataverse_url and entity_set"
             )
         if self.format == SourceFormat.postgres and not (
-            self.server and self.database and self.table_name
+            self.table_name and (catalog_attached() or (self.server and self.database))
         ):
             raise ValueError(
-                f"source '{self.entity}': postgres needs server, database, table_name"
+                f"source '{self.entity}': postgres needs server, database, table_name "
+                "(server/database may come from an attached ER catalog)"
             )
         if self.format == SourceFormat.bigquery and not (
             self.bq_dataset and self.table_name
