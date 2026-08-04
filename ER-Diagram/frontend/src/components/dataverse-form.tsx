@@ -1,31 +1,11 @@
 'use client'
 
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { PublicClientApplication, type AuthenticationResult } from '@azure/msal-browser'
 import { listDataverseEntities } from '@/app/actions'
 import type { DatabaseInfo } from '@/types/schema'
 import DatabasePicker from '@/components/database-picker'
-
-const MSAL_CLIENT_ID = '2967332b-4aa0-4a9a-89ca-596d6d54a009'
-
-// Module-level singleton so MSAL is created exactly once across renders
-let msalInstance: PublicClientApplication | null = null
-let msalInitPromise: Promise<void> | null = null
-
-function getMsalInstance(): { instance: PublicClientApplication; ready: Promise<void> } {
-  if (!msalInstance) {
-    msalInstance = new PublicClientApplication({
-      auth: {
-        clientId: MSAL_CLIENT_ID,
-        authority: 'https://login.microsoftonline.com/common',
-        redirectUri: window.location.origin,
-      },
-      cache: { cacheLocation: 'sessionStorage' },
-    })
-    msalInitPromise = msalInstance.initialize()
-  }
-  return { instance: msalInstance, ready: msalInitPromise! }
-}
+import { getMsalInstance } from '@/lib/msal'
+import ClientIdField from '@/components/client-id-field'
 
 export default function DataverseForm() {
   const [environmentUrl, setEnvironmentUrl] = useState('')
@@ -155,6 +135,7 @@ export default function DataverseForm() {
 
   return (
     <div className="max-w-md mx-auto animate-fadeIn">
+      {!entities && (
       <div className="p-6 glass-panel rounded-2xl">
         <div className="space-y-4">
           {/* Environment URL Field */}
@@ -168,12 +149,14 @@ export default function DataverseForm() {
               value={environmentUrl}
               onChange={(e) => setEnvironmentUrl(e.target.value)}
               placeholder="org.crm.dynamics.com"
-              className="w-full px-3 py-2 border border-slate-700 bg-slate-900/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 focus:border-purple-500 transition-all text-slate-200"
+              className="w-full px-3 py-2 border border-slate-700 bg-slate-900/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 transition-all text-slate-200"
             />
             <p className="mt-1 text-xs text-slate-500">
               e.g. yourorg.crm.dynamics.com (without https://)
             </p>
           </div>
+
+          <ClientIdField />
 
           {/* Auth Status */}
           {!signedInUser ? (
@@ -191,7 +174,7 @@ export default function DataverseForm() {
               >
                 {connecting ? (
                   <>
-                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-purple-400" />
+                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-400" />
                     Connecting...
                   </>
                 ) : (
@@ -225,8 +208,9 @@ export default function DataverseForm() {
           </div>
         )}
       </div>
+      )}
 
-      {/* Entity Picker (appears after successful connection) */}
+      {/* Entity Picker (replaces the connect box after a successful connection) */}
       {entities && (
         <div className="mt-6 p-6 glass-panel rounded-2xl animate-fadeIn">
           <div className="mb-4 p-3 bg-emerald-900/40 border border-emerald-500/30 text-emerald-200 rounded-lg backdrop-blur-sm text-sm">
@@ -248,7 +232,7 @@ export default function DataverseForm() {
               <button
                 onClick={handleProceed}
                 disabled={selectedEntities.length === 0}
-                className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-purple-500 to-purple-600 text-white text-center rounded-lg shadow-[0_0_15px_rgba(168,85,247,0.5)] border border-white/10 hover:from-purple-400 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
+                className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-indigo-500 to-indigo-600 text-white text-center rounded-lg shadow-[0_0_15px_rgba(68,147,248,0.5)] border border-white/10 hover:from-indigo-400 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
               >
                 Next: Extract Schema →
               </button>

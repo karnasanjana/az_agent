@@ -209,6 +209,40 @@ def prune_unbuildable(plan: LogicalPlan, problems: List[str]) -> List[str]:
     return notes
 
 
+# Tokens an LLM reaches for when the BRD named NO real data source and it
+# fabricated one anyway (the Pydantic validator forces location fields to be
+# present, so "no location" never reaches here — only placeholder values do).
+# Conservative on purpose: real sources don't call themselves 'dummy'/'lorem'.
+_PLACEHOLDER_RE = re.compile(
+    r"(?:^|[\s_./-])(dummy|placeholder|changeme|lorem|ipsum|tbd|xxx+|foobar|"
+    r"your[-_](?:table|source|db|database|bucket|file|url))(?:$|[\s_./-])",
+    re.I,
+)
+
+# Whole-entity names a model coins when the BRD named nothing — matched EXACTLY
+# (not as substrings), so a real 'data'/'orders'/'input_records' source is never
+# touched, only the bare generic fallbacks no real BRD uses as a source name.
+_FABRICATED_ENTITY_NAMES = {
+    "input_data", "dummy_data", "sample_data", "your_data", "my_data",
+    "test_data", "data_source", "datasource", "source_data", "unknown_source",
+    "generic_data", "placeholder_data", "example_data",
+}
+
+
+def _looks_invented(s: LogicalSource) -> bool:
+    """True when a source's identifying fields are obvious placeholders — the
+    model built a plan from a BRD that pointed at no real data (B1: gibberish
+    in must not yield a confident green plan out)."""
+    if (s.entity or "").strip().lower() in _FABRICATED_ENTITY_NAMES:
+        return True
+    idents = [
+        s.entity, s.container, s.folder, s.file_name, s.http_url, s.server,
+        s.database, s.table_name, s.dataverse_url, s.entity_set,
+        s.sharepoint_site, s.sharepoint_list, s.bq_dataset, s.gcp_project,
+    ]
+    return bool(_PLACEHOLDER_RE.search(" ".join(x for x in idents if x)))
+
+
 def check(plan: LogicalPlan) -> List[str]:
     """Problems that make the plan inconsistent; empty list = pass."""
     problems: List[str] = []
@@ -217,6 +251,16 @@ def check(plan: LogicalPlan) -> List[str]:
     # 1. at least one source.
     if not plan.sources:
         problems.append("no sources: the plan must ingest at least one entity")
+
+    # 1b. a source the model fabricated from a BRD that named no real data —
+    #     ask for the real source instead of shipping a confident fiction.
+    for s in plan.sources:
+        if _looks_invented(s):
+            problems.append(
+                f"source '{s.entity}' looks invented (placeholder identifiers) — "
+                "the BRD names no real data source; provide the actual source "
+                "(URL / table / container + file) and its columns"
+            )
 
     # 2. no duplicate entities.
     seen: Set[str] = set()

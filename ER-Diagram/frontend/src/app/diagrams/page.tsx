@@ -213,7 +213,7 @@ export default function SavedDiagramsPage() {
         {/* Page header with search */}
         <div className="flex items-start justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400 tracking-tight drop-shadow-sm">My Diagrams</h1>
+            <h1 className="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-indigo-400 tracking-tight drop-shadow-sm">My Diagrams</h1>
             <p className="text-sm text-slate-400 mt-1.5 font-medium">
               {diagrams.length} saved diagram{diagrams.length !== 1 ? 's' : ''}
             </p>

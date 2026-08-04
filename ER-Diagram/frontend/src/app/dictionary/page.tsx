@@ -16,7 +16,7 @@ const SOURCE_LABELS: Record<SourceType, string> = {
 const SOURCE_COLORS: Record<SourceType, string> = {
   bigquery: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
   sqlserver: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  dataverse: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  dataverse: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30',
 }
 
 export default function DataDictionaryPage() {
@@ -28,8 +28,14 @@ export default function DataDictionaryPage() {
   const [sortBy, setSortBy] = useState<'name' | 'columns' | 'dataset'>('dataset')
 
   useEffect(() => {
+    // Show a schema only when a diagram is actually open/saved (current_diagram_id).
+    // extracted_schema persists across reloads, so without this gate a stale
+    // extraction from a previous session would show even though nothing is
+    // connected. We don't delete extracted_schema here — the diagram page may
+    // still hold unsaved work; we just don't display stale data in the dictionary.
+    const hasDiagram = sessionStorage.getItem('current_diagram_id')
     const stored = sessionStorage.getItem('extracted_schema')
-    if (stored) {
+    if (hasDiagram && stored) {
       try {
         setSchema(JSON.parse(stored))
       } catch {

@@ -15,6 +15,7 @@ import {
   fetchDataverseSchema,
 } from '@/app/actions'
 import { getCacheKey, getCachedSchema, setCachedSchema } from '@/lib/schema-cache'
+import { getMsalClientId } from '@/lib/msal'
 import type { DatabaseSchema, DatabaseInfo } from '@/types/schema'
 
 interface AddDataSourceModalProps {
@@ -87,7 +88,7 @@ export function AddDataSourceModal({
     if (!msalRef.current) {
       msalRef.current = new PublicClientApplication({
         auth: {
-          clientId: '2967332b-4aa0-4a9a-89ca-596d6d54a009',
+          clientId: getMsalClientId(),
           authority: 'https://login.microsoftonline.com/common',
           redirectUri: window.location.origin,
         },

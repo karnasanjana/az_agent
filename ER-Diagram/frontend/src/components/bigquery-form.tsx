@@ -52,6 +52,7 @@ export default function BigQueryForm() {
 
   return (
     <div className="max-w-md mx-auto animate-fadeIn">
+      {!datasets && (
       <div className="p-6 glass-panel rounded-2xl">
         <div className="space-y-4">
           {/* Project ID Field */}
@@ -119,8 +120,9 @@ export default function BigQueryForm() {
           </div>
         )}
       </div>
+      )}
 
-      {/* Dataset Picker (appears after successful connection) */}
+      {/* Dataset Picker (replaces the connect box after a successful connection) */}
       {datasets && (
         <div className="mt-6 p-6 glass-panel rounded-2xl animate-fadeIn">
           <div className="mb-4 p-3 bg-emerald-900/40 border border-emerald-500/30 text-emerald-200 rounded-lg backdrop-blur-sm text-sm">

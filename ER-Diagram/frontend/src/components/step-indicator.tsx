@@ -1,6 +1,6 @@
 'use client'
 
-const steps = ['Connect', 'Extract', 'View Diagram'] as const
+const steps = ['Connect', 'Extract', 'View Diagram & add pipeline'] as const
 
 interface StepIndicatorProps {
   currentStep: 1 | 2 | 3
@@ -33,7 +33,7 @@ export function StepIndicator({ currentStep }: StepIndicatorProps) {
                   isCompleted
                     ? 'bg-indigo-900/50 text-indigo-400 border py-1.5 border-indigo-500/30'
                     : isActive
-                      ? 'bg-gradient-to-tr from-indigo-500 to-purple-500 text-white shadow-[0_0_15px_rgba(99,102,241,0.5)]'
+                      ? 'bg-gradient-to-tr from-indigo-500 to-indigo-500 text-white shadow-[0_0_15px_rgba(99,102,241,0.5)]'
                       : 'bg-slate-800 text-slate-500 border border-slate-700'
                 }`}
               >

@@ -596,6 +596,34 @@ async def _run_logical(
 
     _ground(plan)
 
+    # ER-flow contract: when a diagram (catalog) is attached, the agent must
+    # build ONLY from tables in that diagram — verify with the data, never guess.
+    # A source matching no catalog table is a hallucination; ask, don't build.
+    # No-op without a catalog, so the pure-BRD flow / offline tests are untouched.
+    if prev_plan is None:
+        from agent.grounding import catalog_membership_problems
+
+        off_diagram = catalog_membership_problems(plan)
+        if off_diagram:
+            questions = [
+                f"'{p.split(chr(39))[1]}' isn't in your connected ER diagram — "
+                "which diagram table did you mean, or should I connect it first?"
+                for p in off_diagram
+            ][:2]
+            prev = _RUNS.get(run_id, {})
+            _RUNS[run_id] = {
+                **prev, "status": "NEEDS_CLARIFICATION", "clarifications": questions,
+                "messages": messages, "logical_plan": plan, "previewed": False,
+            }
+            if requirements_text:
+                _RUNS[run_id]["brd_text"] = requirements_text
+            _RUNS[run_id].pop("run_dir", None)
+            return {
+                "run_id": run_id, "status": "NEEDS_CLARIFICATION",
+                "clarifications": questions, "problems": off_diagram,
+                "mock": mock_mode(), "timings": phases.report(),
+            }
+
     def _with_requirements(instruction: str) -> str:
         if not requirements_text:
             return instruction

@@ -278,10 +278,21 @@ _OP_FN = {
     "second": "second",
     "weekofyear": "weekOfYear",
     "week": "weekOfYear",
+    # Audit/metadata: a load-time timestamp column (no column, no args) — unlocks
+    # the near-universal "add the standard load-audit columns" ask instead of the
+    # model declaring it unsupported (there was no such op before).
+    "currenttimestamp": "currentTimestamp",
+    "currentutc": "currentUTC",
+    "now": "currentTimestamp",
 }
 _OP_IDENTITY = {"identity", "copy", "passthrough", "asis", "none"}
 # Window functions that take NO arguments — rendered as fn(), never fn(column).
 _OP_NOARG = {"rownumber", "rank", "denserank"}
+# Zero-arg audit timestamp ops: rendered fn(), no column (currentTimestamp()).
+_OP_NOW = {"currenttimestamp", "currentutc", "now"}
+# Constant-value column ops: emit the given value (column field OR args[0]) as a
+# literal — audit tags like source_name = 'covid', never a column reference.
+_OP_LITERAL = {"literal", "lit", "constant", "const"}
 # Proper Case: ADF's data-flow DSL has no initCap, so CODE renders the composite
 # concat(upper(left(col,1)), lower(substring(col,2))) — first letter upper, rest
 # lower. (Chain a `trim` op first when the column may carry whitespace.)
@@ -365,6 +376,11 @@ def _render_op(op: str, column: "str | None", args: List[str]) -> "str | None":
     col = dsl_name(column) if column else column
     if key in _OP_IDENTITY:
         return col or None
+    if key in _OP_NOW:  # audit timestamp column: currentTimestamp(), no operands
+        return f"{_OP_FN[key]}()"
+    if key in _OP_LITERAL:  # constant tag column: source_name = 'covid'
+        raw = args[0] if args else column
+        return _render_literal(raw) if raw not in (None, "") else None
     if key in _OP_NOARG:
         return f"{_OP_FN[key]}()"
     if key in _OP_PROPER:

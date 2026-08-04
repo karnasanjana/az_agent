@@ -34,8 +34,7 @@ export default function UnifiedNav() {
           return <Link key={item.href} href={item.href} className={active ? 'active' : ''}><NavIcon name={item.icon}/><span>{item.label}</span></Link>
         })}
       </nav>
-      <div className="unified-status"><i/> Systems ready</div>
-      <UserMenu />
+      <div style={{ marginLeft: 'auto' }}><UserMenu /></div>
     </header>
   )
 }

@@ -66,6 +66,7 @@ _FN_RESULT = {
     "mean": "double", "length": "integer", "rownumber": "long", "rank": "long",
     "denserank": "long", "round": "double", "abs": "double", "floor": "long",
     "ceil": "long",
+    "currenttimestamp": "timestamp", "currentutc": "timestamp", "now": "timestamp",
 }
 
 
@@ -272,11 +273,26 @@ def _check_join(
             )
 
 
+def _agg_arg(expr: str) -> str:
+    """Bare column inside an aggregate expression: ``sum(Confirmed)`` -> 'Confirmed'.
+    '' when the arg is a nested call/literal (``sum(toInteger(x))``) — unresolvable
+    statically, so the caller skips it rather than flag a false positive."""
+    e = expr or ""
+    if "(" not in e:
+        return ""
+    inner = e.split("(", 1)[1].rsplit(")", 1)[0].strip()
+    return inner if inner.isidentifier() else ""
+
+
 def _check_aggregate(flow: str, t: Transform, cols: Dict[str, str], problems: List[str]) -> None:
     for c in t.columns:
         key = _norm_op(c.op or _norm_op((c.expression or "").split("(", 1)[0]))
         if key in _NUMERIC_AGG_OPS:
-            src = c.column or ""
+            # column comes from the structured field OR the expression arg
+            # (legacy `expression="sum(Confirmed)"` carries no c.column).
+            src = c.column or _agg_arg(c.expression)
+            if not src:
+                continue  # can't resolve a bare column to type-check — don't block
             ty = cols.get(src)
             if ty is None:
                 problems.append(

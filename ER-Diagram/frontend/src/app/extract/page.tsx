@@ -13,11 +13,15 @@ import {
   fetchDataverseSchema,
   startPostgresExtraction,
   fetchPostgresSchema,
+  startSharePointExtraction,
+  fetchSharePointSchema,
+  startGcsExtraction,
+  fetchGcsSchema,
 } from '@/app/actions'
 import type { DatabaseSchema, StartExtractionResponse } from '@/types/schema'
 
 type PageState = 'initial' | 'warning' | 'extracting' | 'complete' | 'error'
-type DbType = 'sqlserver' | 'postgres' | 'bigquery' | 'dataverse'
+type DbType = 'sqlserver' | 'postgres' | 'bigquery' | 'dataverse' | 'sharepoint' | 'gcs'
 
 interface SqlServerCredentials {
   host: string
@@ -37,6 +41,11 @@ export default function ExtractPage() {
   const [bqAccessToken, setBqAccessToken] = useState<string | null>(null)
   const [dvEnvironmentUrl, setDvEnvironmentUrl] = useState<string | null>(null)
   const [dvAccessToken, setDvAccessToken] = useState<string | null>(null)
+  const [spSiteUrl, setSpSiteUrl] = useState<string | null>(null)
+  const [spAccessToken, setSpAccessToken] = useState<string | null>(null)
+  const [gcsBucket, setGcsBucket] = useState<string | null>(null)
+  const [gcsPrefix, setGcsPrefix] = useState<string>('')
+  const [gcsAccessToken, setGcsAccessToken] = useState<string | null>(null)
   const [streamId, setStreamId] = useState<string | null>(null)
   const [tableCount, setTableCount] = useState<number>(0)
   const [schema, setSchema] = useState<DatabaseSchema | null>(null)
@@ -69,6 +78,13 @@ export default function ExtractPage() {
       const token = sessionStorage.getItem('dv_access_token')
       setDvEnvironmentUrl(envUrl)
       setDvAccessToken(token)
+    } else if (storedDbType === 'sharepoint') {
+      setSpSiteUrl(sessionStorage.getItem('sp_site_url'))
+      setSpAccessToken(sessionStorage.getItem('sp_access_token'))
+    } else if (storedDbType === 'gcs') {
+      setGcsBucket(sessionStorage.getItem('gcs_bucket'))
+      setGcsPrefix(sessionStorage.getItem('gcs_prefix') || '')
+      setGcsAccessToken(sessionStorage.getItem('gcs_access_token'))
     } else {
       const stored = sessionStorage.getItem('db_credentials')
       if (stored) {
@@ -86,6 +102,10 @@ export default function ExtractPage() {
       await handleBigQueryExtraction()
     } else if (dbType === 'dataverse') {
       await handleDataverseExtraction()
+    } else if (dbType === 'sharepoint') {
+      await handleSharePointExtraction()
+    } else if (dbType === 'gcs') {
+      await handleGcsExtraction()
     } else if (dbType === 'postgres') {
       await handlePostgresExtraction()
     } else {
@@ -312,6 +332,106 @@ export default function ExtractPage() {
     }
   }
 
+  const handleSharePointExtraction = async () => {
+    if (!spSiteUrl || !spAccessToken) {
+      setError('SharePoint credentials not found. Please connect first.')
+      setState('error')
+      return
+    }
+    if (selectedDatabases.length === 0) {
+      setError('No lists selected. Please go back and select lists.')
+      setState('error')
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await startSharePointExtraction(spSiteUrl, spAccessToken, selectedDatabases)
+      if (response.table_count === 0) {
+        setError('No columns found in the selected lists.')
+        setState('error')
+        setLoading(false)
+        return
+      }
+      setStreamId(response.stream_id)
+      setTableCount(response.table_count)
+      setState('extracting')
+      const result = await fetchSharePointSchema(response.stream_id)
+      if (result.schemaJson) {
+        const schemaData: DatabaseSchema = typeof result.schemaJson === 'string'
+          ? JSON.parse(result.schemaJson)
+          : result.schemaJson as unknown as DatabaseSchema
+        const dsNames = Array.from(new Set(schemaData.tables.map((t) => t.schema_name)))
+        const sources: Record<string, 'sharepoint'> = {}
+        dsNames.forEach((ds) => { sources[ds] = 'sharepoint' })
+        schemaData.dataset_sources = sources as unknown as Record<string, 'bigquery' | 'sqlserver'>
+        sessionStorage.setItem('extracted_schema', JSON.stringify(schemaData))
+        sessionStorage.removeItem('current_diagram_id')
+        sessionStorage.removeItem('current_diagram_name')
+        setSchema(schemaData)
+        setState('complete')
+      } else {
+        setError(result.error || 'Failed to extract schema')
+        setState('error')
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start extraction')
+      setState('error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleGcsExtraction = async () => {
+    if (!gcsBucket || !gcsAccessToken) {
+      setError('Cloud Storage credentials not found. Please connect first.')
+      setState('error')
+      return
+    }
+    if (selectedDatabases.length === 0) {
+      setError('No files selected. Please go back and select files.')
+      setState('error')
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await startGcsExtraction(gcsBucket, gcsPrefix, gcsAccessToken, selectedDatabases)
+      if (response.table_count === 0) {
+        setError('No files to extract.')
+        setState('error')
+        setLoading(false)
+        return
+      }
+      setStreamId(response.stream_id)
+      setTableCount(response.table_count)
+      setState('extracting')
+      const result = await fetchGcsSchema(response.stream_id)
+      if (result.schemaJson) {
+        const schemaData: DatabaseSchema = typeof result.schemaJson === 'string'
+          ? JSON.parse(result.schemaJson)
+          : result.schemaJson as unknown as DatabaseSchema
+        const dsNames = Array.from(new Set(schemaData.tables.map((t) => t.schema_name)))
+        const sources: Record<string, 'gcs'> = {}
+        dsNames.forEach((ds) => { sources[ds] = 'gcs' })
+        schemaData.dataset_sources = sources as unknown as Record<string, 'bigquery' | 'sqlserver'>
+        sessionStorage.setItem('extracted_schema', JSON.stringify(schemaData))
+        sessionStorage.removeItem('current_diagram_id')
+        sessionStorage.removeItem('current_diagram_name')
+        setSchema(schemaData)
+        setState('complete')
+      } else {
+        setError(result.error || 'Failed to extract schema')
+        setState('error')
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start extraction')
+      setState('error')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleConfirm = async () => {
     if (!streamId) return
 
@@ -340,8 +460,8 @@ export default function ExtractPage() {
     setState('initial')
   }
 
-  const sourceLabel = dbType === 'bigquery' ? 'BigQuery' : dbType === 'dataverse' ? 'Dataverse' : dbType === 'postgres' ? 'PostgreSQL' : 'SQL Server'
-  const itemLabel = dbType === 'bigquery' ? 'datasets' : dbType === 'dataverse' ? 'entities' : 'databases'
+  const sourceLabel = dbType === 'bigquery' ? 'BigQuery' : dbType === 'dataverse' ? 'Dataverse' : dbType === 'sharepoint' ? 'SharePoint' : dbType === 'gcs' ? 'Cloud Storage' : dbType === 'postgres' ? 'PostgreSQL' : 'SQL Server'
+  const itemLabel = dbType === 'bigquery' ? 'datasets' : dbType === 'dataverse' ? 'entities' : dbType === 'sharepoint' ? 'lists' : dbType === 'gcs' ? 'files' : 'databases'
 
   return (
     <main className="min-h-screen bg-gradient-surface py-12">
@@ -357,7 +477,7 @@ export default function ExtractPage() {
         {/* Initial State - Start Button */}
         {state === 'initial' && (
           <div className="text-center">
-            {(credentials || (bqProjectId && bqAccessToken) || (dvEnvironmentUrl && dvAccessToken)) ? (
+            {(credentials || (bqProjectId && bqAccessToken) || (dvEnvironmentUrl && dvAccessToken) || (spSiteUrl && spAccessToken) || (gcsBucket && gcsAccessToken)) ? (
               <div className="glass-panel bg-slate-900/60 rounded-2xl border border-slate-700 p-6">
                 <div className="mb-4">
                   <span className="inline-block px-2.5 py-1 text-xs font-medium bg-indigo-500/20 text-indigo-300 rounded-full border border-indigo-500/30 mb-2">
@@ -376,6 +496,16 @@ export default function ExtractPage() {
                   {dbType === 'dataverse' && dvEnvironmentUrl && (
                     <p className="text-slate-300">
                       Environment: <span className="font-medium text-slate-100">{dvEnvironmentUrl}</span>
+                    </p>
+                  )}
+                  {dbType === 'sharepoint' && spSiteUrl && (
+                    <p className="text-slate-300">
+                      Site: <span className="font-medium text-slate-100">{spSiteUrl}</span>
+                    </p>
+                  )}
+                  {dbType === 'gcs' && gcsBucket && (
+                    <p className="text-slate-300">
+                      Bucket: <span className="font-medium text-slate-100">gs://{gcsBucket}{gcsPrefix ? '/' + gcsPrefix : ''}</span>
                     </p>
                   )}
                   {selectedDatabases.length > 0 && (

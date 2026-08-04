@@ -36,3 +36,4 @@ transformations and writing data-flow expressions.
 - When defining a source, always verify that the specified entity name (e.g., table, file, list) exactly corresponds to an existing resource in the external data system. Do not assume source entity names; confirm their precise spelling and availability.
 - A data flow plan must always explicitly define at least one source operation to ingest data.
 - A generated pipeline plan must always include at least one executable activity, such as a Copy activity or an ExecuteDataFlow activity, to perform the required data operations.
+- Before planning any data flow or copy activity that connects to an Azure SQL Database using Managed Identity, verify that the target SQL Server and database are configured to trust the Data Factory's Managed Identity for authentication. This is crucial to prevent ErrorCode=SqlFailedToConnect errors.

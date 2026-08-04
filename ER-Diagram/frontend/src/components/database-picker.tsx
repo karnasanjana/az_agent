@@ -6,7 +6,7 @@ import type { DatabaseInfo } from '@/types/schema'
 const PALETTE = [
   'bg-blue-900/40 border-blue-500/50 text-blue-200 ring-1 ring-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.15)]',
   'bg-emerald-900/40 border-emerald-500/50 text-emerald-200 ring-1 ring-emerald-500/30 shadow-[0_0_15px_rgba(16,185,129,0.15)]',
-  'bg-purple-900/40 border-purple-500/50 text-purple-200 ring-1 ring-purple-500/30 shadow-[0_0_15px_rgba(168,85,247,0.15)]',
+  'bg-indigo-900/40 border-indigo-500/50 text-indigo-200 ring-1 ring-indigo-500/30 shadow-[0_0_15px_rgba(68,147,248,0.15)]',
   'bg-orange-900/40 border-orange-500/50 text-orange-200 ring-1 ring-orange-500/30 shadow-[0_0_15px_rgba(249,115,22,0.15)]',
   'bg-pink-900/40 border-pink-500/50 text-pink-200 ring-1 ring-pink-500/30 shadow-[0_0_15px_rgba(236,72,153,0.15)]',
   'bg-teal-900/40 border-teal-500/50 text-teal-200 ring-1 ring-teal-500/30 shadow-[0_0_15px_rgba(20,184,166,0.15)]',

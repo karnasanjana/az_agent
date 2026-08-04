@@ -487,6 +487,83 @@ export async function fetchBigQuerySchema(streamId: string): Promise<{
 }
 
 
+// --- GCS (Cloud Storage bucket) Actions — reuse the Google sign-in token ---
+
+export async function listGcsFiles(
+  bucket: string,
+  prefix: string,
+  accessToken: string
+): Promise<{ files: DatabaseInfo[] | null; error: string | null }> {
+  try {
+    const response = await fetch(`${API_BASE}/api/gcs/files`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bucket, prefix, access_token: accessToken }),
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      return { files: null, error: data.detail || data.message || 'Failed to list files' }
+    }
+    const data = await response.json()
+    return { files: data.files ?? data, error: null }
+  } catch {
+    return { files: null, error: NETWORK_ERROR_MSG }
+  }
+}
+
+export async function startGcsExtraction(
+  bucket: string,
+  prefix: string,
+  accessToken: string,
+  files: string[]
+): Promise<StartExtractionResponse> {
+  try {
+    const response = await fetch(`${API_BASE}/api/gcs/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bucket, prefix, access_token: accessToken, files }),
+    })
+    return response.json()
+  } catch {
+    throw new Error(NETWORK_ERROR_MSG)
+  }
+}
+
+export async function fetchGcsSchema(streamId: string): Promise<{
+  schemaJson: string | null
+  error: string | null
+}> {
+  try {
+    const response = await fetch(`${API_BASE}/api/gcs/stream/${streamId}`, {
+      headers: { 'Accept': 'text/event-stream' },
+    })
+    if (!response.body) return { schemaJson: null, error: 'No response body from server' }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let fullText = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      fullText += decoder.decode(value, { stream: true })
+    }
+    fullText += decoder.decode()
+
+    const lines = fullText.split('\n')
+    let nextIsResult = false
+    for (const line of lines) {
+      if (line === 'event: result') { nextIsResult = true; continue }
+      if (nextIsResult && line.startsWith('data: ')) {
+        return { schemaJson: line.substring(6), error: null }
+      }
+      if (line === 'event: error') nextIsResult = false
+    }
+    return { schemaJson: null, error: 'No schema data received from extraction' }
+  } catch (err) {
+    return { schemaJson: null, error: `Extraction failed: ${err instanceof Error ? err.message : 'Unknown error'}` }
+  }
+}
+
 // --- Dataverse Actions ---
 
 export async function listDataverseEntities(
@@ -567,6 +644,81 @@ export async function fetchDataverseSchema(streamId: string): Promise<{
       if (line === 'event: error') {
         nextIsResult = false
       }
+    }
+    return { schemaJson: null, error: 'No schema data received from extraction' }
+  } catch (err) {
+    return { schemaJson: null, error: `Extraction failed: ${err instanceof Error ? err.message : 'Unknown error'}` }
+  }
+}
+
+// --- SharePoint Actions (mirror Dataverse; Microsoft Graph, delegated token) ---
+
+export async function listSharePointLists(
+  siteUrl: string,
+  accessToken: string
+): Promise<{ lists: DatabaseInfo[] | null; error: string | null }> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sharepoint/lists`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site_url: siteUrl, access_token: accessToken }),
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      return { lists: null, error: data.detail || data.message || 'Failed to list lists' }
+    }
+    const data = await response.json()
+    return { lists: data.lists ?? data, error: null }
+  } catch {
+    return { lists: null, error: NETWORK_ERROR_MSG }
+  }
+}
+
+export async function startSharePointExtraction(
+  siteUrl: string,
+  accessToken: string,
+  lists: string[]
+): Promise<StartExtractionResponse> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sharepoint/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site_url: siteUrl, access_token: accessToken, lists }),
+    })
+    return response.json()
+  } catch {
+    throw new Error(NETWORK_ERROR_MSG)
+  }
+}
+
+export async function fetchSharePointSchema(streamId: string): Promise<{
+  schemaJson: string | null
+  error: string | null
+}> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sharepoint/stream/${streamId}`, {
+      headers: { 'Accept': 'text/event-stream' },
+    })
+    if (!response.body) return { schemaJson: null, error: 'No response body from server' }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let fullText = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      fullText += decoder.decode(value, { stream: true })
+    }
+    fullText += decoder.decode()
+
+    const lines = fullText.split('\n')
+    let nextIsResult = false
+    for (const line of lines) {
+      if (line === 'event: result') { nextIsResult = true; continue }
+      if (nextIsResult && line.startsWith('data: ')) {
+        return { schemaJson: line.substring(6), error: null }
+      }
+      if (line === 'event: error') nextIsResult = false
     }
     return { schemaJson: null, error: 'No schema data received from extraction' }
   } catch (err) {

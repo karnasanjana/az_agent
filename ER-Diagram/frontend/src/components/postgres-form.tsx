@@ -30,7 +30,7 @@ export default function PostgresForm() {
     ['username','Username','postgres','text'], ['password','Password','Password','password'],
   ]
   return <div className="max-w-md mx-auto animate-fadeIn">
-    <form ref={form} action={action} onSubmit={capture} className="p-6 glass-panel rounded-2xl space-y-4">
+    {!state.success && <form ref={form} action={action} onSubmit={capture} className="p-6 glass-panel rounded-2xl space-y-4">
       {fields.map(([name,label,placeholder,type]) => <div key={name}>
         <label htmlFor={`pg-${name}`} className="block text-sm font-medium text-slate-300 mb-1">{label}</label>
         <input id={`pg-${name}`} name={name} type={type} required placeholder={placeholder} defaultValue={name === 'port' ? 5432 : ''}
@@ -38,11 +38,13 @@ export default function PostgresForm() {
       </div>)}
       <button disabled={pending} className="w-full py-2.5 px-4 bg-gradient-to-r from-blue-500 to-cyan-600 text-white rounded-lg font-medium disabled:opacity-50">{pending ? 'Testing Connection...' : 'Test PostgreSQL Connection'}</button>
       {state.success === false && <div className="p-3 bg-red-900/40 border border-red-500/30 text-red-200 rounded-lg text-sm">{state.message}</div>}
-    </form>
-    {state.success && databases && <div className="mt-6 p-6 glass-panel rounded-2xl">
+    </form>}
+    {state.success && <div className="p-6 glass-panel rounded-2xl">
       <div className="mb-4 p-3 bg-emerald-900/40 border border-emerald-500/30 text-emerald-200 rounded-lg text-sm">{state.message}</div>
-      <DatabasePicker databases={databases} selectedDatabases={selected} onSelect={setSelected} label="databases" />
-      <button disabled={!selected.length} onClick={() => { sessionStorage.setItem('selected_databases', JSON.stringify(selected)); window.location.href='/extract' }} className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-blue-500 to-cyan-600 text-white rounded-lg disabled:opacity-50">Next: Extract Schema →</button>
+      {databases ? <>
+        <DatabasePicker databases={databases} selectedDatabases={selected} onSelect={setSelected} label="databases" />
+        <button disabled={!selected.length} onClick={() => { sessionStorage.setItem('selected_databases', JSON.stringify(selected)); window.location.href='/extract' }} className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-blue-500 to-cyan-600 text-white rounded-lg disabled:opacity-50">Next: Extract Schema →</button>
+      </> : <div className="text-center py-6"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-400 mx-auto mb-3" /><p className="text-sm text-slate-400">Loading databases...</p></div>}
     </div>}
   </div>
 }

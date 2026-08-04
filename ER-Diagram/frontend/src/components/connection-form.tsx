@@ -82,6 +82,7 @@ export default function ConnectionForm() {
 
   return (
     <div className="max-w-md mx-auto animate-fadeIn">
+      {state.success !== true && (
       <form ref={formRef} action={formAction} onSubmit={handleSubmit} className="p-6 glass-panel rounded-2xl">
         <div className="space-y-4">
           {/* Host Field */}
@@ -167,7 +168,7 @@ export default function ConnectionForm() {
             type="submit"
             disabled={pending}
             aria-busy={pending}
-            className="w-full py-2.5 px-4 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg font-medium shadow-[0_0_15px_rgba(99,102,241,0.5)] border border-white/10 hover:from-indigo-400 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            className="w-full py-2.5 px-4 bg-gradient-to-r from-indigo-500 to-indigo-600 text-white rounded-lg font-medium shadow-[0_0_15px_rgba(99,102,241,0.5)] border border-white/10 hover:from-indigo-400 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
             {pending ? 'Testing Connection...' : 'Test Connection'}
           </button>
@@ -182,8 +183,9 @@ export default function ConnectionForm() {
           )}
         </div>
       </form>
+      )}
 
-      {/* Database Picker (appears after successful connection) */}
+      {/* Database Picker (replaces the form after a successful connection) */}
       {state.success === true && (
         <div className="mt-6 p-6 glass-panel rounded-2xl animate-fadeIn">
           <div className="mb-4 p-3 bg-emerald-900/40 border border-emerald-500/30 text-emerald-200 rounded-lg backdrop-blur-sm text-sm">
@@ -214,7 +216,7 @@ export default function ConnectionForm() {
               <button
                 onClick={handleProceed}
                 disabled={selectedDatabases.length === 0}
-                className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-indigo-500 to-purple-600 text-white text-center rounded-lg shadow-[0_0_15px_rgba(99,102,241,0.5)] border border-white/10 hover:from-indigo-400 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
+                className="mt-6 w-full py-2.5 px-4 bg-gradient-to-r from-indigo-500 to-indigo-600 text-white text-center rounded-lg shadow-[0_0_15px_rgba(99,102,241,0.5)] border border-white/10 hover:from-indigo-400 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all font-medium"
               >
                 Next: Extract Schema →
               </button>

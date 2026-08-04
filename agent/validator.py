@@ -257,6 +257,7 @@ def _run_mock(run_dir: str, on_update: UpdateFn) -> Dict[str, Any]:
         time.sleep(0.4)
         step.update(status="Succeeded")
         emit("InProgress")
+    emit("Succeeded")  # final terminal emit so the streamed run object matches
     return {"run_id": run_id, "status": "Succeeded", "steps": steps,
             "layers": _steps_to_layers(steps), "mock": True}
 

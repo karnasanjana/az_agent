@@ -5,6 +5,7 @@ Diagrams are stored per-user under diagrams/{user_id}/{diagram_id}.json in a GCS
 Shared diagrams are indexed at diagrams/_shared/{share_token}.json for public access.
 """
 import json
+import os
 import re
 import secrets
 import uuid
@@ -12,7 +13,10 @@ from datetime import datetime, timezone
 
 from google.cloud import storage
 
-BUCKET_NAME = "erdiagram"
+# Bucket/project are env-configurable so a different deployment (or a local test)
+# isn't pinned to one tenant's GCS. Defaults keep the original behaviour.
+BUCKET_NAME = os.environ.get("GCS_BUCKET", "erdiagram")
+GCS_PROJECT = os.environ.get("GCS_PROJECT", "gemini-for-zion")
 GCS_PREFIX = "diagrams"
 SHARED_PREFIX = "diagrams/_shared"
 MAX_DIAGRAMS_PER_USER = 50
@@ -20,7 +24,7 @@ MAX_DIAGRAMS_PER_USER = 50
 
 def _get_bucket():
     """Get the GCS bucket."""
-    client = storage.Client(project="gemini-for-zion")
+    client = storage.Client(project=GCS_PROJECT)
     return client.bucket(BUCKET_NAME)
 
 

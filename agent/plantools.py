@@ -171,6 +171,12 @@ def build_plan_agent():
         model_settings=default_model_settings(),
     )
 
+    @agent.system_prompt
+    def _connected_catalog() -> str:
+        from agent.grounding import catalog_preamble
+
+        return catalog_preamble()
+
     @agent.tool
     def add_source(
         ctx: RunContext[PlanSession],
@@ -401,11 +407,27 @@ async def extract_plan(
     return await _run(brd_text, message_history, None)
 
 
+_EDIT_PREAMBLE = (
+    "You are EDITING an existing plan that is ALREADY BUILT and loaded into this "
+    "session. Call plan_status FIRST to see exactly what is there. Then apply "
+    "ONLY the change requested below and leave everything else EXACTLY as it is — "
+    "do NOT re-add, re-specify, or re-derive sources, transforms, or outputs that "
+    "are already present and unaffected by the request (re-adding them silently "
+    "drops details and changes unrelated parts). Use the narrowest tool for the "
+    "change (e.g. set_containers to rename a container; add_transform for the ONE "
+    "entity whose cleaning changes). When done, call finalize_plan.\n\n"
+    "Requested change:\n"
+)
+
+
 async def refine_plan(
     instruction: str,
     message_history: "List[Any]",
     base_plan: "Optional[LogicalPlan]" = None,
 ) -> "Tuple[LogicalPlan, List[Any]]":
     """Continue the conversation: the session is rebuilt from ``base_plan`` (the
-    last accepted plan) and the model edits it with tool calls."""
-    return await _run(instruction, message_history, base_plan)
+    last accepted plan) and the model edits it with tool calls. The instruction
+    is framed as a SURGICAL edit so the model patches the loaded plan instead of
+    rebuilding it from the instruction alone (which dropped edits and drifted)."""
+    prompt = _EDIT_PREAMBLE + instruction if base_plan is not None else instruction
+    return await _run(prompt, message_history, base_plan)

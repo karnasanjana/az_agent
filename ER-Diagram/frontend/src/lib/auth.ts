@@ -38,6 +38,10 @@ async function refreshAccessToken(token: any) {
 }
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  // Production builds otherwise reject a non-Vercel host with UntrustedHost,
+  // 500-ing /api/auth/session (dev trusts localhost automatically). Safe here:
+  // the app runs behind a known host, not arbitrary public traffic.
+  trustHost: true,
   providers: [
     Google({
       clientId: process.env.AUTH_GOOGLE_ID,
@@ -45,7 +49,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       authorization: {
         url: "https://accounts.google.com/o/oauth2/auth",
         params: {
-          scope: "openid email profile https://www.googleapis.com/auth/bigquery",
+          scope: "openid email profile https://www.googleapis.com/auth/bigquery https://www.googleapis.com/auth/devstorage.read_only",
           access_type: "offline",
           prompt: "consent",
           response_type: "code",

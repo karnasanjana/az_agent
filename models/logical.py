@@ -46,6 +46,7 @@ from models.spec import (
     _OP_BLANK_DEFAULT,
     _OP_FN,
     _OP_IDENTITY,
+    _OP_LITERAL,
     _OP_PROPER,
     _OP_QUARTER,
     _OP_REMOVE_SPECIAL,
@@ -309,6 +310,7 @@ class CleaningOp(BaseModel):
             and key not in _OP_QUARTER
             and key not in _OP_REMOVE_SPECIAL
             and key not in _OP_BLANK_DEFAULT
+            and key not in _OP_LITERAL
         ):
             raise ValueError(
                 f"unknown op '{v}'. Allowed: "

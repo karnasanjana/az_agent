@@ -123,6 +123,12 @@ Rules:
   `validate_first: true` on that source. The pipeline then waits for the file,
   and a missing/empty file fails the gate and blocks that entity's copy and
   everything downstream. Fully supported — do NOT mark it unsupported.
+- AUDIT/METADATA COLUMNS: "add the standard load-audit columns" / "load
+  timestamp" / "ingestion date" = a silver cleaning derived column with op
+  `currenttimestamp` (no column, no args) — renders currentTimestamp(). A
+  constant tag column (e.g. source_name = 'covid') = op `literal` with the value
+  in `column` or `args[0]`. Both are fully supported — do NOT mark load-audit /
+  metadata columns unsupported.
 - FILTERS: supported filter ops are not_null/null/eq/ne/gt/ge/lt/le plus LIKE,
   regex/rlike, IN, and BETWEEN. For IN use a comma-separated value string; for
   BETWEEN use "low,high". Multiple filters are AND-ed; OR logic belongs in a
@@ -259,6 +265,10 @@ def capability_card() -> str:
         "pipeline organisation.\n"
         "CONTAINERS: BRD-named layer containers are supported — set `containers` "
         "{bronze, silver, gold} ('copy into the raw container' -> bronze='raw').\n"
+        "AUDIT/METADATA COLUMNS (supported — never mark unsupported): a load/"
+        "ingestion timestamp = derived op `currenttimestamp` (no column/args); a "
+        "constant tag (source_name = 'covid') = derived op `literal` (value in "
+        "column or args[0]).\n"
         "COMPILER-OWNED IMPLEMENTATION DETAILS (record as assumptions, not "
         "unsupported): resource naming, dataset/pipeline parameterization, linked "
         "services."
@@ -268,13 +278,24 @@ def capability_card() -> str:
 def build_extractor_agent():
     from pydantic_ai import Agent
 
-    return Agent(
+    agent = Agent(
         get_model(),
         output_type=structured_output(LogicalPlan),
         system_prompt=_system_prompt(),
         retries=4,
         model_settings=default_model_settings(),
     )
+
+    @agent.system_prompt
+    def _connected_catalog() -> str:
+        # When an ER diagram is attached, tell the model the engine + tables at
+        # PARSE time so it emits DB sources with exact table names instead of
+        # guessing (and inventing CSV files). '' without a diagram.
+        from agent.grounding import catalog_preamble
+
+        return catalog_preamble()
+
+    return agent
 
 
 async def extract_plan(

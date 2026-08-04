@@ -409,6 +409,217 @@ def _seed_catalog_connection(plan) -> "List[str]":
     return notes
 
 
+def _seed_catalog_joins(plan) -> "List[str]":
+    """Resolve gold join keys from the ER catalog's foreign keys. When a join's
+    two entities are catalog tables with an FK between them, the FK columns ARE
+    the join keys — override the planner's name-guessed keys (same 'diagram is
+    truth' rule as _seed_catalog_connection). No FK between the pair (or no
+    catalog, or a non-DB source) leaves the planner's keys untouched, so
+    name-inference stays the fallback. Never blocks planning.
+    ponytail: table-name match (single-schema DBs); qualify by schema_name if a
+    cross-schema table-name collision ever bites."""
+    source_id = _CATALOG_SOURCE_ID.get() or os.environ.get("CATALOG_SOURCE_ID")
+    if not source_id:
+        return []
+    notes: List[str] = []
+    try:
+        import sys
+
+        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from catalog import fetch, relationships
+
+        schema = fetch(source_id)
+        if not schema:
+            return []
+        fks = relationships(schema)
+        if not fks:
+            return []
+        # entity name -> bare lowercase table name (catalog-backed DB sources only)
+        ent_table = {
+            src.entity: src.table_name.lower()
+            for src in plan.sources
+            if getattr(src, "table_name", None)
+        }
+        # (left_table, right_table) -> (left_keys, right_keys), both directions
+        fk_map: Dict[tuple, tuple] = {}
+        for fk in fks:
+            fk_map.setdefault((fk["source_table"], fk["target_table"]),
+                              (fk["source_columns"], fk["target_columns"]))
+            fk_map.setdefault((fk["target_table"], fk["source_table"]),
+                              (fk["target_columns"], fk["source_columns"]))
+        for out in plan.outputs:
+            for j in out.joins:
+                lt, rt = ent_table.get(j.left_entity), ent_table.get(j.right_entity)
+                if not lt or not rt:
+                    continue
+                hit = fk_map.get((lt, rt))
+                if not hit:
+                    continue
+                lk, rk = list(hit[0]), list(hit[1])
+                if ([k.lower() for k in j.left_keys] == [k.lower() for k in lk]
+                        and [k.lower() for k in j.right_keys] == [k.lower() for k in rk]):
+                    continue  # planner already picked the FK columns
+                was = f"{j.left_keys}->{j.right_keys}"
+                j.left_keys, j.right_keys = lk, rk
+                note = (
+                    f"Join {j.left_entity}->{j.right_entity} keyed from the ER "
+                    f"catalog foreign key ({lk} -> {rk}); planner had {was} — the "
+                    "diagram is authoritative"
+                )
+                if note not in plan.assumptions:
+                    plan.assumptions.append(note)
+                notes.append(note)
+    except Exception:  # noqa: BLE001 — never block; leave joins as the planner set them
+        return notes
+    return notes
+
+
+def _catalog_schema() -> "dict | None":
+    """The attached ER catalog (DatabaseSchema JSON), or None when none is
+    attached / it can't be fetched. Shared by the ER-flow helpers below."""
+    source_id = _CATALOG_SOURCE_ID.get() or os.environ.get("CATALOG_SOURCE_ID")
+    if not source_id:
+        return None
+    try:
+        import sys
+
+        tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from catalog import fetch
+
+        return fetch(source_id)
+    except Exception:  # noqa: BLE001 — grounding must never hard-block
+        return None
+
+
+# ER connection "type" -> az_agent SourceFormat for that engine's tables.
+_ENGINE_FORMAT = {
+    "postgres": SourceFormat.postgres,
+    "sqlserver": SourceFormat.sql_table,
+    "bigquery": SourceFormat.bigquery,
+    "dataverse": SourceFormat.dataverse,
+}
+# Formats a model picks when it does NOT realise the entity is a DB table.
+_FILE_FORMATS = {SourceFormat.csv, SourceFormat.parquet, SourceFormat.json,
+                 SourceFormat.http_csv, SourceFormat.gcs}
+
+
+def _match_catalog_table(name: str, tables: "dict") -> "str | None":
+    """Resolve a loose source name to the diagram's actual table name. Handles
+    exact, singular/plural, and unique-substring matches (payments->payment).
+    `tables` maps lowercased name -> actual name. None when no confident match."""
+    n = (name or "").strip().lower()
+    if not n:
+        return None
+    if n in tables:
+        return tables[n]
+    for variant in (n.rstrip("s"), n + "s"):
+        if variant in tables:
+            return tables[variant]
+    subs = [actual for low, actual in tables.items()
+            if len(low) >= 4 and (low in n or n in low)]
+    return subs[0] if len(subs) == 1 else None
+
+
+def resolve_sources_to_catalog(plan) -> "List[str]":
+    """Correct sources to the connected diagram BEFORE grounding: a loose or
+    wrong table name (payments->payment) is snapped to the real one, and a source
+    the model wrongly typed as a file (csv) when it is really a DB table is
+    switched to the engine's format. This is why the ER flow can "just know" the
+    schema even when the user never says 'postgres'. No catalog -> no-op."""
+    schema = _catalog_schema()
+    if not schema:
+        return []
+    tables = {(t.get("table_name") or "").lower(): t.get("table_name")
+              for t in schema.get("tables", []) if t.get("table_name")}
+    if not tables:
+        return []
+    conns = schema.get("connections") or []
+    engine_fmt = _ENGINE_FORMAT.get((conns[0].get("type") or "").lower()) if conns else None
+    notes: List[str] = []
+    for s in plan.sources:
+        actual = _match_catalog_table(s.table_name, tables) or _match_catalog_table(s.entity, tables)
+        if not actual:
+            continue  # not a diagram table — catalog_membership_problems handles it
+        changed = False
+        if (s.table_name or "").lower() != actual.lower():
+            s.table_name = actual
+            changed = True
+        if engine_fmt and s.format in _FILE_FORMATS:
+            s.format = engine_fmt
+            if engine_fmt in (SourceFormat.postgres, SourceFormat.sql_table):
+                s.schema_name = s.schema_name or "public"
+            s.container = s.folder = s.file_name = s.http_url = None
+            changed = True
+        if changed:
+            note = (f"source '{s.entity}' resolved to diagram table '{actual}' "
+                    f"({s.format.value}) — the connected ER diagram is authoritative")
+            if note not in plan.assumptions:
+                plan.assumptions.append(note)
+            notes.append(note)
+    return notes
+
+
+def catalog_preamble() -> str:
+    """Text prepended to the extractor's view of the BRD when a diagram is
+    attached, so the model KNOWS the connected engine + tables at parse time and
+    emits DB sources (not invented CSVs). '' when no diagram is attached — the
+    pure-BRD flow is unchanged."""
+    schema = _catalog_schema()
+    if not schema:
+        return ""
+    tables = sorted(t.get("table_name") for t in schema.get("tables", []) if t.get("table_name"))
+    if not tables:
+        return ""
+    conns = schema.get("connections") or []
+    engine = (conns[0].get("type") if conns else "") or "database"
+    fmt = _ENGINE_FORMAT.get(engine.lower())
+    fmt_name = fmt.value if fmt else "the connected engine's"
+    return (
+        "CONNECTED DATA SOURCE — an ER diagram is attached, so the user will NOT "
+        f"re-describe where the data lives. A {engine} database is connected with "
+        f"these tables: {', '.join(tables)}. Every entity the requirements name is "
+        f"ONE OF THESE tables — emit it as a `{fmt_name}` source with `table_name` "
+        "set to the EXACT table name above (never a CSV/file source, never invented "
+        "columns — the diagram supplies schema, joins and connection). If a "
+        "requested entity is not in this list, add a `clarifications` line instead "
+        "of inventing a source.\n\n"
+    )
+
+
+def catalog_membership_problems(plan) -> "List[str]":
+    """When an ER diagram (catalog) IS attached, every source must be a table in
+    that diagram — the engineer connected specific data and expects the agent to
+    build from THAT, not invent sources. A source matching no catalog table is a
+    hallucination or a typo; ask instead of silently building it. This is the
+    "verify with the data, don't guess" contract of the ER flow. Runs AFTER
+    resolve_sources_to_catalog, so only genuinely-absent tables remain.
+
+    No catalog attached -> [] (the pure-BRD flow and the offline tests are
+    unaffected)."""
+    schema = _catalog_schema()
+    if not schema:
+        return []
+    tables = {(t.get("table_name") or "").lower(): t.get("table_name")
+              for t in schema.get("tables", []) if t.get("table_name")}
+    if not tables:
+        return []
+    problems: List[str] = []
+    for s in plan.sources:
+        if _match_catalog_table(s.table_name, tables) or _match_catalog_table(s.entity, tables):
+            continue
+        avail = ", ".join(sorted(tables.values())[:10])
+        problems.append(
+            f"source '{s.entity}' is not a table in the connected ER diagram "
+            f"(the diagram has: {avail}) — use a real table from the diagram, "
+            "or connect that source before building"
+        )
+    return problems
+
+
 def _live_external_columns(src) -> "List[LogicalColumn]":
     """Live schema read straight from a postgres/bigquery/gcs/sharepoint source
     (same readers the bootstrap mover uses). [] on any failure — best-effort."""
@@ -511,10 +722,18 @@ def ground_logical_plan(plan: LogicalPlan) -> List[str]:
     unreadable files leave the plan unchanged.
     """
     notes: List[str] = []
+    # Snap sources to the connected diagram FIRST: correct a loose/wrong table
+    # name (payments->payment) and switch a mis-typed file source to the engine's
+    # format, so connection-seeding, FK join-keying and column grounding below all
+    # act on the real table. No-op when no diagram is attached.
+    notes += resolve_sources_to_catalog(plan)
     # Fill a catalog-backed DB source's connection identity (server/database/port)
     # from the ER diagram BEFORE column grounding, so the BRD names only the
     # engine + tables and everything connection-y comes from the reviewed diagram.
     notes += _seed_catalog_connection(plan)
+    # Then correct gold join keys from the diagram's foreign keys (the connection
+    # seed above doesn't touch entities, so entity->table mapping is stable here).
+    notes += _seed_catalog_joins(plan)
     for src in plan.sources:
         if src.format != SourceFormat.csv:
             continue

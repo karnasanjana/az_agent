@@ -108,6 +108,14 @@ INDEX_HTML = r"""<!doctype html>
   }
   body.embedded > header { display:none; }
   body.embedded .workspace { height:100vh; }
+  /* chat-first composer */
+  .chatlog { flex:1; min-height:220px; overflow:auto; display:flex; flex-direction:column; gap:8px; padding:4px 2px 10px; }
+  .msg { max-width:88%; padding:9px 12px; border-radius:12px; font-size:13px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
+  .msg.me { align-self:flex-end; background:var(--accent); color:#fff; border-bottom-right-radius:4px; }
+  .msg.bot { align-self:flex-start; background:var(--panel2); border:1px solid var(--line); border-bottom-left-radius:4px; }
+  .composer { display:flex; gap:8px; align-items:flex-end; }
+  .composer textarea { flex:1; height:52px; min-height:52px; max-height:160px; resize:vertical; }
+  body.embedded .left-inner { display:flex; flex-direction:column; height:100%; }
 </style>
 </head>
 <body>
@@ -128,32 +136,21 @@ INDEX_HTML = r"""<!doctype html>
 <main>
   <section class="left">
     <div class="left-inner">
-    <h2>Describe your pipeline</h2>
-    <div class="composer-note">Paste a BRD or explain the source, transformations, and destination in plain English.</div>
-    <textarea id="brd" placeholder="Describe it in plain English or paste a full BRD &mdash; e.g. &quot;copy the daily sales CSVs from https://... into the lake and aggregate revenue by region&quot;. Or upload a .txt/.md/.pdf."></textarea>
-    <div class="row">
+    <h2>Talk to your data</h2>
+    <div class="composer-note">Tell me what to build &mdash; I already know your connected tables. e.g. &quot;clean customers and orders, then give me sales by city.&quot;</div>
+    <div id="chatLog" class="chatlog"></div>
+    <div class="composer">
+      <textarea id="chatInput" placeholder="Message the data agent&hellip;"></textarea>
+      <button id="chatBtn">Send</button>
+    </div>
+    <div class="row" style="margin-top:8px">
       <label class="file">Upload BRD (.txt/.md/.pdf)<input id="file" type="file" accept=".txt,.md,.text,.pdf" style="display:none"/></label>
       <span id="fileName" class="pill"></span>
-    </div>
-    <div class="row">
-      <button id="genBtn">Generate pipelines</button>
     </div>
     <div id="genState" class="pill"></div>
 
     <div id="preflight"></div>
     <div id="clar"></div>
-
-    <div id="chatBox" style="display:none">
-      <h2>Chat &mdash; refine or answer questions</h2>
-      <div class="card" style="padding:0">
-        <div id="chatLog" style="max-height:260px;overflow:auto;padding:10px"></div>
-        <div style="display:flex;gap:8px;padding:8px;border-top:1px solid var(--line)">
-          <input id="chatInput" placeholder="e.g. rename the gold sink, or answer a question&hellip;"
-                 style="flex:1;min-width:120px;background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px"/>
-          <button id="chatBtn" class="sec">Send</button>
-        </div>
-      </div>
-    </div>
 
     <div id="approveBox" style="display:none">
       <h2>4. Approval gate</h2>
@@ -179,7 +176,7 @@ INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section class="right">
-    <div class="canvas-head"><div><div class="canvas-title">Medallion pipeline</div><div class="canvas-sub">Bronze &rarr; Silver &rarr; Gold</div></div><span class="tag">Azure Data Factory</span></div>
+    <div class="canvas-head"><div><div class="canvas-title">Medallion ADF pipelines</div><div class="canvas-sub">Bronze &rarr; Silver &rarr; Gold</div></div><span class="tag">Azure Data Factory</span></div>
     <div class="right-inner">
     <div class="pipeline-canvas" aria-label="Bronze to Silver to Gold medallion flow">
       <div class="pipeline-track">
@@ -202,6 +199,10 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $ = (s)=>document.querySelector(s);
 let RUN = null, REVIEW = null, POLL = null, UPLOAD = null;
+// Declared here (not next to setCanvasState below) because setCanvasState('idle')
+// runs at load, above that declaration — a const in its temporal dead zone throws
+// ReferenceError and aborts the whole script, so no handlers (incl. Generate) bind.
+const LAYERS = ['bronze','silver','gold'];
 
 function authHeaders(){ const t = sessionStorage.getItem('api_token'); return t ? {'x-api-token': t} : {}; }
 async function jget(u){ const r = await fetch(u); if(!r.ok) throw new Error((await r.json()).detail||r.status); return r.json(); }
@@ -215,6 +216,39 @@ async function jpost(u, body){
   if(!r.ok){ const d=(await r.json()).detail; throw new Error(typeof d==='string'?d:JSON.stringify(d)||r.status); }
   return r.json(); }
 
+// Native alert()/confirm()/prompt() are silently BLOCKED inside a cross-origin
+// iframe (the ER app's Pipelines tab embeds this at a different origin), so every
+// dialog-based message/decision must render in-page instead.
+function notify(msg, kind){
+  let box = $('#toast');
+  if(!box){ box = document.createElement('div'); box.id='toast';
+    box.style.cssText='position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:92%';
+    document.body.appendChild(box); }
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = 'padding:10px 14px;border-radius:8px;font-size:13px;color:#fff;box-shadow:0 6px 20px rgba(0,0,0,.35);white-space:pre-line;'
+    + (kind==='err' ? 'background:#b3261e' : 'background:#1f6feb');
+  box.appendChild(t);
+  setTimeout(()=>t.remove(), 6000);
+}
+function askConfirm(msg, okLabel){
+  return new Promise(resolve=>{
+    const ov = document.createElement('div');
+    ov.style.cssText='position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+    const card = document.createElement('div');
+    card.style.cssText='background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:10px;padding:18px;max-width:420px;white-space:pre-line;font-size:13px';
+    const p = document.createElement('div'); p.textContent=msg; p.style.marginBottom='14px';
+    const row = document.createElement('div'); row.style.cssText='display:flex;gap:8px;justify-content:flex-end';
+    const cancel = document.createElement('button'); cancel.textContent='Cancel';
+    const ok = document.createElement('button'); ok.textContent=okLabel||'Confirm';
+    cancel.style.cssText='padding:7px 12px;border-radius:7px;background:#21262d;color:#e6edf3;border:1px solid #30363d;cursor:pointer';
+    ok.style.cssText='padding:7px 12px;border-radius:7px;background:#b3261e;color:#fff;border:none;cursor:pointer';
+    const done=(v)=>{ ov.remove(); resolve(v); };
+    cancel.onclick=()=>done(false); ok.onclick=()=>done(true);
+    row.append(cancel, ok); card.append(p, row); ov.appendChild(card); document.body.appendChild(ov);
+  });
+}
+
 setCanvasState('idle');
 (async()=>{ try{ const h=await jget('/health');
   const t=$('#modeTag'); if(h.mock){t.textContent='MOCK tenant (no Azure writes)';t.className='tag mock';}
@@ -222,15 +256,11 @@ setCanvasState('idle');
   if(h.self_heal){ $('#healTag').style.display=''; }
 }catch(e){} })();
 
-$('#file').addEventListener('change', async (e)=>{
-  const f=e.target.files[0]; if(!f) return; $('#fileName').textContent=f.name;
-  const isPdf = /\.pdf$/i.test(f.name) || f.type==='application/pdf';
-  if(isPdf){
-    // PDFs can't be read as text in the browser — send the file to the server.
-    UPLOAD = f; $('#brd').value=''; $('#brd').placeholder='PDF ready: '+f.name+' — click Generate.';
-  }else{
-    UPLOAD = null; $('#brd').value = await f.text();
-  }
+$('#file').addEventListener('change', (e)=>{
+  // Optional: attach a full BRD file. The server reads txt/md/pdf text on /plan,
+  // so we just hold the file and send it with the next message.
+  const f=e.target.files[0]; if(!f) return;
+  UPLOAD = f; $('#fileName').textContent = f.name + ' — press Send';
 });
 
 
@@ -243,34 +273,88 @@ function startTimer(sel, label){
   return ()=>{ clearInterval(id); el.disabled=false; };
 }
 
-$('#genBtn').onclick = async ()=>{
-  const brd = $('#brd').value.trim();
-  if(!brd && !UPLOAD){ alert('Paste or upload a BRD first.'); return; }
-  reset();
-  $('#genState').textContent='Large BRDs can take 1–2 minutes to generate — please wait.';
-  const stop = startTimer('#genBtn','Generating');
+// You give only the Silver/Gold requirements — the frame supplies the
+// architecture (medallion), where the data lives (the connected+reviewed schema),
+// bronze-as-is, chaining, and trigger, so none of that has to be typed.
+// A catalog is attached only when the ER app's Build Pipeline passed a diagram
+// token (?catalog_source_id=...). Standalone (no token) = no connected schema.
+function hasCatalog(){ return !!new URLSearchParams(location.search).get('catalog_source_id'); }
+
+function wrapIntent(t){
+  if(/\b(medallion|bronze)\b/i.test(t)) return t;  // already a full BRD — don't double-wrap
+  const frame = hasCatalog()
+    ? "Build and run a medallion pipeline in Azure Data Factory from the database I've already "
+      + "connected and reviewed in the diagram — use that schema for the tables, columns, types, "
+      + "keys, relationships, and connection details. Bronze: load each referenced table as-is, "
+      + "one folder per table. "
+    : "Build and run a medallion pipeline in Azure Data Factory. Bronze: load the source table(s) "
+      + "I describe below as-is, one folder per table. ";
+  return frame + "Silver and Gold: apply exactly the requirements below, writing both as Delta. "
+    + "Chain bronze -> silver -> gold in one master pipeline; a failed stage stops the run; manual "
+    + "trigger.\n\nMy requirements:\n" + t;
+}
+
+// A short, plain-English agent reply for the chat thread (the full plan renders
+// on the right). Handles clarifications, build success, and pre-flight failures.
+function planReply(data){
+  if(data.status==='NEEDS_CLARIFICATION')
+    return "I need a bit more before I build:\n• " + (data.clarifications||[]).join("\n• ");
+  const s=data.summary||{}, n=a=>(a&&a.length)||0, bits=[];
+  if(n(s.datasets))  bits.push(n(s.datasets)+' datasets');
+  if(n(s.dataflows)) bits.push(n(s.dataflows)+' data flows');
+  if(n(s.pipelines)) bits.push(n(s.pipelines)+' pipeline(s)');
+  let msg = "Built the pipeline"+(bits.length?' — '+bits.join(', '):'')+".";
+  if(data.preflight && !data.preflight.passed)
+    msg += " Pre-flight flagged something — tell me what to change and I'll fix it.";
+  else
+    msg += " It's on the right. Tell me any change, or say “build it” to run it in Azure.";
+  // Correlate with the connected schema: surface the agent's cleaning / other
+  // suggestions right in the chat (they also render on the right panel).
+  const sug=(data.suggestions||[]).slice(0,3), asm=(data.assumptions||[]).slice(0,3);
+  if(sug.length)      msg += "\n\nSuggestions:\n• " + sug.join("\n• ");
+  else if(asm.length) msg += "\n\nWhat I did / assumed:\n• " + asm.join("\n• ");
+  return msg;
+}
+
+// One composer for the whole conversation: the first message builds the plan
+// (/plan), later messages refine it (/chat), and "build it / run / approve"
+// triggers the deploy — so it all feels like one chat.
+async function send(){
+  const text = $('#chatInput').value.trim();
+  if(!text && !UPLOAD){ notify('Type what you want to build.','err'); return; }
+  if(RUN && text && /^(approve|approve it|build it|run|run it|deploy|go|go ahead|yes)$/i.test(text)){
+    chatAppend('you', text); $('#chatInput').value='';
+    chatAppend('agent', 'On it — building and running in Azure. Watch the layers on the right.');
+    $('#approveBtn').click();
+    return;
+  }
+  chatAppend('you', text || ('📎 '+UPLOAD.name)); $('#chatInput').value='';
+  const stop = startTimer('#chatBtn', RUN ? 'Working' : 'Building');
   try{
-    const fd = new FormData();
-    if(UPLOAD){ fd.append('file', UPLOAD); } else { fd.append('brd', brd); }
-    // Embedded in the ER app's Pipelines tab: the diagram's share token arrives
-    // as ?catalog_source_id=... — pass it so grounding uses the reviewed catalog.
-    const csid = new URLSearchParams(location.search).get('catalog_source_id');
-    if(csid){ fd.append('catalog_source_id', csid); }
-    let r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd});
-    if(r.status===401){
-      const t = prompt('This server requires an API token (API_TOKEN):');
-      if(t){ sessionStorage.setItem('api_token', t);
-        r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd}); }
+    let data;
+    if(!RUN){
+      const fd = new FormData();
+      if(UPLOAD){ fd.append('file', UPLOAD); } else { fd.append('brd', wrapIntent(text)); }
+      const csid = new URLSearchParams(location.search).get('catalog_source_id');
+      if(csid){ fd.append('catalog_source_id', csid); }
+      let r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd});
+      if(r.status===401){
+        const tok = prompt('This server requires an API token (API_TOKEN):');
+        if(tok){ sessionStorage.setItem('api_token', tok);
+          r = await fetch('/plan',{method:'POST',headers:authHeaders(),body:fd}); }
+      }
+      data = await r.json();
+      if(!r.ok){ throw new Error(data.detail||'plan failed'); }
+      RUN = data.run_id; $('#runTag').textContent = 'run '+RUN;
+      UPLOAD = null; $('#fileName').textContent = '';
+    } else {
+      data = await jpost('/chat', {run_id:RUN, message:text});
     }
-    const data = await r.json();
-    if(!r.ok){ throw new Error(data.detail||'plan failed'); }
-    RUN = data.run_id; $('#runTag').textContent = 'run '+RUN;
-    $('#chatBox').style.display='block';
     applyPlan(data);
-    $('#genState').textContent='';
-  }catch(e){ alert('Generate failed: '+e.message); $('#genState').textContent=''; }
-  finally{ stop(); $('#genBtn').textContent='Generate pipelines'; }
-};
+    chatAppend('agent', planReply(data));
+  }catch(e){ chatAppend('agent', '⚠ '+e.message); }
+  finally{ stop(); $('#chatBtn').textContent='Send'; }
+}
 
 // Render a /plan or /chat response into the page.
 function applyPlan(data){
@@ -350,7 +434,6 @@ function renderPlan(data){
 // place. This is the interactive fix path: agent asks/flags, human decides.
 function fixViaChat(i){
   const f = (window._REVIEW_FINDINGS||[])[i]; if(!f) return;
-  const box = $('#chatBox'); if(box) box.style.display='';
   const inp = $('#chatInput'); if(!inp) return;
   inp.value = 'Fix this reviewer finding: '+(f.requirement||'')+' — '+(f.issue||'');
   inp.focus();
@@ -379,33 +462,30 @@ async function applyAzureTarget(){
   }catch(e){ st.textContent = 'failed: '+e.message; }
 }
 
-// --- chat: refine the spec or answer the agent's questions ---
+// --- chat thread: one conversation drives build + refine (see send() above) ---
 function chatAppend(who, text){
-  const log=$('#chatLog');
-  log.innerHTML += '<div style="margin:4px 0"><b class="'+(who==='you'?'':'muted')+'">'+
-    (who==='you'?'You':'Agent')+':</b> '+esc(text)+'</div>';
-  log.scrollTop = log.scrollHeight;
+  const log=$('#chatLog'); if(!log) return;
+  const div=document.createElement('div');
+  div.className='msg '+(who==='you'?'me':'bot');
+  div.innerHTML=esc(text).replace(/\n/g,'<br>');
+  log.appendChild(div); log.scrollTop = log.scrollHeight;
 }
-
-async function sendChat(){
-  const msg = $('#chatInput').value.trim();
-  if(!msg || !RUN) return;
-  chatAppend('you', msg); $('#chatInput').value='';
-  const stop = startTimer('#chatBtn','Working');
-  try{
-    const data = await jpost('/chat',{run_id:RUN, message:msg});
-    if(data.status==='NEEDS_CLARIFICATION'){
-      chatAppend('agent', 'I need a bit more: '+(data.clarifications||[]).join(' • '));
-    }else{
-      chatAppend('agent', 'Updated — pre-flight '+(data.preflight.passed?'PASS':'FAIL')+'. '+
-        (data.preflight.passed?'Re-approve when ready.':'See the failing checks.'));
-    }
-    applyPlan(data);
-  }catch(e){ chatAppend('agent', 'Sorry — '+e.message); }
-  finally{ stop(); $('#chatBtn').textContent='Send'; }
+function greet(){
+  if(hasCatalog()){
+    chatAppend('agent', "Hi — I can see the tables from your saved diagram. Tell me the Silver "
+      + "cleaning and Gold outputs you want, e.g. “clean customers and orders, then give me sales "
+      + "by city and sales by category.” I'll handle the medallion layout, chaining and connection. "
+      + "Not sure where to start? Ask “what cleaning do you suggest?”");
+  } else {
+    chatAppend('agent', "Hi — describe the pipeline you want in plain English: the source, the "
+      + "cleaning, and the outputs — e.g. “load orders and customers from my SQL Server, clean "
+      + "them, and give me sales by city.” Tip: open a diagram and click Build Pipeline first and "
+      + "I'll already know your tables and connection.");
+  }
 }
-$('#chatBtn').onclick = sendChat;
-$('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendChat(); });
+$('#chatBtn').onclick = send;
+$('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+greet();
 
 function reset(){
   setJourney('define'); setCanvasState('idle');
@@ -413,7 +493,7 @@ function reset(){
   ['preflight','clar','summary','chatLog','planNotes'].forEach(id=>$('#'+id).innerHTML='');
   $('#planReadable').innerHTML='Generate a plan to see it in plain English.'; $('#planReadable').className='card muted';
   $('#approveBox').style.display='none'; $('#liveBox').style.display='none';
-  $('#chatBox').style.display='none'; $('#runErr').textContent='';
+  $('#runErr').textContent=''; greet();
 }
 
 function renderClar(items){
@@ -468,7 +548,7 @@ async function approveRun(ack){
     const msg = 'These BRD requirements were NOT built:\n\n- '
       + data.detail.unsupported.join('\n- ')
       + '\n\nDeploy the pipeline WITHOUT them?';
-    if(confirm(msg)) return approveRun(true);
+    if(await askConfirm(msg,'Deploy anyway')) return approveRun(true);
     throw new Error('cancelled — unbuilt requirements not acknowledged');
   }
   if(!r.ok){ const d=data.detail; throw new Error(typeof d==='string'?d:JSON.stringify(d)||r.status); }
@@ -484,49 +564,20 @@ $('#approveBtn').onclick = async ()=>{
     $('#liveBox').style.display='block';
     $('#stopBtn').style.display=''; $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run';
     POLL = setInterval(poll, 1500); poll();
-  }catch(e){ alert('Approve blocked: '+e.message); $('#approveBtn').disabled=false; }
+  }catch(e){ notify('Approve blocked: '+e.message,'err'); $('#approveBtn').disabled=false; }
 };
 
 $('#stopBtn').onclick = async ()=>{
   if(!RUN) return;
   $('#stopBtn').disabled=true; $('#stopBtn').textContent='Stopping…';
   try{ await jpost('/stop/'+RUN,{}); }
-  catch(e){ alert('Stop failed: '+e.message); $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run'; }
+  catch(e){ notify('Stop failed: '+e.message,'err'); $('#stopBtn').disabled=false; $('#stopBtn').textContent='Stop run'; }
 };
 
-const CAT_LABEL = {linkedServices:'linked services', datasets:'datasets',
-                   dataflows:'data flows', pipelines:'pipelines', triggers:'triggers'};
-
 function renderDeployReport(s){
-  let html = 'state: '+s.status+
-    (s.containers_created? '  •  containers '+JSON.stringify(s.containers_created):'');
-  const dr = s.deploy_report;
-  if(dr){
-    // Intended (this plan) vs actual (what the factory really contains now).
-    const rows = Object.keys(CAT_LABEL).map(cat=>{
-      const want = (dr.intended_counts||{})[cat];
-      const have = dr.factory_counts ? dr.factory_counts[cat] : null;
-      if(!want && !have) return '';
-      const match = (have==null || have===-1) ? '' : (have===want ? ' ✓' : ' ⚠ factory has '+have);
-      return '<div class="pill">'+CAT_LABEL[cat]+': '+(want||0)+' in plan'+match+'</div>';
-    }).join('');
-    html += '<div style="margin-top:6px">'+rows+'</div>';
-    if(dr.pruned && dr.pruned.length){
-      html += '<div class="pill">removed '+dr.pruned.length+' stale object(s) from earlier runs</div>';
-    }
-    if(dr.stale && dr.stale.length){
-      html += '<div class="pill" title="'+esc(dr.stale.join(', '))+'">'+dr.stale.length+
-        ' stale object(s) from earlier runs left in the factory — the agent never deletes; '+
-        'remove them yourself or set PRUNE_STALE=true</div>';
-    }
-    if(dr.prune_error){
-      html += '<div class="warn">Cleanup of old objects failed — stale objects may remain in the factory: '+
-              esc(dr.prune_error)+'</div>';
-    }
-  } else if(s.deployed){
-    html += '  •  deployed '+s.deployed.length+' objects';
-  }
-  $('#deployState').innerHTML = html;
+  // Just the run state. The plan-vs-factory count diff and stale-object list were
+  // noise for the embedded view — the agent still never deletes anything.
+  $('#deployState').innerHTML = 'state: '+s.status;
 }
 
 async function poll(){
@@ -590,7 +641,6 @@ function setJourney(step){
 // Reflect real state on the medallion canvas instead of a static diagram.
 // mode 'idle' (nothing built) / 'ready' (plan built, awaiting deploy); a live
 // run overrides both with per-layer status from paintCanvas.
-const LAYERS = ['bronze','silver','gold'];
 function setCanvasState(mode){
   LAYERS.forEach(k=>{
     const node=$('#node-'+k), st=$('#status-'+k); if(!node||!st) return;
@@ -604,6 +654,13 @@ function paintCanvas(steps){
   const byLayer={};
   (steps||[]).forEach(d=>{ const n=(d.name||'').toLowerCase();
     LAYERS.forEach(k=>{ if(n.includes(k)) byLayer[k]=d.status||'Pending'; }); });
+  // Medallion runs strictly bronze->silver->gold (a failed stage stops the run), so
+  // if a later layer has started, every earlier layer already Succeeded. Bronze's
+  // copy steps aren't named 'bronze', so without this bronze reads 'Pending' while
+  // silver is InProgress.
+  let maxActive=-1;
+  LAYERS.forEach((k,i)=>{ const s=byLayer[k]; if(s && s!=='Pending') maxActive=i; });
+  LAYERS.forEach((k,i)=>{ if(i<maxActive && byLayer[k]!=='Failed') byLayer[k]='Succeeded'; });
   LAYERS.forEach(k=>{
     const node=$('#node-'+k), st=$('#status-'+k); if(!node||!st) return;
     const s=byLayer[k]; node.classList.remove('dim'); node.classList.toggle('active', s==='InProgress');

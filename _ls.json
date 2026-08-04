@@ -1,0 +1,15 @@
+[
+  "AzureBlobStorage",
+  "AzureDatabricks",
+  "LS_ADLS_StorageAccount",
+  "LS_HTTP_GitHub",
+  "LS_HTTP_IPL_GitHub",
+  "LS_Advworks_dynamic",
+  "ADLS_NYC",
+  "LS_HTTP_NYC",
+  "LS_HTTP_uber_rides_analytics",
+  "LS_ADLS_azurejaydeltalake",
+  "ls_storage",
+  "ls_dataverse_zcscmdemodev_crm_dynamics_com",
+  "ls_http_raw_githubusercontent_com"
+]

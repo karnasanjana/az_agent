@@ -1,0 +1,1 @@
+Total payment amount per customer with each customer's first and last name. Join customer to payment. Also give total rentals per customer. Top 25 by payment.

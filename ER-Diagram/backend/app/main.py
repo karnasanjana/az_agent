@@ -8,8 +8,10 @@ from app.api.chat import router as chat_router
 from app.api.connection import router as connection_router
 from app.api.dataverse import router as dataverse_router
 from app.api.diagrams import router as diagrams_router
+from app.api.gcs import router as gcs_router
 from app.api.postgres import router as postgres_router
 from app.api.schema import router as schema_router
+from app.api.sharepoint import router as sharepoint_router
 
 app = FastAPI(
     title="SchemaViz API",
@@ -33,8 +35,10 @@ app.include_router(chat_router)
 app.include_router(connection_router)
 app.include_router(dataverse_router)
 app.include_router(diagrams_router)
+app.include_router(gcs_router)
 app.include_router(postgres_router)
 app.include_router(schema_router)
+app.include_router(sharepoint_router)
 
 
 @app.get("/health")
