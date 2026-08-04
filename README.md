@@ -155,19 +155,124 @@ Every `/plan` and `/chat` response carries a `timings` block — per-phase wall-
 (`extract`, `repair_completeness`, `triage_unsupported`, `compile`, `grounding`,
 `repair_preflight`) plus `llm_calls` — so a slow or chatty run is measurable.
 
-## Install & run
+## Branches and development workflow
+
+The repository currently uses the following branches. Branch descriptions are based
+on their current commit history; update this table when a branch is repurposed.
+
+| Branch | Purpose | Relationship |
+| --- | --- | --- |
+| `main` | Stable baseline for the BRD-to-ADF agent and its passing BRD test set. | Base branch for the feature branches below. |
+| `brd-passed-version` | Historical checkpoint for the BRD-tested version. | The local branch currently matches `main`; `origin/brd-passed-version` still points to the earlier "7 brd passed" checkpoint. |
+| `linking-external-source` | Adds and tests external sources, including Dataverse, Postgres, BigQuery/GCP, GCS, and SharePoint-related source tooling. | Three commits ahead of `main`; included in `linking-er`. |
+| `linking-er` | Unified application branch: combines the ADF agent, external-source support, redesigned UI, schema catalog seam, and the `ER-Diagram/` frontend/backend. | Built on `linking-external-source`; this is the integration branch for the complete app. |
+
+Typical workflow:
 
 ```bash
-python -m venv .venv && . .venv/Scripts/activate    # Windows: .venv\Scripts\activate
+git fetch origin
+git switch main
+git pull --ff-only
+git switch -c feature/<short-name>
+
+# After making and testing the change:
+git add <files>
+git commit -m "Describe the change"
+git push -u origin feature/<short-name>
+```
+
+Open a pull request into the branch your work extends. Use `main` for agent-only
+changes and `linking-er` for work that depends on the unified ER Diagram/catalog
+application. Do not commit `.env`, cloud credentials, service-account JSON, generated
+artifacts, or tenant output.
+
+## Setup
+
+### Prerequisites
+
+- Git, Python 3.11+, and `pip`.
+- Node.js 18+ and npm for the ER Diagram frontend.
+- ODBC Driver 18 for SQL Server when extracting SQL Server/Azure SQL schemas.
+- Docker Desktop with Compose if using the recommended all-in-one setup.
+- Cloud credentials only for the source systems and real Azure deployment paths you
+  intend to use. `MOCK=true` keeps ADF deployment local.
+
+Clone the repository and select the branch you want to run:
+
+```bash
+git clone https://github.com/sanjanakarna/az_agent.git
+cd az_agent
+git switch linking-er       # complete integrated app
+# git switch main           # agent-only stable baseline
+```
+
+### Option 1: Docker Compose (complete application)
+
+Copy `.env.example` to `.env`, fill in the values required for your chosen LLM and
+data sources, and keep `MOCK=true` for a local ADF dry run. The ER backend also needs
+`FERNET_KEY`, `GEMINI_API_KEY`, `GCS_BUCKET`, and `GCS_PROJECT`; set
+`GCP_SA_KEY_FILE` to the host path of its GCP service-account key when GCS persistence
+is enabled.
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- Unified ER Diagram frontend: `http://localhost:3000`
+- ER Diagram backend and Swagger: `http://localhost:8010/docs`
+- BRD-to-ADF agent: `http://localhost:8000`
+
+Stop the stack with `docker compose down`.
+
+### Option 2: Run each service locally
+
+Agent API/UI (from the repository root):
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-uvicorn app:app --reload                            # open http://127.0.0.1:8000
+Copy-Item .env.example .env
+uvicorn app:app --reload --port 8000
 ```
 
-Docker:
+ER Diagram backend (in a second terminal):
+
+```powershell
+cd ER-Diagram\backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+# Configure FERNET_KEY and the source/storage credentials in the environment.
+uvicorn app.main:app --reload --port 8010
+```
+
+ER Diagram frontend (in a third terminal):
+
+```powershell
+cd ER-Diagram\frontend
+npm install
+Copy-Item .env.example .env.local
+# Set NEXT_PUBLIC_API_URL=http://localhost:8010 and configure Auth/MSAL as needed.
+npm run dev
+```
+
+For bash/zsh, activate Python environments with `source .venv/bin/activate` and copy
+environment templates with `cp` instead of `Copy-Item`.
+
+### Verify the setup
 
 ```bash
-docker compose up --build                           # reads env from a .env file
+python tests/smoke_test.py
+python -m pytest
+cd ER-Diagram/frontend && npm run lint && npm run build
 ```
+
+Some integration tests require real source credentials or Azure access. Start with
+the smoke test and `MOCK=true`; enable external integrations one at a time.
 
 ## Phase 1 — Local dry-run (no Azure, no Foundry)
 
